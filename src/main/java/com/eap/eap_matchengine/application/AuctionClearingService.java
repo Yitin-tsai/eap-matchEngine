@@ -193,29 +193,20 @@ public class AuctionClearingService {
      * represents total qty from highest price down to p.
      */
     private int getDemandAtPrice(TreeMap<Integer, Integer> demandCurve, int price) {
-        // demandCurve: each entry (p, cumQty) means cumQty = sum of all buy qty at prices >= p (in descending order)
-        // But actually the curve stores cumulative in the order we inserted (desc price).
-        // For price p, demand = cumulative qty at p or the closest price >= p.
-        // If p exists in the curve, return its value.
-        // If p doesn't exist, find the largest price <= p in the curve and return that value.
-        // But wait - the curve was built in descending order. At highest price, cumQty = qty at that price.
-        // At next lower price, cumQty += qty at that price, etc.
-        // So cumQty at price X = total qty for all prices >= X (since we summed from high to low).
-        // To find demand at price p: find p in curve, or the largest price < p.
-        // Actually: if p is in the curve, demand(p) = curve.get(p).
-        // If p is NOT in the curve but there are prices > p, demand(p) = curve value at the largest price < p... no.
+        // demandCurve is built from price DESC order with cumulative qty:
+        //   Price 60: cumQty = 50 (only bids at 60)
+        //   Price 55: cumQty = 80 (bids at 60 + 55)
+        //   Price 50: cumQty = 100 (bids at 60 + 55 + 50)
         //
-        // Let me re-think: demandCurve keys are all buy prices, values are cumulative.
-        // Price 60: cumQty = 50 (only bids at 60)
-        // Price 55: cumQty = 80 (bids at 60 + 55)
-        // Price 50: cumQty = 100 (bids at 60 + 55 + 50)
+        // demand(p) = total buy qty at price >= p
+        // We need ceilingEntry(p): the smallest key >= p, whose cumQty represents
+        // total qty from the highest price down to that key (which includes all prices >= key >= p).
         //
-        // demand(p=57) = qty of buys with price >= 57 = 50 (only price 60)
-        // We need floorEntry(p) from perspective of "price >= p"...
-        // Actually: the entry at price 60 has cumQty=50, meaning 50 units willing to buy at >= 60
-        // The entry at price 55 has cumQty=80, meaning 80 units willing to buy at >= 55
-        // So demand(p) = curve value at floorEntry(p) where floor is the largest key <= p
-        Map.Entry<Integer, Integer> entry = demandCurve.floorEntry(price);
+        // Example: demand(57) -> ceilingEntry(57) = (60, 50) -> 50 units at >= 57 ✓
+        //          demand(55) -> ceilingEntry(55) = (55, 80) -> 80 units at >= 55 ✓
+        //          demand(50) -> ceilingEntry(50) = (50, 100) -> 100 units at >= 50 ✓
+        //          demand(70) -> ceilingEntry(70) = null -> 0 ✓
+        Map.Entry<Integer, Integer> entry = demandCurve.ceilingEntry(price);
         return entry != null ? entry.getValue() : 0;
     }
 
