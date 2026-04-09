@@ -1,0 +1,7 @@
+# src/test/resources/application-test.yml
+spring:
+  cloud:
+    contract:
+      verifier:
+        messaging:
+          type: rabbit

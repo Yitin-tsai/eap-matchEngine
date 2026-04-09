@@ -1,0 +1,5 @@
+description: When BaseContractTest sends OrderCreatedEvent, matching engine processes it
+label: order_created_to_matched
+name: order_created_to_matched
+input:
+  triggeredBy: sendOrderCreatedEvent()

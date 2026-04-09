@@ -1,0 +1,77 @@
+# eap-matchEngine — LLM Context
+
+> Port 8082 | Context Path: /match-engine
+> OpenAPI spec: `docs/api/match-engine.json`
+
+## API Endpoints
+
+| Endpoint | Description | Involves |
+|----------|-------------|----------|
+| GET /v1/order/orderbook | 從 Redis 讀取訂單簿 | matchEngine (Redis ZSet) |
+| GET /v1/order/market/summary | 最佳買賣價 | matchEngine (Redis) |
+| GET /v1/order/query/{userId} | 查詢用戶在 Redis 中的活躍訂單 | matchEngine (Redis Set) |
+| DELETE /v1/order/cancel | 從 Redis 訂單簿取消訂單 | matchEngine (Redis Lua script) |
+
+## Redis Data Model
+
+| Key Pattern | Type | Purpose |
+|-------------|------|---------|
+| orderbook:buy | ZSet (score=price ASC) | Buy order book, sorted by price |
+| orderbook:sell | ZSet (score=price ASC) | Sell order book, sorted by price |
+| order:{orderId} | String (GET/SET) | JSON-serialized OrderConfirmedEvent (fields: orderId, userId, price, amount, orderType, createdAt). Read with `GET`, not `HGETALL`. |
+| user:{userId}:orders | Set | Set of orderId strings for a user |
+| match:id:sequence | String (INCR) | Auto-increment match ID generator |
+| match:processed:{matchId} | String (SETNX, TTL 24h) | Idempotency check for match processing |
+| lock:order:{orderId} | Redisson Lock | Distributed lock for partial-fill re-add |
+
+## Lua Scripts (atomic operations)
+
+Location: `src/main/resources/lua/`
+
+| Script | Purpose |
+|--------|---------|
+| add_order.lua | Add order to ZSet + Hash + user Set atomically |
+| get_and_remove_match_order_buy.lua | Pop best sell order matching buy price |
+| get_and_remove_match_order_sell.lua | Pop best buy order matching sell price |
+| remove_order.lua | Remove order from ZSet + Hash + user Set atomically |
+
+Pricing: Maker Price — dealPrice = resting order's price (passive side determines price).
+
+## Matching & Partial Fill 流程
+
+`OrderConfirmedListener` 收到 confirmed 事件後呼叫 `MatchingEngineService.tryMatch()`：
+
+```
+tryMatch(incomingOrder) — while loop:
+  1. Lua script 原子取出最佳對手方訂單（ZREM + GET + DEL from ZSet/String）
+  2. matchQty = Math.min(incoming.amount, match.amount)
+  3. 產生 matchId（Redis INCR）→ 冪等檢查（SETNX match:processed:{matchId}）
+  4. publish OrderMatchedEvent → order.matched（fan-out to order + wallet）
+  5. 對手方剩餘數量 > 0（partial fill of resting order）：
+     → Redisson lock (lock:order:{orderId}, tryLock 5s, autoRelease 10s)
+     → addOrder() 重新加回訂單簿（ZSet + String + user Set）
+     → ⚠️ 風險：lock 取得失敗時，剩餘數量會從訂單簿遺失（無補償機制）
+  6. 對手方完全成交：removeOrder() 清理 user:{userId}:orders
+  7. incoming 仍有剩餘 → 繼續 loop 尋找下一個對手方
+  8. loop 結束後，incoming 仍有剩餘 → addOrder() 加入訂單簿等待
+```
+
+**重點**：matchEngine **不消費** order.matched 事件。訂單簿清理在 tryMatch() 內同步完成，不是透過獨立的 RabbitMQ listener。order.matched 只 fan-out 到 eap-order 和 eap-wallet。
+
+## RabbitMQ Listeners
+
+| Queue | Listener Class | Handles |
+|-------|---------------|---------|
+| matchEngine.orderConfirmed.queue | OrderConfirmedListener | Try match → publish OrderMatchedEvent or add to order book |
+
+Note: matchEngine 只有這一個 listener。它是 order.matched 的 **publisher**，不是 consumer。
+
+## Key Files
+
+| What | Path |
+|------|------|
+| Controllers | src/main/java/com/eap/eap_matchengine/controller/ |
+| Matching Service | src/main/java/com/eap/eap_matchengine/application/ |
+| Listeners | src/main/java/com/eap/eap_matchengine/application/ |
+| Lua Scripts | src/main/resources/lua/ |
+| Redis Config | src/main/java/com/eap/eap_matchengine/configuration/ |

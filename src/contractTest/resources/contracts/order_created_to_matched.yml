@@ -1,0 +1,5 @@
+description: When BaseContractTest sends OrderConfirmedEvent, matching engine processes it
+label: order_confirmed_to_matched
+name: order_confirmed_to_matched
+input:
+  triggeredBy: sendOrderConfirmedEvent()
