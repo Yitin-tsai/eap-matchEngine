@@ -41,6 +41,12 @@ springdoc:
   swagger-ui:
     path: /swagger-ui.html
 
+auction:
+  enabled: true
+  duration-minutes: 10
+  default-price-floor: 0
+  default-price-ceiling: 9999
+
 logging:
   level:
     root: INFO
