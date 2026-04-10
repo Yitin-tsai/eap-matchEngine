@@ -17,8 +17,8 @@ public class OrderConfirmedListener {
     private final MatchingEngineService matchingEngineService;
 
     /**
-     * CDA mode only - auction bids go through AuctionController directly.
-     * This listener handles continuous double auction order matching.
+     * CDA mode only - handles continuous double auction order matching.
+     * Auction bids flow through AuctionBidConfirmedListener instead.
      */
     @RabbitListener(queues = MATCH_ENGINE_ORDER_CONFIRMED_QUEUE)
     public void handleConfirmedOrder(OrderConfirmedEvent event) throws JsonProcessingException {

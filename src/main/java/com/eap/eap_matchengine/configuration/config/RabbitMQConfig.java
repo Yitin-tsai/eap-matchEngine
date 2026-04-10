@@ -16,8 +16,8 @@ import static com.eap.common.constants.RabbitMQConstants.*;
  * MatchEngine Module RabbitMQ Configuration
  *
  * This module consumes:
- * - order.created events (wallet-validated orders for matching)
- * - auction.bid.submitted events (auction bids for Redis collection)
+ * - order.confirmed events (wallet-validated orders for CDA matching)
+ * - auction.bid.confirmed events (wallet-confirmed auction bids for Redis collection)
  *
  * This module publishes:
  * - order.matched events (match results)
@@ -70,23 +70,24 @@ public class RabbitMQConfig {
     }
 
     /**
-     * MatchEngine queue for auction bid submitted events
+     * MatchEngine queue for wallet-confirmed auction bid events.
+     * Only bids that have passed wallet fund-locking reach this queue.
      */
     @Bean
-    public Queue matchEngineAuctionBidSubmittedQueue() {
-        return QueueBuilder.durable(MATCH_ENGINE_AUCTION_BID_SUBMITTED_QUEUE)
+    public Queue matchEngineAuctionBidConfirmedQueue() {
+        return QueueBuilder.durable(MATCH_ENGINE_AUCTION_BID_CONFIRMED_QUEUE)
                 .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
                 .build();
     }
 
     /**
-     * Bind matchEngine auction bid queue to auction.bid.submitted routing key
+     * Bind matchEngine auction bid queue to auction.bid.confirmed routing key
      */
     @Bean
-    public Binding matchEngineAuctionBidSubmittedBinding(Queue matchEngineAuctionBidSubmittedQueue, TopicExchange auctionExchange) {
-        return BindingBuilder.bind(matchEngineAuctionBidSubmittedQueue)
+    public Binding matchEngineAuctionBidConfirmedBinding(Queue matchEngineAuctionBidConfirmedQueue, TopicExchange auctionExchange) {
+        return BindingBuilder.bind(matchEngineAuctionBidConfirmedQueue)
                 .to(auctionExchange)
-                .with(AUCTION_BID_SUBMITTED_KEY);
+                .with(AUCTION_BID_CONFIRMED_KEY);
     }
 
     // ==================== Common ====================
