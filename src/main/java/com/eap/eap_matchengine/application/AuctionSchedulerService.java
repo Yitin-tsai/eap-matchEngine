@@ -128,41 +128,66 @@ public class AuctionSchedulerService {
                 }
 
                 log.info("Starting auction clearing: auctionId={}", auctionId);
+                boolean clearedEventPublished = false;
 
-                // Close gate to prevent new bids
-                auctionRedisService.closeGate(auctionId);
+                try {
+                    // Close gate to prevent new bids
+                    auctionRedisService.closeGate(auctionId);
 
-                // Retrieve all bids
-                AuctionRedisService.AuctionBids bids = auctionRedisService.getAllBids(auctionId);
+                    // Retrieve all bids
+                    AuctionRedisService.AuctionBids bids = auctionRedisService.getAllBids(auctionId);
 
-                // Execute clearing algorithm
-                AuctionClearingService.ClearingResult result = clearingService.clear(
-                        bids.buyBids(), bids.sellBids());
+                    // Execute clearing algorithm
+                    AuctionClearingService.ClearingResult result = clearingService.clear(
+                            bids.buyBids(), bids.sellBids());
 
-                // Build and publish clearing event
-                AuctionClearedEvent event = AuctionClearedEvent.builder()
-                        .auctionId(auctionId)
-                        .clearingPrice(result.getClearingPrice())
-                        .clearingVolume(result.getClearingVolume())
-                        .status(result.getStatus())
-                        .results(result.getResults().stream()
-                                .map(r -> new AuctionClearedEvent.AuctionBidResult(
-                                        r.getUserId(),
-                                        r.getSide(),
-                                        r.getBidAmount(),
-                                        r.getClearedAmount(),
-                                        r.getSettlementAmount(),
-                                        r.getOriginalTotalLocked()))
-                                .collect(Collectors.toList()))
-                        .clearedAt(LocalDateTime.now())
-                        .build();
+                    // Build and publish clearing event
+                    AuctionClearedEvent event = AuctionClearedEvent.builder()
+                            .auctionId(auctionId)
+                            .clearingPrice(result.getClearingPrice())
+                            .clearingVolume(result.getClearingVolume())
+                            .status(result.getStatus())
+                            .results(result.getResults().stream()
+                                    .map(r -> new AuctionClearedEvent.AuctionBidResult(
+                                            r.getUserId(),
+                                            r.getSide(),
+                                            r.getBidAmount(),
+                                            r.getClearedAmount(),
+                                            r.getSettlementAmount(),
+                                            r.getOriginalTotalLocked()))
+                                    .collect(Collectors.toList()))
+                            .clearedAt(LocalDateTime.now())
+                            .build();
 
-                rabbitTemplate.convertAndSend(AUCTION_EXCHANGE, AUCTION_CLEARED_KEY, event);
+                    rabbitTemplate.convertAndSend(AUCTION_EXCHANGE, AUCTION_CLEARED_KEY, event);
+                    clearedEventPublished = true;
 
-                log.info("Auction cleared: auctionId={}, MCP={}, MCV={}, status={}, results={}",
-                        auctionId, result.getClearingPrice(), result.getClearingVolume(),
-                        result.getStatus(), result.getResults().size());
+                    log.info("Auction cleared: auctionId={}, MCP={}, MCV={}, status={}, results={}",
+                            auctionId, result.getClearingPrice(), result.getClearingVolume(),
+                            result.getStatus(), result.getResults().size());
 
+                    // M-1 fix: cleanup Redis keys after successful clearing
+                    auctionRedisService.cleanupAuction(auctionId);
+
+                } catch (Exception e) {
+                    log.error("Auction clearing failed: auctionId={}", auctionId, e);
+                    // M-2 fix: only publish FAILED event if CLEARED was not already published
+                    if (!clearedEventPublished) {
+                        try {
+                            AuctionClearedEvent failedEvent = AuctionClearedEvent.builder()
+                                    .auctionId(auctionId)
+                                    .clearingPrice(0)
+                                    .clearingVolume(0)
+                                    .status("FAILED")
+                                    .results(List.of())
+                                    .clearedAt(LocalDateTime.now())
+                                    .build();
+                            rabbitTemplate.convertAndSend(AUCTION_EXCHANGE, AUCTION_CLEARED_KEY, failedEvent);
+                        } catch (Exception ex) {
+                            log.error("Failed to publish FAILED clearing event: auctionId={}", auctionId, ex);
+                        }
+                    }
+                }
             } finally {
                 if (lock.isHeldByCurrentThread()) {
                     lock.unlock();
@@ -171,25 +196,6 @@ public class AuctionSchedulerService {
         } catch (InterruptedException e) {
             log.error("Interrupted while acquiring clearing lock", e);
             Thread.currentThread().interrupt();
-        } catch (Exception e) {
-            log.error("Auction clearing failed", e);
-            // Publish a FAILED event so downstream modules are aware
-            try {
-                String auctionId = auctionRedisService.getCurrentAuctionId();
-                if (auctionId != null) {
-                    AuctionClearedEvent failedEvent = AuctionClearedEvent.builder()
-                            .auctionId(auctionId)
-                            .clearingPrice(0)
-                            .clearingVolume(0)
-                            .status("FAILED")
-                            .results(List.of())
-                            .clearedAt(LocalDateTime.now())
-                            .build();
-                    rabbitTemplate.convertAndSend(AUCTION_EXCHANGE, AUCTION_CLEARED_KEY, failedEvent);
-                }
-            } catch (Exception ex) {
-                log.error("Failed to publish FAILED clearing event", ex);
-            }
         }
     }
 }
