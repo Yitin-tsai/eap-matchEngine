@@ -39,9 +39,6 @@ public class AuctionSchedulerService {
 
     private static final DateTimeFormatter AUCTION_ID_FORMAT = DateTimeFormatter.ofPattern("yyyyMMddHH");
 
-    @Value("${auction.enabled:true}")
-    private boolean auctionEnabled;
-
     @Value("${auction.duration-minutes:10}")
     private int durationMinutes;
 
@@ -53,7 +50,7 @@ public class AuctionSchedulerService {
      */
     @Scheduled(cron = "0 0 * * * *")
     public void openAuction() {
-        if (!auctionEnabled) {
+        if (!auctionRedisService.getGlobalConfig().isAuctionEnabled()) {
             log.debug("Auction scheduling is disabled");
             return;
         }
@@ -108,7 +105,7 @@ public class AuctionSchedulerService {
      */
     @Scheduled(cron = "0 10 * * * *")
     public void closeAndClear() {
-        if (!auctionEnabled) {
+        if (!auctionRedisService.getGlobalConfig().isAuctionEnabled()) {
             log.debug("Auction scheduling is disabled");
             return;
         }
