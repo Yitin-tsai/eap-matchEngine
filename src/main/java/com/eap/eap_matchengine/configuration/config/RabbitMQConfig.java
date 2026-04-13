@@ -4,6 +4,7 @@ import org.springframework.amqp.core.Binding;
 import org.springframework.amqp.core.BindingBuilder;
 import org.springframework.amqp.core.Queue;
 import org.springframework.amqp.core.QueueBuilder;
+import org.springframework.amqp.core.FanoutExchange;
 import org.springframework.amqp.core.TopicExchange;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
@@ -91,6 +92,23 @@ public class RabbitMQConfig {
     }
 
     // ==================== Common ====================
+
+    // --- Dead Letter Exchange / Queue (shared, idempotent declare) ---
+
+    @Bean
+    public FanoutExchange deadLetterExchange() {
+        return new FanoutExchange(DEAD_LETTER_EXCHANGE);
+    }
+
+    @Bean
+    public Queue deadLetterQueue() {
+        return QueueBuilder.durable(DEAD_LETTER_QUEUE).build();
+    }
+
+    @Bean
+    public Binding dlqBinding(Queue deadLetterQueue, FanoutExchange deadLetterExchange) {
+        return BindingBuilder.bind(deadLetterQueue).to(deadLetterExchange);
+    }
 
     /**
      * 配置消息轉換器，使用 JSON 格式
