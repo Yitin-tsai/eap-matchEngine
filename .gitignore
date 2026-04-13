@@ -17,6 +17,7 @@ gradlew.bat
 *.ipr
 *.iws
 .vscode/
+*.code-workspace
 
 # OS
 .DS_Store
