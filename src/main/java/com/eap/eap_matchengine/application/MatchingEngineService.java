@@ -82,7 +82,7 @@ public class MatchingEngineService {
 
     while (incomingOrder.getAmount() > 0) {
       // Use Lua script to atomically get and remove best match order
-      OrderConfirmedEvent matchOrder = orderBookService.getAndRemoveBestMatchOrderLua(isBuy, incomingOrder.getPrice());
+      OrderConfirmedEvent matchOrder = orderBookService.getAndRemoveBestMatchOrderLua(incomingOrder);
 
       if (matchOrder == null) {
         // No matching order found, add remaining order to orderbook atomically
@@ -136,6 +136,9 @@ public class MatchingEngineService {
           .sellerId(isBuy ? matchOrder.getUserId() : incomingOrder.getUserId())
           .buyerOrderId(isBuy ? incomingOrder.getOrderId() : matchOrder.getOrderId())
           .sellerOrderId(isBuy ? matchOrder.getOrderId() : incomingOrder.getOrderId())
+          .marketId(incomingOrder.getMarketId())
+          .buyerMarketSequence(isBuy ? incomingOrder.getMarketSequence() : matchOrder.getMarketSequence())
+          .sellerMarketSequence(isBuy ? matchOrder.getMarketSequence() : incomingOrder.getMarketSequence())
           .originBuyerPrice(isBuy ? incomingOrder.getPrice(): matchOrder.getPrice())
           .originSellerPrice(isBuy ? matchOrder.getPrice() : incomingOrder.getPrice())
           .dealPrice(matchOrder.getPrice())

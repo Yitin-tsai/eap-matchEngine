@@ -31,8 +31,8 @@ import jakarta.annotation.PostConstruct;
 @Slf4j
 public class RedisOrderBookService {
 
-    private final String BUY_ORDERBOOK_KEY = "orderbook:buy";
-    private final String SELL_ORDERBOOK_KEY = "orderbook:sell";
+    private static final String DEFAULT_MARKET_ID = "ENERGY-SPOT";
+    private static final long SCORE_FACTOR = 1_000_000_000L;
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
 
@@ -80,15 +80,16 @@ public class RedisOrderBookService {
      * @throws JsonProcessingException if the order cannot be serialized to JSON
      */
     public void addOrder(OrderConfirmedEvent event) throws JsonProcessingException {
-        String orderbookKey = event.getOrderType().equalsIgnoreCase("BUY") ? BUY_ORDERBOOK_KEY : SELL_ORDERBOOK_KEY;
+        String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
         String orderJson = objectMapper.writeValueAsString(event);
+        double orderScore = scoreFor(event);
 
         List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey);
         List<String> args = List.of(
             event.getOrderId().toString(),
-            String.valueOf(event.getPrice()),
+            String.valueOf(orderScore),
             orderJson
         );
 
@@ -129,7 +130,7 @@ public class RedisOrderBookService {
      * @param event The order event to be removed
      */
     public void removeOrder(OrderConfirmedEvent event) {
-        String orderbookKey = event.getOrderType().equalsIgnoreCase("BUY") ? BUY_ORDERBOOK_KEY : SELL_ORDERBOOK_KEY;
+        String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
 
@@ -183,7 +184,7 @@ public class RedisOrderBookService {
             OrderConfirmedEvent order = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
 
             // Use Lua script to atomically remove
-            String orderbookKey = order.getOrderType().equalsIgnoreCase("BUY") ? BUY_ORDERBOOK_KEY : SELL_ORDERBOOK_KEY;
+            String orderbookKey = orderbookKey(order);
             String userOrdersKey = "user:" + order.getUserId() + ":orders";
 
             List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey);
@@ -263,12 +264,18 @@ public class RedisOrderBookService {
      * @param price the price limit for matching
      * @return the matched order, or null if no match found
      */
-    public OrderConfirmedEvent getAndRemoveBestMatchOrderLua(boolean isBuy, int price) {
-        String orderbookKey = isBuy ? SELL_ORDERBOOK_KEY : BUY_ORDERBOOK_KEY;
+    public OrderConfirmedEvent getAndRemoveBestMatchOrderLua(OrderConfirmedEvent incomingOrder) {
+        boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
+        String orderbookKey = isBuy
+                ? orderbookKey(marketId(incomingOrder), "sell")
+                : orderbookKey(marketId(incomingOrder), "buy");
         String luaScript = isBuy ? getAndRemoveMatchOrderBuyLuaScript : getAndRemoveMatchOrderSellLuaScript;
+        double priceBoundary = isBuy
+                ? maxSellScore(incomingOrder.getPrice())
+                : minBuyScore(incomingOrder.getPrice());
 
         List<String> keys = List.of(orderbookKey);
-        List<String> args = List.of(String.valueOf(price));
+        List<String> args = List.of(String.valueOf(priceBoundary));
 
         String orderJson = redisTemplate.execute((RedisCallback<String>) connection -> {
             // Flatten keys and args into single byte[] varargs array
@@ -290,7 +297,7 @@ public class RedisOrderBookService {
         });
 
         if (orderJson == null) {
-            log.debug("No matching order found for price {}, isBuy={}", price, isBuy);
+            log.debug("No matching order found for price {}, isBuy={}", incomingOrder.getPrice(), isBuy);
             return null;
         }
 
@@ -316,15 +323,17 @@ public class RedisOrderBookService {
      */
     public List<OrderConfirmedEvent> getMatchableOrders(OrderConfirmedEvent incomingOrder) {
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
-        String oppositeKey = isBuy ? SELL_ORDERBOOK_KEY : BUY_ORDERBOOK_KEY;
+        String oppositeKey = isBuy
+                ? orderbookKey(marketId(incomingOrder), "sell")
+                : orderbookKey(marketId(incomingOrder), "buy");
 
         Set<String> results;
         if (isBuy) {
             // Find sell orders with price <= buy price
-            results = redisTemplate.opsForZSet().rangeByScore(oppositeKey, 0, incomingOrder.getPrice());
+            results = redisTemplate.opsForZSet().rangeByScore(oppositeKey, 0, maxSellScore(incomingOrder.getPrice()));
         } else {
             // Find buy orders with price >= sell price
-            results = redisTemplate.opsForZSet().reverseRangeByScore(oppositeKey, incomingOrder.getPrice(), Double.POSITIVE_INFINITY);
+            results = redisTemplate.opsForZSet().reverseRangeByScore(oppositeKey, minBuyScore(incomingOrder.getPrice()), Double.POSITIVE_INFINITY);
         }
 
         if (results == null || results.isEmpty()) {
@@ -345,5 +354,37 @@ public class RedisOrderBookService {
                 })
                 .filter(event -> event != null)
                 .collect(Collectors.toList());
+    }
+
+    private String orderbookKey(OrderConfirmedEvent event) {
+        String side = event.getOrderType().equalsIgnoreCase("BUY") ? "buy" : "sell";
+        return orderbookKey(marketId(event), side);
+    }
+
+    private String orderbookKey(String marketId, String side) {
+        return "orderbook:" + marketId + ":" + side;
+    }
+
+    private String marketId(OrderConfirmedEvent event) {
+        return event.getMarketId() == null || event.getMarketId().isBlank()
+                ? DEFAULT_MARKET_ID
+                : event.getMarketId();
+    }
+
+    private double scoreFor(OrderConfirmedEvent event) {
+        long sequence = event.getMarketSequence() == null ? 0L : event.getMarketSequence();
+        long boundedSequence = Math.floorMod(sequence, SCORE_FACTOR);
+        if (event.getOrderType().equalsIgnoreCase("BUY")) {
+            return ((long) event.getPrice() * SCORE_FACTOR) + (SCORE_FACTOR - boundedSequence);
+        }
+        return ((long) event.getPrice() * SCORE_FACTOR) + boundedSequence;
+    }
+
+    private double maxSellScore(int buyLimitPrice) {
+        return ((long) buyLimitPrice * SCORE_FACTOR) + (SCORE_FACTOR - 1);
+    }
+
+    private double minBuyScore(int sellLimitPrice) {
+        return (long) sellLimitPrice * SCORE_FACTOR;
     }
 }

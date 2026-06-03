@@ -5,15 +5,15 @@
 -- For BUY orders: finds sell orders with price <= buy price (lowest sell price first)
 --
 -- KEYS[1]: orderbook ZSet key (e.g., "orderbook:sell")
--- ARGV[1]: max price (buy order's price limit)
+-- ARGV[1]: max composite score (buy order's price limit)
 --
 -- Returns: order JSON string, or nil if no match found
 
 local orderbook_key = KEYS[1]
-local max_price = tonumber(ARGV[1])
+local max_score = tonumber(ARGV[1])
 
 -- Find the best matching order (lowest sell price)
-local orders = redis.call('ZRANGEBYSCORE', orderbook_key, '-inf', max_price, 'LIMIT', 0, 1)
+local orders = redis.call('ZRANGEBYSCORE', orderbook_key, '-inf', max_score, 'LIMIT', 0, 1)
 
 if #orders == 0 then
     return nil

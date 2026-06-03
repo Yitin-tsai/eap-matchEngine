@@ -6,7 +6,7 @@
 -- KEYS[3]: user orders Set key (e.g., "user:uuid:orders")
 --
 -- ARGV[1]: order ID (string)
--- ARGV[2]: price (number, used as ZSet score)
+-- ARGV[2]: score (number, composite price + sequence score)
 -- ARGV[3]: order JSON (string)
 --
 -- Returns: 1 on success
@@ -16,11 +16,11 @@ local order_id_key = KEYS[2]
 local user_orders_key = KEYS[3]
 
 local order_id = ARGV[1]
-local price = tonumber(ARGV[2])
+local score = tonumber(ARGV[2])
 local order_json = ARGV[3]
 
 -- All three operations are atomic within this Lua script
-redis.call('ZADD', orderbook_key, price, order_id)
+redis.call('ZADD', orderbook_key, score, order_id)
 redis.call('SET', order_id_key, order_json)
 redis.call('SADD', user_orders_key, order_id)
 
