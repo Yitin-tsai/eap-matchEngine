@@ -140,4 +140,15 @@
             <column name="trade_executed_at"/>
         </createIndex>
     </changeSet>
+
+    <changeSet id="match-trade-005" author="eap">
+        <comment>Add delayed detection and repair metadata to trade completion view</comment>
+        <addColumn tableName="trade_completion_view" schemaName="match_engine">
+            <column name="delayed_detected_at" type="TIMESTAMP"/>
+            <column name="last_missing_markers" type="VARCHAR(120)"/>
+            <column name="repair_attempt_count" type="INT" defaultValueNumeric="0">
+                <constraints nullable="false"/>
+            </column>
+        </addColumn>
+    </changeSet>
 </databaseChangeLog>

@@ -78,6 +78,11 @@ eap:
       max-attempts: 10
       initial-backoff-ms: 1000
       max-backoff-ms: 300000
+    trade-completion-reconciler:
+      enabled: true
+      batch-size: 100
+      poll-interval-ms: 5000
+      delayed-threshold-seconds: 30
 
 management:
   endpoints:

@@ -17,3 +17,5 @@ eap:
       enabled: false
     trade-outbox-relay:
       enabled: false
+    trade-completion-reconciler:
+      enabled: false
