@@ -116,4 +116,28 @@
             WHERE status = 'PENDING';
         </sql>
     </changeSet>
+
+    <changeSet id="match-trade-004" author="eap">
+        <comment>Track downstream completion state for each TradeExecuted fact</comment>
+        <createTable tableName="trade_completion_view" schemaName="match_engine">
+            <column name="trade_id" type="VARCHAR(80)">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="trade_executed_at" type="TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+            <column name="buyer_order_applied_at" type="TIMESTAMP"/>
+            <column name="seller_order_applied_at" type="TIMESTAMP"/>
+            <column name="wallet_settled_at" type="TIMESTAMP"/>
+            <column name="completed_at" type="TIMESTAMP"/>
+            <column name="updated_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <createIndex tableName="trade_completion_view" schemaName="match_engine"
+                     indexName="idx_trade_completion_incomplete">
+            <column name="completed_at"/>
+            <column name="trade_executed_at"/>
+        </createIndex>
+    </changeSet>
 </databaseChangeLog>

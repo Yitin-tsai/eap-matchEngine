@@ -8,6 +8,7 @@ import org.springframework.amqp.core.FanoutExchange;
 import org.springframework.amqp.core.TopicExchange;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -55,14 +56,48 @@ public class RabbitMQConfig {
         return new TopicExchange(TRADE_EXCHANGE);
     }
 
+    @Bean
+    public Queue matchEngineOrderTradeAppliedQueue() {
+        return QueueBuilder.durable(MATCH_ENGINE_ORDER_TRADE_APPLIED_QUEUE)
+                .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+                .build();
+    }
+
+    @Bean
+    public Queue matchEngineWalletTradeSettledQueue() {
+        return QueueBuilder.durable(MATCH_ENGINE_WALLET_TRADE_SETTLED_QUEUE)
+                .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+                .build();
+    }
+
     /**
      * Bind matchEngine queue to order.confirmed routing key
      */
     @Bean
-    public Binding matchEngineOrderConfirmedBinding(Queue matchEngineOrderConfirmedQueue, TopicExchange orderExchange) {
+    public Binding matchEngineOrderConfirmedBinding(
+            @Qualifier("matchEngineOrderConfirmedQueue") Queue matchEngineOrderConfirmedQueue,
+            @Qualifier("orderExchange") TopicExchange orderExchange) {
         return BindingBuilder.bind(matchEngineOrderConfirmedQueue)
                 .to(orderExchange)
                 .with(ORDER_CONFIRMED_KEY);
+    }
+
+    @Bean
+    public Binding matchEngineOrderTradeAppliedBinding(
+            @Qualifier("matchEngineOrderTradeAppliedQueue") Queue matchEngineOrderTradeAppliedQueue,
+            @Qualifier("tradeExchange") TopicExchange tradeExchange) {
+        return BindingBuilder.bind(matchEngineOrderTradeAppliedQueue)
+                .to(tradeExchange)
+                .with(TRADE_ORDER_APPLIED_KEY);
+    }
+
+    @Bean
+    public Binding matchEngineWalletTradeSettledBinding(
+            @Qualifier("matchEngineWalletTradeSettledQueue") Queue matchEngineWalletTradeSettledQueue,
+            @Qualifier("tradeExchange") TopicExchange tradeExchange) {
+        return BindingBuilder.bind(matchEngineWalletTradeSettledQueue)
+                .to(tradeExchange)
+                .with(TRADE_WALLET_SETTLED_KEY);
     }
 
     // ==================== Auction (Timed Double Auction) ====================
@@ -90,7 +125,9 @@ public class RabbitMQConfig {
      * Bind matchEngine auction bid queue to auction.bid.confirmed routing key
      */
     @Bean
-    public Binding matchEngineAuctionBidConfirmedBinding(Queue matchEngineAuctionBidConfirmedQueue, TopicExchange auctionExchange) {
+    public Binding matchEngineAuctionBidConfirmedBinding(
+            @Qualifier("matchEngineAuctionBidConfirmedQueue") Queue matchEngineAuctionBidConfirmedQueue,
+            @Qualifier("auctionExchange") TopicExchange auctionExchange) {
         return BindingBuilder.bind(matchEngineAuctionBidConfirmedQueue)
                 .to(auctionExchange)
                 .with(AUCTION_BID_CONFIRMED_KEY);
@@ -111,7 +148,9 @@ public class RabbitMQConfig {
     }
 
     @Bean
-    public Binding dlqBinding(Queue deadLetterQueue, FanoutExchange deadLetterExchange) {
+    public Binding dlqBinding(
+            @Qualifier("deadLetterQueue") Queue deadLetterQueue,
+            FanoutExchange deadLetterExchange) {
         return BindingBuilder.bind(deadLetterQueue).to(deadLetterExchange);
     }
 

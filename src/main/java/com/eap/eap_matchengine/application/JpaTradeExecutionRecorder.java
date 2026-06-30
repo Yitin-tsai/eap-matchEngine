@@ -23,6 +23,7 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
 
     private final TradeExecutionRepository tradeExecutionRepository;
     private final TradeOutboxRepository tradeOutboxRepository;
+    private final TradeCompletionService tradeCompletionService;
     private final ObjectMapper objectMapper;
 
     @Override
@@ -56,6 +57,7 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
                 event.getTradeId(),
                 RabbitMQConstants.TRADE_EXECUTED_KEY,
                 serialize(event)));
+        tradeCompletionService.markTradeExecuted(event);
     }
 
     private String serialize(TradeExecutedEvent event) {
