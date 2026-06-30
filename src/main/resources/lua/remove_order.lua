@@ -7,7 +7,7 @@
 --
 -- ARGV[1]: order ID (string)
 --
--- Returns: 1 if removed, 0 if order not found in orderbook
+-- Returns: 1 if any orderbook/detail/user reference was removed, 0 if nothing existed
 
 local orderbook_key = KEYS[1]
 local order_id_key = KEYS[2]
@@ -15,15 +15,12 @@ local user_orders_key = KEYS[3]
 
 local order_id = ARGV[1]
 
--- Check if order exists in orderbook
 local removed = redis.call('ZREM', orderbook_key, order_id)
+local deleted = redis.call('DEL', order_id_key)
+local unlinked = redis.call('SREM', user_orders_key, order_id)
 
-if removed > 0 then
-    -- Order was in orderbook, remove all related data
-    redis.call('DEL', order_id_key)
-    redis.call('SREM', user_orders_key, order_id)
+if removed > 0 or deleted > 0 or unlinked > 0 then
     return 1
-else
-    -- Order not in orderbook (might have been matched already)
-    return 0
 end
+
+return 0

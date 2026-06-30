@@ -2,6 +2,7 @@ package com.eap.eap_matchengine;
 
 import com.eap.eap_matchengine.application.MatchingEngineService;
 import com.eap.eap_matchengine.application.RedisOrderBookService;
+import com.eap.eap_matchengine.application.TradeExecutionRecorder;
 import com.eap.common.event.OrderConfirmedEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -52,6 +53,9 @@ public class BaseContractTest {
 
     @MockitoBean
     private RedissonClient redissonClient;
+
+    @MockitoBean
+    private TradeExecutionRecorder tradeExecutionRecorder;
 
     @BeforeEach
     public void setup() {

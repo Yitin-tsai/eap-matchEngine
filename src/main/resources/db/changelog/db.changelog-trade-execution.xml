@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+         http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-3.8.xsd">
+
+    <changeSet id="match-trade-001" author="eap">
+        <sql>CREATE SCHEMA IF NOT EXISTS match_engine;</sql>
+    </changeSet>
+
+    <changeSet id="match-trade-002" author="eap">
+        <createTable tableName="trade_executions" schemaName="match_engine">
+            <column name="id" type="BIGSERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="trade_id" type="VARCHAR(80)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="sequence" type="BIGINT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="legacy_match_id" type="BIGINT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="market_id" type="VARCHAR(100)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="buyer_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="seller_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="buyer_order_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="seller_order_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="buyer_market_sequence" type="BIGINT"/>
+            <column name="seller_market_sequence" type="BIGINT"/>
+            <column name="origin_buyer_price" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="origin_seller_price" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="deal_price" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="quantity" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="occurred_at" type="TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <addUniqueConstraint tableName="trade_executions" schemaName="match_engine"
+                             columnNames="trade_id" constraintName="uk_trade_executions_trade_id"/>
+        <addUniqueConstraint tableName="trade_executions" schemaName="match_engine"
+                             columnNames="market_id, sequence" constraintName="uk_trade_executions_market_sequence"/>
+        <addUniqueConstraint tableName="trade_executions" schemaName="match_engine"
+                             columnNames="legacy_match_id" constraintName="uk_trade_executions_legacy_match_id"/>
+        <createIndex tableName="trade_executions" schemaName="match_engine" indexName="idx_trade_executions_buyer_order">
+            <column name="buyer_order_id"/>
+        </createIndex>
+        <createIndex tableName="trade_executions" schemaName="match_engine" indexName="idx_trade_executions_seller_order">
+            <column name="seller_order_id"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="match-trade-003" author="eap">
+        <createTable tableName="trade_outbox" schemaName="match_engine">
+            <column name="id" type="BIGSERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="event_type" type="VARCHAR(80)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="aggregate_type" type="VARCHAR(80)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="aggregate_id" type="VARCHAR(80)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="routing_key" type="VARCHAR(80)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="payload" type="TEXT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="status" type="VARCHAR(10)" defaultValue="PENDING">
+                <constraints nullable="false"/>
+            </column>
+            <column name="attempt_count" type="INT" defaultValueNumeric="0">
+                <constraints nullable="false"/>
+            </column>
+            <column name="next_retry_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP"/>
+            <column name="last_error" type="VARCHAR(1000)"/>
+            <column name="created_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+            <column name="updated_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <addUniqueConstraint tableName="trade_outbox" schemaName="match_engine"
+                             columnNames="event_type, aggregate_id" constraintName="uk_trade_outbox_event_aggregate"/>
+        <sql>
+            CREATE INDEX idx_trade_outbox_pending_retry
+            ON match_engine.trade_outbox(next_retry_at, created_at)
+            WHERE status = 'PENDING';
+        </sql>
+    </changeSet>
+</databaseChangeLog>

@@ -5,3 +5,13 @@ spring:
       verifier:
         messaging:
           type: rabbit
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+      - org.springframework.boot.autoconfigure.liquibase.LiquibaseAutoConfiguration
+
+eap:
+  match-engine:
+    trade-persistence:
+      enabled: false

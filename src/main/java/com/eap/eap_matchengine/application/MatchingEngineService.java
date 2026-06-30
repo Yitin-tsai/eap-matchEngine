@@ -2,6 +2,7 @@ package com.eap.eap_matchengine.application;
 
 import com.eap.common.event.OrderConfirmedEvent;
 import com.eap.common.event.OrderMatchedEvent;
+import com.eap.common.event.TradeExecutedEvent;
 import com.fasterxml.jackson.core.JsonProcessingException;
 
 import java.time.LocalDateTime;
@@ -35,6 +36,7 @@ public class MatchingEngineService {
   private final RabbitTemplate rabbitTemplate;
   private final RedisTemplate<String, String> redisTemplate;
   private final RedissonClient redissonClient;
+  private final TradeExecutionRecorder tradeExecutionRecorder;
 
   private static final String MATCH_ID_KEY = "match:id:sequence";
   private static final String ORDER_LOCK_PREFIX = "lock:order:";
@@ -147,6 +149,10 @@ public class MatchingEngineService {
           .orderType(incomingOrder.getOrderType())
           .build();
 
+      TradeExecutedEvent tradeExecutedEvent = toTradeExecutedEvent(matchedEvent);
+      tradeExecutionRecorder.record(tradeExecutedEvent);
+      log.debug("Persisted TradeExecutedEvent for tradeId={}", tradeExecutedEvent.getTradeId());
+
       // Publish match event once - all interested modules will receive via their own queues
       rabbitTemplate.convertAndSend(ORDER_EXCHANGE, ORDER_MATCHED_KEY, matchedEvent);
       log.debug("Published OrderMatchedEvent for matchId={}", matchId);
@@ -188,11 +194,27 @@ public class MatchingEngineService {
         log.info("Order fully matched and removed: orderId={}", matchOrder.getOrderId());
       }
     }
+  }
 
-    // If incoming order is fully matched, remove it too
-    if (incomingOrder.getAmount() == 0) {
-      orderBookService.removeOrder(incomingOrder);
-      log.info("Incoming order fully matched and removed: orderId={}", incomingOrder.getOrderId());
-    }
+  private TradeExecutedEvent toTradeExecutedEvent(OrderMatchedEvent matchedEvent) {
+    Long sequence = matchedEvent.getMatchId().longValue();
+    String marketId = matchedEvent.getMarketId() == null ? "UNKNOWN" : matchedEvent.getMarketId();
+    return TradeExecutedEvent.builder()
+        .tradeId(marketId + "-" + sequence)
+        .sequence(sequence)
+        .legacyMatchId(matchedEvent.getMatchId())
+        .marketId(marketId)
+        .buyerId(matchedEvent.getBuyerId())
+        .sellerId(matchedEvent.getSellerId())
+        .buyerOrderId(matchedEvent.getBuyerOrderId())
+        .sellerOrderId(matchedEvent.getSellerOrderId())
+        .buyerMarketSequence(matchedEvent.getBuyerMarketSequence())
+        .sellerMarketSequence(matchedEvent.getSellerMarketSequence())
+        .originBuyerPrice(matchedEvent.getOriginBuyerPrice())
+        .originSellerPrice(matchedEvent.getOriginSellerPrice())
+        .dealPrice(matchedEvent.getDealPrice())
+        .quantity(matchedEvent.getAmount())
+        .occurredAt(matchedEvent.getMatchedAt())
+        .build();
   }
 }

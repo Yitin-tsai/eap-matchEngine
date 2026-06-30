@@ -7,6 +7,25 @@ spring:
   application:
     name: match-engine
 
+  datasource:
+    url: jdbc:postgresql://localhost:5432/eapdb
+    username: admin
+    password: admin123
+
+  liquibase:
+    enabled: true
+    change-log: classpath:db/changelog/db.changelog-master.xml
+    contexts: dev
+    drop-first: false
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
   data:
     redis:
       host: localhost
@@ -20,6 +39,10 @@ spring:
     username: admin
     password: admin123
     virtual-host: /
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
     listener:
       simple:
         prefetch: 10
@@ -42,6 +65,11 @@ springdoc:
     path: /v3/api-docs
   swagger-ui:
     path: /swagger-ui.html
+
+eap:
+  match-engine:
+    trade-persistence:
+      enabled: true
 
 auction:
   enabled: true

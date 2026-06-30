@@ -29,10 +29,13 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-web'
     implementation 'org.springframework.boot:spring-boot-starter-amqp'
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.liquibase:liquibase-core'
     implementation 'org.redisson:redisson-spring-boot-starter:3.37.0'
 
     implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310'
     implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.6'
+    runtimeOnly 'org.postgresql:postgresql'
 
     compileOnly "org.projectlombok:lombok"
     annotationProcessor "org.projectlombok:lombok"
@@ -53,4 +56,18 @@ tasks.named("generateContractTests") {
 
 tasks.named('test') {
     useJUnitPlatform()
+}
+
+tasks.register('matchEngineCoreLoadTest', JavaExec) {
+    group = 'verification'
+    description = 'Benchmark and verify the Redis/Lua CDA matching core without Order/Wallet/DB overhead.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_matchengine.loadtest.MatchEngineCoreLoadGenerator'
+}
+
+tasks.register('matchEngineAmqpLoadTest', JavaExec) {
+    group = 'verification'
+    description = 'Publish OrderConfirmedEvent through RabbitMQ and capture OrderMatchedEvent output.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_matchengine.loadtest.MatchEngineAmqpLoadGenerator'
 }

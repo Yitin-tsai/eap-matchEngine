@@ -1,0 +1,12 @@
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        concurrency: 16
+        max-concurrency: 16
+        prefetch: 50
+
+logging:
+  level:
+    root: WARN
+    '[com.eap.eap_matchengine]': WARN
