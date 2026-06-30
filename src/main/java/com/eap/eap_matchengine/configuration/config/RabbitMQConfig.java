@@ -50,6 +50,11 @@ public class RabbitMQConfig {
         return new TopicExchange(ORDER_EXCHANGE);
     }
 
+    @Bean
+    public TopicExchange tradeExchange() {
+        return new TopicExchange(TRADE_EXCHANGE);
+    }
+
     /**
      * Bind matchEngine queue to order.confirmed routing key
      */

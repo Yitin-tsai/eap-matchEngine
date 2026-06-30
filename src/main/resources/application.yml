@@ -70,6 +70,23 @@ eap:
   match-engine:
     trade-persistence:
       enabled: true
+    trade-outbox-relay:
+      enabled: true
+      batch-size: 200
+      poll-interval-ms: 500
+      confirm-timeout-ms: 5000
+      max-attempts: 10
+      initial-backoff-ms: 1000
+      max-backoff-ms: 300000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  metrics:
+    tags:
+      application: eap-matchEngine
 
 auction:
   enabled: true

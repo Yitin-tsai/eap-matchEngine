@@ -15,3 +15,5 @@ eap:
   match-engine:
     trade-persistence:
       enabled: false
+    trade-outbox-relay:
+      enabled: false
