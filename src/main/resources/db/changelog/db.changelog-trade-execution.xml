@@ -151,4 +151,21 @@
             </column>
         </addColumn>
     </changeSet>
+
+    <changeSet id="match-trade-006" author="eap">
+        <comment>Collapse buyer/seller order completion markers into one trade-level order marker</comment>
+        <addColumn tableName="trade_completion_view" schemaName="match_engine">
+            <column name="order_applied_at" type="TIMESTAMP"/>
+        </addColumn>
+        <sql>
+            UPDATE match_engine.trade_completion_view
+            SET order_applied_at = GREATEST(buyer_order_applied_at, seller_order_applied_at)
+            WHERE buyer_order_applied_at IS NOT NULL
+              AND seller_order_applied_at IS NOT NULL;
+        </sql>
+        <dropColumn tableName="trade_completion_view" schemaName="match_engine"
+                    columnName="buyer_order_applied_at"/>
+        <dropColumn tableName="trade_completion_view" schemaName="match_engine"
+                    columnName="seller_order_applied_at"/>
+    </changeSet>
 </databaseChangeLog>

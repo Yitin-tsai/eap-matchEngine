@@ -34,24 +34,21 @@ public class TradeCompletionService {
     @Transactional
     public void markOrderApplied(OrderTradeAppliedEvent event) {
         LocalDateTime appliedAt = event.getAppliedAt() == null ? LocalDateTime.now() : event.getAppliedAt();
-        String column = "SELL".equals(event.getSide()) ? "seller_order_applied_at" : "buyer_order_applied_at";
-        String otherOrderColumn = "SELL".equals(event.getSide()) ? "buyer_order_applied_at" : "seller_order_applied_at";
         jdbcTemplate.update("""
                 INSERT INTO match_engine.trade_completion_view
-                    (trade_id, trade_executed_at, %s, updated_at)
+                    (trade_id, trade_executed_at, order_applied_at, updated_at)
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT (trade_id) DO UPDATE
-                SET %s = EXCLUDED.%s,
+                SET order_applied_at = EXCLUDED.order_applied_at,
                     completed_at = CASE
                         WHEN match_engine.trade_completion_view.completed_at IS NULL
                          AND match_engine.trade_completion_view.trade_executed_at IS NOT NULL
-                         AND match_engine.trade_completion_view.%s IS NOT NULL
                          AND match_engine.trade_completion_view.wallet_settled_at IS NOT NULL
                         THEN CURRENT_TIMESTAMP
                         ELSE match_engine.trade_completion_view.completed_at
                     END,
                     updated_at = CURRENT_TIMESTAMP
-                """.formatted(column, column, column, otherOrderColumn),
+                """,
                 event.getTradeId(),
                 appliedAt,
                 appliedAt);
@@ -69,8 +66,7 @@ public class TradeCompletionService {
                     completed_at = CASE
                         WHEN match_engine.trade_completion_view.completed_at IS NULL
                          AND match_engine.trade_completion_view.trade_executed_at IS NOT NULL
-                         AND match_engine.trade_completion_view.buyer_order_applied_at IS NOT NULL
-                         AND match_engine.trade_completion_view.seller_order_applied_at IS NOT NULL
+                         AND match_engine.trade_completion_view.order_applied_at IS NOT NULL
                         THEN CURRENT_TIMESTAMP
                         ELSE match_engine.trade_completion_view.completed_at
                     END,
@@ -97,8 +93,7 @@ public class TradeCompletionService {
                     updated_at = CURRENT_TIMESTAMP
                 WHERE completed_at IS NULL
                   AND trade_executed_at IS NOT NULL
-                  AND buyer_order_applied_at IS NOT NULL
-                  AND seller_order_applied_at IS NOT NULL
+                  AND order_applied_at IS NOT NULL
                   AND wallet_settled_at IS NOT NULL
                 """);
     }
@@ -108,8 +103,7 @@ public class TradeCompletionService {
                 SELECT trade_id,
                        trade_executed_at,
                        CONCAT_WS(',',
-                           CASE WHEN buyer_order_applied_at IS NULL THEN 'BUYER_ORDER_APPLIED' END,
-                           CASE WHEN seller_order_applied_at IS NULL THEN 'SELLER_ORDER_APPLIED' END,
+                           CASE WHEN order_applied_at IS NULL THEN 'ORDER_APPLIED' END,
                            CASE WHEN wallet_settled_at IS NULL THEN 'WALLET_SETTLED' END
                        ) AS missing_markers,
                        repair_attempt_count

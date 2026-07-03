@@ -22,8 +22,8 @@ public class TradeCompletionListener {
             concurrency = "${eap.match-engine.listeners.order-trade-applied.concurrency:2}")
     public void handleOrderTradeApplied(OrderTradeAppliedEvent event) {
         tradeCompletionService.markOrderApplied(event);
-        log.debug("Order trade applied marker consumed: tradeId={}, orderId={}, side={}",
-                event.getTradeId(), event.getOrderId(), event.getSide());
+        log.debug("Order trade applied marker consumed: tradeId={}, buyerOrderId={}, sellerOrderId={}",
+                event.getTradeId(), event.getBuyerOrderId(), event.getSellerOrderId());
     }
 
     @RabbitListener(

@@ -23,7 +23,7 @@ class TradeCompletionReconcilerTest {
                 new TradeCompletionService.DelayedTradeCompletion(
                         "trade-1",
                         LocalDateTime.now().minusMinutes(5),
-                        "BUYER_ORDER_APPLIED,WALLET_SETTLED",
+                        "ORDER_APPLIED,WALLET_SETTLED",
                         0);
         when(tradeCompletionService.findDelayedCompletions(any(), anyInt()))
                 .thenReturn(List.of(delayed));

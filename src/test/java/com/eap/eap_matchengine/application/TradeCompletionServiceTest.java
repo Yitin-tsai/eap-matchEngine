@@ -21,11 +21,10 @@ class TradeCompletionServiceTest {
     private final TradeCompletionService service = new TradeCompletionService(jdbcTemplate);
 
     @Test
-    void markOrderApplied_shouldUseSingleUpsertForBuyerMarker() {
+    void markOrderApplied_shouldUseSingleUpsertForTradeLevelOrderMarker() {
         LocalDateTime appliedAt = LocalDateTime.of(2026, 7, 3, 9, 30);
         OrderTradeAppliedEvent event = OrderTradeAppliedEvent.builder()
                 .tradeId("trade-1")
-                .side("BUY")
                 .appliedAt(appliedAt)
                 .build();
 
@@ -37,35 +36,10 @@ class TradeCompletionServiceTest {
 
         assertThat(sql.getValue())
                 .contains("INSERT INTO match_engine.trade_completion_view")
-                .contains("(trade_id, trade_executed_at, buyer_order_applied_at, updated_at)")
+                .contains("(trade_id, trade_executed_at, order_applied_at, updated_at)")
                 .contains("ON CONFLICT (trade_id) DO UPDATE")
-                .contains("SET buyer_order_applied_at = EXCLUDED.buyer_order_applied_at")
-                .contains("match_engine.trade_completion_view.seller_order_applied_at IS NOT NULL")
+                .contains("SET order_applied_at = EXCLUDED.order_applied_at")
                 .contains("match_engine.trade_completion_view.wallet_settled_at IS NOT NULL")
-                .doesNotContain("ON CONFLICT (trade_id) DO NOTHING")
-                .doesNotContain("WHERE trade_id = ?");
-    }
-
-    @Test
-    void markOrderApplied_shouldUseSingleUpsertForSellerMarker() {
-        LocalDateTime appliedAt = LocalDateTime.of(2026, 7, 3, 9, 31);
-        OrderTradeAppliedEvent event = OrderTradeAppliedEvent.builder()
-                .tradeId("trade-2")
-                .side("SELL")
-                .appliedAt(appliedAt)
-                .build();
-
-        service.markOrderApplied(event);
-
-        ArgumentCaptor<String> sql = ArgumentCaptor.forClass(String.class);
-        verify(jdbcTemplate).update(sql.capture(), eq("trade-2"), eq(appliedAt), eq(appliedAt));
-        verifyNoMoreInteractions(jdbcTemplate);
-
-        assertThat(sql.getValue())
-                .contains("(trade_id, trade_executed_at, seller_order_applied_at, updated_at)")
-                .contains("SET seller_order_applied_at = EXCLUDED.seller_order_applied_at")
-                .contains("match_engine.trade_completion_view.buyer_order_applied_at IS NOT NULL")
-                .contains("ON CONFLICT (trade_id) DO UPDATE")
                 .doesNotContain("ON CONFLICT (trade_id) DO NOTHING")
                 .doesNotContain("WHERE trade_id = ?");
     }
@@ -88,8 +62,7 @@ class TradeCompletionServiceTest {
                 .contains("ON CONFLICT (trade_id) DO UPDATE")
                 .contains("SET wallet_settled_at = EXCLUDED.wallet_settled_at")
                 .contains("completed_at = CASE")
-                .contains("buyer_order_applied_at IS NOT NULL")
-                .contains("seller_order_applied_at IS NOT NULL")
+                .contains("order_applied_at IS NOT NULL")
                 .doesNotContain("WHERE trade_id = ?");
     }
 
