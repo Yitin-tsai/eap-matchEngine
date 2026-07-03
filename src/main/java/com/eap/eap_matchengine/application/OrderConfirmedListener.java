@@ -20,7 +20,9 @@ public class OrderConfirmedListener {
      * CDA mode only - handles continuous double auction order matching.
      * Auction bids flow through AuctionBidConfirmedListener instead.
      */
-    @RabbitListener(queues = MATCH_ENGINE_ORDER_CONFIRMED_QUEUE)
+    @RabbitListener(
+            queues = MATCH_ENGINE_ORDER_CONFIRMED_QUEUE,
+            concurrency = "${eap.match-engine.listeners.order-confirmed.concurrency:8}")
     public void handleConfirmedOrder(OrderConfirmedEvent event) throws JsonProcessingException {
         log.info("Confirmed order received: orderId={}, userId={}, type={}, price={}, amount={}",
                 event.getOrderId(), event.getUserId(), event.getOrderType(),

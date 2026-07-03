@@ -1,12 +1,40 @@
 spring:
+  datasource:
+    url: jdbc:postgresql://localhost:15434/eap_match_db
+    username: admin
+    password: admin123
+    hikari:
+      maximum-pool-size: 35
+      minimum-idle: 10
   rabbitmq:
     listener:
       simple:
-        concurrency: 16
-        max-concurrency: 16
+        concurrency: 8
+        max-concurrency: 32
         prefetch: 50
+
+eap:
+  match-engine:
+    listeners:
+      order-confirmed:
+        concurrency: 12
+      order-trade-applied:
+        concurrency: 12
+      wallet-trade-settled:
+        concurrency: 6
+    legacy-order-matched-publish:
+      enabled: false
+    trade-outbox-relay:
+      batch-size: 500
+      poll-interval-ms: 100
+    trade-completion-reconciler:
+      enabled: false
+      batch-size: 500
+      poll-interval-ms: 1000
+      delayed-threshold-seconds: 30
 
 logging:
   level:
-    root: WARN
     '[com.eap.eap_matchengine]': WARN
+    '[org.springframework.amqp.rabbit.listener]': WARN
+    '[org.hibernate]': WARN

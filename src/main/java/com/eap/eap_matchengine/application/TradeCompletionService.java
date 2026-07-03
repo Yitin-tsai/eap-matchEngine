@@ -35,19 +35,26 @@ public class TradeCompletionService {
     public void markOrderApplied(OrderTradeAppliedEvent event) {
         LocalDateTime appliedAt = event.getAppliedAt() == null ? LocalDateTime.now() : event.getAppliedAt();
         String column = "SELL".equals(event.getSide()) ? "seller_order_applied_at" : "buyer_order_applied_at";
+        String otherOrderColumn = "SELL".equals(event.getSide()) ? "buyer_order_applied_at" : "seller_order_applied_at";
         jdbcTemplate.update("""
                 INSERT INTO match_engine.trade_completion_view
-                    (trade_id, trade_executed_at, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT (trade_id) DO NOTHING
-                """, event.getTradeId(), appliedAt);
-        jdbcTemplate.update("""
-                UPDATE match_engine.trade_completion_view
-                SET %s = ?,
+                    (trade_id, trade_executed_at, %s, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (trade_id) DO UPDATE
+                SET %s = EXCLUDED.%s,
+                    completed_at = CASE
+                        WHEN match_engine.trade_completion_view.completed_at IS NULL
+                         AND match_engine.trade_completion_view.trade_executed_at IS NOT NULL
+                         AND match_engine.trade_completion_view.%s IS NOT NULL
+                         AND match_engine.trade_completion_view.wallet_settled_at IS NOT NULL
+                        THEN CURRENT_TIMESTAMP
+                        ELSE match_engine.trade_completion_view.completed_at
+                    END,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE trade_id = ?
-                """.formatted(column), appliedAt, event.getTradeId());
-        markCompletedIfReady(event.getTradeId());
+                """.formatted(column, column, column, otherOrderColumn),
+                event.getTradeId(),
+                appliedAt,
+                appliedAt);
     }
 
     @Transactional
@@ -59,23 +66,16 @@ public class TradeCompletionService {
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT (trade_id) DO UPDATE
                 SET wallet_settled_at = EXCLUDED.wallet_settled_at,
+                    completed_at = CASE
+                        WHEN match_engine.trade_completion_view.completed_at IS NULL
+                         AND match_engine.trade_completion_view.trade_executed_at IS NOT NULL
+                         AND match_engine.trade_completion_view.buyer_order_applied_at IS NOT NULL
+                         AND match_engine.trade_completion_view.seller_order_applied_at IS NOT NULL
+                        THEN CURRENT_TIMESTAMP
+                        ELSE match_engine.trade_completion_view.completed_at
+                    END,
                     updated_at = CURRENT_TIMESTAMP
                 """, event.getTradeId(), settledAt, settledAt);
-        markCompletedIfReady(event.getTradeId());
-    }
-
-    private void markCompletedIfReady(String tradeId) {
-        jdbcTemplate.update("""
-                UPDATE match_engine.trade_completion_view
-                SET completed_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE trade_id = ?
-                  AND completed_at IS NULL
-                  AND trade_executed_at IS NOT NULL
-                  AND buyer_order_applied_at IS NOT NULL
-                  AND seller_order_applied_at IS NOT NULL
-                  AND wallet_settled_at IS NOT NULL
-                """, tradeId);
     }
 
     @Transactional

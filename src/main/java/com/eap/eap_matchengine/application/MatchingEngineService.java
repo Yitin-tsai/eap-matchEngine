@@ -13,6 +13,7 @@ import lombok.RequiredArgsConstructor;
 import static com.eap.common.constants.RabbitMQConstants.*;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -37,6 +38,9 @@ public class MatchingEngineService {
   private final RedisTemplate<String, String> redisTemplate;
   private final RedissonClient redissonClient;
   private final TradeExecutionRecorder tradeExecutionRecorder;
+
+  @Value("${eap.match-engine.legacy-order-matched-publish.enabled:true}")
+  private boolean legacyOrderMatchedPublishEnabled;
 
   private static final String MATCH_ID_KEY = "match:id:sequence";
   private static final String ORDER_LOCK_PREFIX = "lock:order:";
@@ -153,9 +157,11 @@ public class MatchingEngineService {
       tradeExecutionRecorder.record(tradeExecutedEvent);
       log.debug("Persisted TradeExecutedEvent for tradeId={}", tradeExecutedEvent.getTradeId());
 
-      // Publish match event once - all interested modules will receive via their own queues
-      rabbitTemplate.convertAndSend(ORDER_EXCHANGE, ORDER_MATCHED_KEY, matchedEvent);
-      log.debug("Published OrderMatchedEvent for matchId={}", matchId);
+      if (legacyOrderMatchedPublishEnabled) {
+        // Legacy event path kept for backward compatibility during migration.
+        rabbitTemplate.convertAndSend(ORDER_EXCHANGE, ORDER_MATCHED_KEY, matchedEvent);
+        log.debug("Published legacy OrderMatchedEvent for matchId={}", matchId);
+      }
 
       // Handle partial match with distributed lock to prevent race conditions
       if (matchOrder.getAmount() > 0) {
