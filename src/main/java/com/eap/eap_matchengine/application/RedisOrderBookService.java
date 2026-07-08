@@ -164,6 +164,24 @@ public class RedisOrderBookService {
     }
 
     /**
+     * Removes only the user's open-order reference.
+     *
+     * Matching Lua scripts already remove the resting order from the market orderbook and delete
+     * the order detail. For a fully matched resting order, the only remaining cleanup is the
+     * user:{userId}:orders set entry. Keeping this as a single Redis SREM avoids a redundant
+     * remove_order.lua round trip on the trade hot path.
+     */
+    public void unlinkUserOrder(OrderConfirmedEvent event) {
+        String userOrdersKey = "user:" + event.getUserId() + ":orders";
+        Long removed = redisTemplate.opsForSet().remove(userOrdersKey, event.getOrderId().toString());
+        if (removed != null && removed > 0) {
+            log.debug("Successfully unlinked order {} from user open orders", event.getOrderId());
+        } else {
+            log.warn("Order {} was not linked in user open orders", event.getOrderId());
+        }
+    }
+
+    /**
      * Atomically cancels an order.
      * First retrieves order details, then uses Lua script to remove atomically.
      *

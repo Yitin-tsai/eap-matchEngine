@@ -44,7 +44,6 @@ public class MatchingEngineService {
 
   private static final String MATCH_ID_KEY = "match:id:sequence";
   private static final String ORDER_LOCK_PREFIX = "lock:order:";
-  private static final String MATCH_PROCESSED_PREFIX = "match:processed:";
 
   /**
    * Generates a unique match ID using Redis INCR operation.
@@ -54,19 +53,6 @@ public class MatchingEngineService {
    */
   private Long generateMatchId() {
     return redisTemplate.opsForValue().increment(MATCH_ID_KEY);
-  }
-
-  /**
-   * Checks if a match has already been processed (idempotency check).
-   * Uses Redis SETNX to ensure only the first caller proceeds.
-   *
-   * @param matchId The match ID to check
-   * @return true if this is the first time processing this match, false if already processed
-   */
-  private boolean isFirstTimeProcessing(Long matchId) {
-    String key = MATCH_PROCESSED_PREFIX + matchId;
-    Boolean isFirst = redisTemplate.opsForValue().setIfAbsent(key, "1", 24, TimeUnit.HOURS);
-    return Boolean.TRUE.equals(isFirst);
   }
 
   /**
@@ -108,21 +94,6 @@ public class MatchingEngineService {
 
       // Generate unique match ID using Redis INCR (atomic operation)
       Long matchId = generateMatchId();
-
-      // Idempotency check: ensure this match is processed only once
-      if (!isFirstTimeProcessing(matchId)) {
-        log.warn("Match ID {} already processed, skipping duplicate", matchId);
-        // Re-add both orders since this match shouldn't happen
-        try {
-          if (incomingOrder.getAmount() > 0) {
-            orderBookService.addOrder(incomingOrder);
-          }
-          orderBookService.addOrder(matchOrder);
-        } catch (JsonProcessingException e) {
-          log.error("Failed to re-add orders after duplicate match detection", e);
-        }
-        break;
-      }
 
       log.info("Match ID: {}, Buyer: {}, Seller: {}, Amount: {}, Price: {}",
           matchId,
@@ -195,9 +166,10 @@ public class MatchingEngineService {
           throw new RuntimeException("Interrupted while waiting for lock", e);
         }
       } else {
-        // Fully matched: remove from user's order set
-        orderBookService.removeOrder(matchOrder);
-        log.info("Order fully matched and removed: orderId={}", matchOrder.getOrderId());
+        // Fully matched: getAndRemoveBestMatchOrderLua already removed the orderbook entry and order detail.
+        // Only unlink the order from the user's open-order set here to avoid a redundant Redis Lua round trip.
+        orderBookService.unlinkUserOrder(matchOrder);
+        log.info("Order fully matched and unlinked from user open orders: orderId={}", matchOrder.getOrderId());
       }
     }
   }

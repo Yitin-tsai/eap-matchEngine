@@ -31,6 +31,7 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -82,6 +83,7 @@ public class MatchEngineCoreLoadGenerator {
                 redisTemplate,
                 redissonClient,
                 new NoopTradeExecutionRecorder());
+        ReflectionTestUtils.setField(matchingEngineService, "legacyOrderMatchedPublishEnabled", true);
 
         try {
             runCorrectnessChecks(matchingEngineService, orderBookService, redisTemplate, publishedEvents);

@@ -168,4 +168,37 @@
         <dropColumn tableName="trade_completion_view" schemaName="match_engine"
                     columnName="seller_order_applied_at"/>
     </changeSet>
+
+    <changeSet id="match-trade-007" author="eap">
+        <comment>Append-only completion markers for downstream service completion evidence</comment>
+        <createTable tableName="trade_completion_markers" schemaName="match_engine">
+            <column name="trade_id" type="VARCHAR(80)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="marker_type" type="VARCHAR(40)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="marker_at" type="TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <addPrimaryKey tableName="trade_completion_markers" schemaName="match_engine"
+                       columnNames="trade_id, marker_type"
+                       constraintName="pk_trade_completion_markers"/>
+        <createIndex tableName="trade_completion_markers" schemaName="match_engine"
+                     indexName="idx_trade_completion_markers_type">
+            <column name="marker_type"/>
+            <column name="marker_at"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="match-trade-008" author="eap">
+        <comment>Drop unused completion marker secondary index to reduce hot-path marker insert cost</comment>
+        <sql>
+            DROP INDEX IF EXISTS match_engine.idx_trade_completion_markers_type;
+        </sql>
+    </changeSet>
 </databaseChangeLog>
