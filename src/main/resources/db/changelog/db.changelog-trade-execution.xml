@@ -201,4 +201,34 @@
             DROP INDEX IF EXISTS match_engine.idx_trade_completion_markers_type;
         </sql>
     </changeSet>
+
+    <changeSet id="match-trade-009" author="eap">
+        <comment>Drop unused trade execution order lookup indexes from the write hot path</comment>
+        <sql>
+            DROP INDEX IF EXISTS match_engine.idx_trade_executions_buyer_order;
+            DROP INDEX IF EXISTS match_engine.idx_trade_executions_seller_order;
+        </sql>
+    </changeSet>
+
+    <changeSet id="match-trade-010" author="eap">
+        <comment>Drop redundant trade outbox aggregate uniqueness from the write hot path</comment>
+        <sql>
+            ALTER TABLE match_engine.trade_outbox
+                DROP CONSTRAINT IF EXISTS uk_trade_outbox_event_aggregate;
+        </sql>
+    </changeSet>
+
+    <changeSet id="match-trade-011" author="eap">
+        <comment>Use trade_id as the trade execution primary key to avoid a redundant surrogate-key index write</comment>
+        <sql>
+            ALTER TABLE match_engine.trade_executions
+                DROP CONSTRAINT IF EXISTS uk_trade_executions_trade_id;
+            ALTER TABLE match_engine.trade_executions
+                DROP CONSTRAINT IF EXISTS trade_executions_pkey;
+            ALTER TABLE match_engine.trade_executions
+                ADD CONSTRAINT trade_executions_pkey PRIMARY KEY (trade_id);
+            ALTER TABLE match_engine.trade_executions
+                DROP COLUMN IF EXISTS id;
+        </sql>
+    </changeSet>
 </databaseChangeLog>

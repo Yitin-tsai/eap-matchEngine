@@ -7,6 +7,9 @@ spring:
       maximum-pool-size: 35
       minimum-idle: 10
   rabbitmq:
+    cache:
+      channel:
+        size: 128
     listener:
       simple:
         concurrency: 8
@@ -22,10 +25,14 @@ eap:
         concurrency: 12
       wallet-trade-settled:
         concurrency: 6
+      completion-marker:
+        batch-size: 50
+        receive-timeout-ms: 25
     legacy-order-matched-publish:
       enabled: false
     trade-outbox-relay:
       batch-size: 500
+      publish-concurrency: 4
       poll-interval-ms: 100
     trade-completion-view:
       hot-path-enabled: false

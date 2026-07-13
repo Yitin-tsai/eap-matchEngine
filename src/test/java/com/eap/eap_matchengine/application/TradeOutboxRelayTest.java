@@ -8,7 +8,9 @@ import com.eap.eap_matchengine.domain.entity.TradeOutboxEntity;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.junit.jupiter.api.Test;
+import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
+import org.springframework.amqp.rabbit.core.RabbitOperations;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.domain.Pageable;
 
@@ -23,6 +25,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -45,10 +48,10 @@ class TradeOutboxRelayTest {
             CorrelationData correlationData = invocation.getArgument(3);
             correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
             return null;
-        }).when(rabbitTemplate).convertAndSend(
+        }).when(rabbitTemplate).send(
                 eq(RabbitMQConstants.TRADE_EXCHANGE),
                 eq(RabbitMQConstants.TRADE_EXECUTED_KEY),
-                any(TradeExecutedEvent.class),
+                any(Message.class),
                 any(CorrelationData.class));
 
         relay().pollAndPublish();
@@ -68,10 +71,10 @@ class TradeOutboxRelayTest {
             CorrelationData correlationData = invocation.getArgument(3);
             correlationData.getFuture().complete(new CorrelationData.Confirm(false, "test nack"));
             return null;
-        }).when(rabbitTemplate).convertAndSend(
+        }).when(rabbitTemplate).send(
                 anyString(),
                 anyString(),
-                any(TradeExecutedEvent.class),
+                any(Message.class),
                 any(CorrelationData.class));
 
         relay().pollAndPublish();
@@ -81,13 +84,52 @@ class TradeOutboxRelayTest {
         verify(metrics).retryScheduled();
     }
 
+    @Test
+    void usesDedicatedTemplateInvokeChannelForParallelPublishChunks() throws Exception {
+        TradeOutboxEntity first = entry(1L, "TRADE-1");
+        TradeOutboxEntity second = entry(2L, "TRADE-2");
+        TradeOutboxEntity third = entry(3L, "TRADE-3");
+        TradeOutboxEntity fourth = entry(4L, "TRADE-4");
+        when(repository.findByStatusAndNextRetryAtLessThanEqualOrderByCreatedAtAsc(
+                eq("PENDING"), any(LocalDateTime.class), any(Pageable.class)))
+                .thenReturn(List.of(first, second, third, fourth))
+                .thenReturn(List.of());
+        when(repository.markPendingAsSent(anyList(), any(LocalDateTime.class))).thenReturn(4);
+
+        doAnswer(invocation -> {
+            RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
+            RabbitOperations operations = mock(RabbitOperations.class);
+            doAnswer(sendInvocation -> {
+                CorrelationData correlationData = sendInvocation.getArgument(3);
+                correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
+                return null;
+            }).when(operations).send(
+                    eq(RabbitMQConstants.TRADE_EXCHANGE),
+                    eq(RabbitMQConstants.TRADE_EXECUTED_KEY),
+                    any(Message.class),
+                    any(CorrelationData.class));
+            callback.doInRabbit(operations);
+            return null;
+        }).when(rabbitTemplate).invoke(any(RabbitOperations.OperationsCallback.class));
+
+        relay(2).pollAndPublish();
+
+        verify(rabbitTemplate, times(2)).invoke(any(RabbitOperations.OperationsCallback.class));
+        verify(repository).markPendingAsSent(eq(List.of(1L, 2L, 3L, 4L)), any(LocalDateTime.class));
+        verify(metrics, times(4)).published();
+    }
+
     private TradeOutboxRelay relay() {
+        return relay(1);
+    }
+
+    private TradeOutboxRelay relay(int publishConcurrency) {
         return new TradeOutboxRelay(
                 repository,
                 rabbitTemplate,
-                objectMapper,
                 metrics,
                 10,
+                publishConcurrency,
                 1000,
                 3,
                 100,
@@ -95,6 +137,10 @@ class TradeOutboxRelayTest {
     }
 
     private TradeOutboxEntity entry(String tradeId) throws Exception {
+        return entry(1L, tradeId);
+    }
+
+    private TradeOutboxEntity entry(Long id, String tradeId) throws Exception {
         TradeExecutedEvent event = TradeExecutedEvent.builder()
                 .tradeId(tradeId)
                 .sequence(1L)
@@ -116,7 +162,7 @@ class TradeOutboxRelayTest {
                 tradeId,
                 RabbitMQConstants.TRADE_EXECUTED_KEY,
                 objectMapper.writeValueAsString(event));
-        entity.setId(1L);
+        entity.setId(id);
         return entity;
     }
 }

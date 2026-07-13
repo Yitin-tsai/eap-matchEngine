@@ -5,6 +5,6 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 import java.util.Optional;
 
-public interface TradeExecutionRepository extends JpaRepository<TradeExecutionEntity, Long> {
+public interface TradeExecutionRepository extends JpaRepository<TradeExecutionEntity, String> {
     Optional<TradeExecutionEntity> findByTradeId(String tradeId);
 }

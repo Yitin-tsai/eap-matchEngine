@@ -17,6 +17,11 @@ public class TradeOutboxMetrics {
     private final Counter publishFailedTotal;
     private final Counter retryScheduledTotal;
     private final Timer publishDuration;
+    private final Timer selectDuration;
+    private final Timer publishEnqueueDuration;
+    private final Timer confirmDuration;
+    private final Timer markSentDuration;
+    private final Timer batchDuration;
 
     public TradeOutboxMetrics(MeterRegistry registry, TradeOutboxRepository repository) {
         this.publishedTotal = Counter.builder("trade_outbox_published_total")
@@ -31,6 +36,26 @@ public class TradeOutboxMetrics {
         this.publishDuration = Timer.builder("trade_outbox_publish_duration")
                 .description("TradeExecuted outbox publish and confirm duration")
                 .register(registry);
+        this.selectDuration = stageTimer(
+                registry,
+                "trade_outbox_select_duration",
+                "Time spent selecting pending TradeExecuted outbox records");
+        this.publishEnqueueDuration = stageTimer(
+                registry,
+                "trade_outbox_publish_enqueue_duration",
+                "Time spent deserializing and enqueueing TradeExecuted outbox records to RabbitMQ");
+        this.confirmDuration = stageTimer(
+                registry,
+                "trade_outbox_confirm_duration",
+                "Time spent waiting for RabbitMQ publisher confirms for TradeExecuted outbox records");
+        this.markSentDuration = stageTimer(
+                registry,
+                "trade_outbox_mark_sent_duration",
+                "Time spent marking confirmed TradeExecuted outbox records as SENT");
+        this.batchDuration = stageTimer(
+                registry,
+                "trade_outbox_batch_duration",
+                "Wall-clock time spent processing one TradeExecuted outbox relay batch");
 
         Gauge.builder("trade_outbox_pending", repository, repo -> repo.countByStatus("PENDING"))
                 .description("Number of pending TradeExecuted outbox events")
@@ -60,5 +85,32 @@ public class TradeOutboxMetrics {
 
     public void recordPublish(Duration duration) {
         publishDuration.record(duration);
+    }
+
+    public void recordSelect(Duration duration) {
+        selectDuration.record(duration);
+    }
+
+    public void recordPublishEnqueue(Duration duration) {
+        publishEnqueueDuration.record(duration);
+    }
+
+    public void recordConfirm(Duration duration) {
+        confirmDuration.record(duration);
+    }
+
+    public void recordMarkSent(Duration duration) {
+        markSentDuration.record(duration);
+    }
+
+    public void recordBatch(Duration duration) {
+        batchDuration.record(duration);
+    }
+
+    private Timer stageTimer(MeterRegistry registry, String name, String description) {
+        return Timer.builder(name)
+                .description(description)
+                .publishPercentileHistogram()
+                .register(registry);
     }
 }
