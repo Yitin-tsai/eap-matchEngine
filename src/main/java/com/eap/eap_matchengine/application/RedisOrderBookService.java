@@ -33,6 +33,7 @@ public class RedisOrderBookService {
 
     private static final String DEFAULT_MARKET_ID = "ENERGY-SPOT";
     private static final long SCORE_FACTOR = 1_000_000_000L;
+    private static final String MISSING_ORDER_DETAIL_PREFIX = "__MISSING_ORDER_DETAIL__:";
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
 
@@ -318,6 +319,12 @@ public class RedisOrderBookService {
             log.debug("No matching order found for price {}, isBuy={}", incomingOrder.getPrice(), isBuy);
             return null;
         }
+        if (orderJson.startsWith(MISSING_ORDER_DETAIL_PREFIX)) {
+            String missingOrderId = orderJson.substring(MISSING_ORDER_DETAIL_PREFIX.length());
+            log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
+                    missingOrderId);
+            throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+        }
 
         try {
             OrderConfirmedEvent matchedOrder = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
@@ -325,7 +332,7 @@ public class RedisOrderBookService {
             return matchedOrder;
         } catch (Exception e) {
             log.error("Failed to deserialize matched order", e);
-            return null;
+            throw new IllegalStateException("Failed to deserialize matched Redis order", e);
         }
     }
 
