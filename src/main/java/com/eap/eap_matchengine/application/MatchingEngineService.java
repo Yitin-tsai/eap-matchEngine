@@ -89,49 +89,60 @@ public class MatchingEngineService {
         break;
       }
 
+      int incomingAmountBeforeMatch = incomingOrder.getAmount();
+      int matchOrderAmountBeforeMatch = matchOrder.getAmount();
+
       // Calculate match amount
       int matchedAmount = Math.min(incomingOrder.getAmount(), matchOrder.getAmount());
 
-      // Generate unique match ID using Redis INCR (atomic operation)
-      Long matchId = generateMatchId();
+      OrderMatchedEvent matchedEvent;
+      TradeExecutedEvent tradeExecutedEvent;
+      try {
+        // Generate unique match ID using Redis INCR (atomic operation)
+        Long matchId = generateMatchId();
 
-      log.info("Match ID: {}, Buyer: {}, Seller: {}, Amount: {}, Price: {}",
-          matchId,
-          isBuy ? incomingOrder.getUserId() : matchOrder.getUserId(),
-          isBuy ? matchOrder.getUserId() : incomingOrder.getUserId(),
-          matchedAmount,
-          matchOrder.getPrice());
+        log.info("Match ID: {}, Buyer: {}, Seller: {}, Amount: {}, Price: {}",
+            matchId,
+            isBuy ? incomingOrder.getUserId() : matchOrder.getUserId(),
+            isBuy ? matchOrder.getUserId() : incomingOrder.getUserId(),
+            matchedAmount,
+            matchOrder.getPrice());
 
-      // Update amounts
-      incomingOrder.setAmount(incomingOrder.getAmount() - matchedAmount);
-      matchOrder.setAmount(matchOrder.getAmount() - matchedAmount);
+        // Create and publish match event
+        matchedEvent = OrderMatchedEvent.builder()
+            .matchId(matchId.intValue())
+            .buyerId(isBuy ? incomingOrder.getUserId() : matchOrder.getUserId())
+            .sellerId(isBuy ? matchOrder.getUserId() : incomingOrder.getUserId())
+            .buyerOrderId(isBuy ? incomingOrder.getOrderId() : matchOrder.getOrderId())
+            .sellerOrderId(isBuy ? matchOrder.getOrderId() : incomingOrder.getOrderId())
+            .marketId(incomingOrder.getMarketId())
+            .buyerMarketSequence(isBuy ? incomingOrder.getMarketSequence() : matchOrder.getMarketSequence())
+            .sellerMarketSequence(isBuy ? matchOrder.getMarketSequence() : incomingOrder.getMarketSequence())
+            .originBuyerPrice(isBuy ? incomingOrder.getPrice(): matchOrder.getPrice())
+            .originSellerPrice(isBuy ? matchOrder.getPrice() : incomingOrder.getPrice())
+            .dealPrice(matchOrder.getPrice())
+            .amount(matchedAmount)
+            .matchedAt(LocalDateTime.now())
+            .orderType(incomingOrder.getOrderType())
+            .build();
 
-      // Create and publish match event
-      OrderMatchedEvent matchedEvent = OrderMatchedEvent.builder()
-          .matchId(matchId.intValue())
-          .buyerId(isBuy ? incomingOrder.getUserId() : matchOrder.getUserId())
-          .sellerId(isBuy ? matchOrder.getUserId() : incomingOrder.getUserId())
-          .buyerOrderId(isBuy ? incomingOrder.getOrderId() : matchOrder.getOrderId())
-          .sellerOrderId(isBuy ? matchOrder.getOrderId() : incomingOrder.getOrderId())
-          .marketId(incomingOrder.getMarketId())
-          .buyerMarketSequence(isBuy ? incomingOrder.getMarketSequence() : matchOrder.getMarketSequence())
-          .sellerMarketSequence(isBuy ? matchOrder.getMarketSequence() : incomingOrder.getMarketSequence())
-          .originBuyerPrice(isBuy ? incomingOrder.getPrice(): matchOrder.getPrice())
-          .originSellerPrice(isBuy ? matchOrder.getPrice() : incomingOrder.getPrice())
-          .dealPrice(matchOrder.getPrice())
-          .amount(matchedAmount)
-          .matchedAt(LocalDateTime.now())
-          .orderType(incomingOrder.getOrderType())
-          .build();
-
-      TradeExecutedEvent tradeExecutedEvent = toTradeExecutedEvent(matchedEvent);
-      tradeExecutionRecorder.record(tradeExecutedEvent);
+        tradeExecutedEvent = toTradeExecutedEvent(matchedEvent);
+        tradeExecutionRecorder.record(tradeExecutedEvent);
+      } catch (RuntimeException e) {
+        reAddPoppedRestingOrder(matchOrder, matchOrderAmountBeforeMatch, e);
+        throw e;
+      }
       log.debug("Persisted TradeExecutedEvent for tradeId={}", tradeExecutedEvent.getTradeId());
+
+      // Update amounts only after the durable trade fact is committed. If persistence fails,
+      // the popped resting order is restored with its original amount and the incoming order can retry.
+      incomingOrder.setAmount(incomingAmountBeforeMatch - matchedAmount);
+      matchOrder.setAmount(matchOrderAmountBeforeMatch - matchedAmount);
 
       if (legacyOrderMatchedPublishEnabled) {
         // Legacy event path kept for backward compatibility during migration.
         rabbitTemplate.convertAndSend(ORDER_EXCHANGE, ORDER_MATCHED_KEY, matchedEvent);
-        log.debug("Published legacy OrderMatchedEvent for matchId={}", matchId);
+        log.debug("Published legacy OrderMatchedEvent for matchId={}", matchedEvent.getMatchId());
       }
 
       // Handle partial match with distributed lock to prevent race conditions
@@ -171,6 +182,22 @@ public class MatchingEngineService {
         orderBookService.unlinkUserOrder(matchOrder);
         log.info("Order fully matched and unlinked from user open orders: orderId={}", matchOrder.getOrderId());
       }
+    }
+  }
+
+  private void reAddPoppedRestingOrder(
+      OrderConfirmedEvent matchOrder,
+      int originalAmount,
+      RuntimeException cause) {
+    matchOrder.setAmount(originalAmount);
+    try {
+      orderBookService.addOrder(matchOrder);
+      log.warn("Re-added popped resting order after trade persistence failure: orderId={}, amount={}",
+          matchOrder.getOrderId(), originalAmount, cause);
+    } catch (JsonProcessingException compensationFailure) {
+      cause.addSuppressed(compensationFailure);
+      log.error("Failed to re-add popped resting order after trade persistence failure: orderId={}",
+          matchOrder.getOrderId(), compensationFailure);
     }
   }
 
