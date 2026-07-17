@@ -26,17 +26,14 @@ class JpaTradeExecutionRecorderTest {
             new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService, new ObjectMapper().findAndRegisterModules());
 
     @Test
-    void record_shouldInsertTradeAndOutboxWithoutPreselect() {
+    void record_shouldInsertTradeAndOutboxInOneStatementWithoutPreselect() {
         TradeExecutedEvent event = event("trade-1");
         when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class)))
-                .thenReturn(1);
-        when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_outbox"), any(Object[].class)))
                 .thenReturn(1);
 
         recorder.record(event);
 
         verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class));
-        verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_outbox"), any(Object[].class));
         verify(tradeCompletionService).markTradeExecuted(event);
         verifyNoMoreInteractions(tradeCompletionService);
     }
@@ -53,7 +50,6 @@ class JpaTradeExecutionRecorderTest {
                 .hasMessageContaining("trade-duplicate");
 
         verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class));
-        verify(jdbcTemplate, never()).update(contains("INSERT INTO match_engine.trade_outbox"), any(Object[].class));
         verify(tradeCompletionService, never()).markTradeExecuted(any());
     }
 
@@ -62,36 +58,30 @@ class JpaTradeExecutionRecorderTest {
         TradeExecutedEvent event = event("trade-payload");
         when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class)))
                 .thenReturn(1);
-        when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_outbox"), any(Object[].class)))
-                .thenReturn(1);
 
         recorder.record(event);
 
         verify(jdbcTemplate).update(
-                contains("INSERT INTO match_engine.trade_outbox"),
+                contains("INSERT INTO match_engine.trade_executions"),
+                eq("trade-payload"),
+                eq(1L),
+                eq(1L),
+                eq("M"),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000001")),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000002")),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000003")),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000004")),
+                eq(10L),
+                eq(20L),
+                eq(100),
+                eq(90),
+                eq(90),
+                eq(1),
+                eq(LocalDateTime.of(2026, 7, 8, 12, 0)),
                 eq("TradeExecutedEvent"),
                 eq("TRADE"),
-                eq("trade-payload"),
                 eq("trade.executed"),
                 contains("\"tradeId\":\"trade-payload\""));
-    }
-
-    @Test
-    void record_whenOutboxInsertReturnsNoRow_shouldFailAfterTradeInsert() {
-        TradeExecutedEvent event = event("trade-outbox-empty");
-        when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class)))
-                .thenReturn(1);
-        when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_outbox"), any(Object[].class)))
-                .thenReturn(0);
-
-        assertThatThrownBy(() -> recorder.record(event))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("Trade outbox insert returned no row")
-                .hasMessageContaining("trade-outbox-empty");
-
-        verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class));
-        verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_outbox"), any(Object[].class));
-        verify(tradeCompletionService, never()).markTradeExecuted(any());
     }
 
     private TradeExecutedEvent event(String tradeId) {

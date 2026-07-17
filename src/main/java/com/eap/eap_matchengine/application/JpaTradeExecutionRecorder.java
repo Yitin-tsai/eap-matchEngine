@@ -25,14 +25,21 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
     @Override
     @Transactional
     public void record(TradeExecutedEvent event) {
-        int insertedTrade = jdbcTemplate.update("""
-                INSERT INTO match_engine.trade_executions
-                    (trade_id, sequence, legacy_match_id, market_id,
-                     buyer_id, seller_id, buyer_order_id, seller_order_id,
-                     buyer_market_sequence, seller_market_sequence,
-                     origin_buyer_price, origin_seller_price, deal_price, quantity, occurred_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (trade_id) DO NOTHING
+        int insertedOutbox = jdbcTemplate.update("""
+                WITH inserted_trade AS (
+                    INSERT INTO match_engine.trade_executions
+                        (trade_id, sequence, legacy_match_id, market_id,
+                         buyer_id, seller_id, buyer_order_id, seller_order_id,
+                         buyer_market_sequence, seller_market_sequence,
+                         origin_buyer_price, origin_seller_price, deal_price, quantity, occurred_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (trade_id) DO NOTHING
+                    RETURNING trade_id
+                )
+                INSERT INTO match_engine.trade_outbox
+                    (event_type, aggregate_type, aggregate_id, routing_key, payload)
+                SELECT ?, ?, inserted_trade.trade_id, ?, ?
+                FROM inserted_trade
                 """,
                 event.getTradeId(),
                 event.getSequence(),
@@ -48,23 +55,13 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
                 event.getOriginSellerPrice(),
                 event.getDealPrice(),
                 event.getQuantity(),
-                event.getOccurredAt());
-        if (insertedTrade == 0) {
-            throw new IllegalStateException("Trade already executed: tradeId=" + event.getTradeId());
-        }
-
-        int insertedOutbox = jdbcTemplate.update("""
-                INSERT INTO match_engine.trade_outbox
-                    (event_type, aggregate_type, aggregate_id, routing_key, payload)
-                VALUES (?, ?, ?, ?, ?)
-                """,
+                event.getOccurredAt(),
                 "TradeExecutedEvent",
                 "TRADE",
-                event.getTradeId(),
                 RabbitMQConstants.TRADE_EXECUTED_KEY,
                 serialize(event));
         if (insertedOutbox == 0) {
-            throw new IllegalStateException("Trade outbox insert returned no row: tradeId=" + event.getTradeId());
+            throw new IllegalStateException("Trade already executed: tradeId=" + event.getTradeId());
         }
         tradeCompletionService.markTradeExecuted(event);
     }
