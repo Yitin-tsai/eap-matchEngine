@@ -19,7 +19,9 @@ import static org.mockito.Mockito.verify;
 class RedisOrderBookServiceTest {
 
     private final RedisTemplate<String, String> redisTemplate = mock(RedisTemplate.class);
-    private final RedisOrderBookService service = new RedisOrderBookService(redisTemplate, new ObjectMapper());
+    private final RedisOrderBookService service = new RedisOrderBookService(
+            redisTemplate,
+            new ObjectMapper().findAndRegisterModules());
 
     @Test
     void reserveBestMatchOrderLua_whenOrderbookDetailIsMissing_shouldFailFast() {
@@ -31,6 +33,31 @@ class RedisOrderBookServiceTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Redis orderbook detail missing")
                 .hasMessageContaining(missingOrderId.toString());
+
+        verify(redisTemplate).execute(any(RedisCallback.class));
+    }
+
+    @Test
+    void reserveBestMatchOrderLua_whenReservationAlreadyExists_shouldFailFast() {
+        UUID orderId = UUID.fromString("00000000-0000-0000-0000-000000000004");
+        doReturn("__RESERVATION_EXISTS__:" + orderId)
+                .when(redisTemplate).execute(any(RedisCallback.class));
+
+        assertThatThrownBy(() -> service.reserveBestMatchOrderLua(incomingBuyOrder()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Redis order already reserved")
+                .hasMessageContaining(orderId.toString());
+
+        verify(redisTemplate).execute(any(RedisCallback.class));
+    }
+
+    @Test
+    void releaseReservedOrder_whenReservationDoesNotExist_shouldFailWithoutResurrectingOrder() {
+        doReturn(0L).when(redisTemplate).execute(any(RedisCallback.class));
+
+        assertThatThrownBy(() -> service.releaseReservedOrder(incomingBuyOrder()))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Failed to release reserved order");
 
         verify(redisTemplate).execute(any(RedisCallback.class));
     }

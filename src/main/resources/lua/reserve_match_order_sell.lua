@@ -5,10 +5,13 @@
 -- KEYS[1]: buy orderbook ZSet key
 -- ARGV[1]: min composite score (sell order's price limit)
 --
+-- ARGV[2]: reserved timestamp epoch millis
+--
 -- Returns: order JSON string, or nil if no match found
 
 local orderbook_key = KEYS[1]
 local min_score = tonumber(ARGV[1])
+local reserved_at = tonumber(ARGV[2])
 
 local orders = redis.call('ZREVRANGEBYSCORE', orderbook_key, '+inf', min_score, 'LIMIT', 0, 1)
 
@@ -28,6 +31,10 @@ if not order_json then
 end
 
 redis.call('ZREM', orderbook_key, order_id)
-redis.call('SET', reservation_key, order_json)
+local reservation_json = '{"reservedAtEpochMillis":' .. reserved_at .. ',"order":' .. order_json .. '}'
+local reserved = redis.call('SET', reservation_key, reservation_json, 'NX')
+if not reserved then
+    return '__RESERVATION_EXISTS__:' .. order_id
+end
 
 return order_json
