@@ -1,6 +1,7 @@
 package com.eap.eap_matchengine;
 
 import com.eap.eap_matchengine.application.MatchingEngineService;
+import com.eap.eap_matchengine.application.MatchingEngineMetrics;
 import com.eap.eap_matchengine.application.RedisOrderBookService;
 import com.eap.eap_matchengine.application.TradeExecutionRecorder;
 import com.eap.common.event.OrderConfirmedEvent;
@@ -56,6 +57,9 @@ public class BaseContractTest {
 
     @MockitoBean
     private TradeExecutionRecorder tradeExecutionRecorder;
+
+    @MockitoBean
+    private MatchingEngineMetrics matchingEngineMetrics;
 
     @BeforeEach
     public void setup() {

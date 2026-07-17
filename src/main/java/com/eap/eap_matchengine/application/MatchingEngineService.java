@@ -5,6 +5,8 @@ import com.eap.common.event.OrderMatchedEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.fasterxml.jackson.core.JsonProcessingException;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.concurrent.TimeUnit;
 
@@ -38,6 +40,7 @@ public class MatchingEngineService {
   private final RedisTemplate<String, String> redisTemplate;
   private final RedissonClient redissonClient;
   private final TradeExecutionRecorder tradeExecutionRecorder;
+  private final MatchingEngineMetrics metrics;
 
   @Value("${eap.match-engine.legacy-order-matched-publish.enabled:true}")
   private boolean legacyOrderMatchedPublishEnabled;
@@ -52,7 +55,12 @@ public class MatchingEngineService {
    * @return A unique match ID as Long
    */
   private Long generateMatchId() {
-    return redisTemplate.opsForValue().increment(MATCH_ID_KEY);
+    Instant startedAt = Instant.now();
+    try {
+      return redisTemplate.opsForValue().increment(MATCH_ID_KEY);
+    } finally {
+      metrics.recordMatchId(Duration.between(startedAt, Instant.now()));
+    }
   }
 
   /**
@@ -70,116 +78,175 @@ public class MatchingEngineService {
    * @param incomingOrder The new order to be matched
    */
   public void tryMatch(OrderConfirmedEvent incomingOrder) {
-    boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
+    Instant tryMatchStartedAt = Instant.now();
+    try {
+      boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
 
-    while (incomingOrder.getAmount() > 0) {
-      // Reserve the resting order before writing the durable trade fact. The order is removed
-      // from the visible orderbook but remains in a known Redis reservation state until commit.
-      OrderConfirmedEvent matchOrder = orderBookService.reserveBestMatchOrderLua(incomingOrder);
+      while (incomingOrder.getAmount() > 0) {
+        // Reserve the resting order before writing the durable trade fact. The order is removed
+        // from the visible orderbook but remains in a known Redis reservation state until commit.
+        OrderConfirmedEvent matchOrder = reserveBestMatchOrder(incomingOrder);
 
-      if (matchOrder == null) {
-        // No matching order found, add remaining order to orderbook atomically
-        try {
-          orderBookService.addOrder(incomingOrder);
-          log.info("No matching order found, added to order book: orderId={}, amount={}",
-              incomingOrder.getOrderId(), incomingOrder.getAmount());
-        } catch (JsonProcessingException e) {
-          log.error("Failed to add order to orderbook", e);
-          throw new RuntimeException("Failed to add order to orderbook", e);
-        }
-        break;
-      }
-
-      int incomingAmountBeforeMatch = incomingOrder.getAmount();
-      int matchOrderAmountBeforeMatch = matchOrder.getAmount();
-
-      // Calculate match amount
-      int matchedAmount = Math.min(incomingOrder.getAmount(), matchOrder.getAmount());
-
-      OrderMatchedEvent matchedEvent;
-      TradeExecutedEvent tradeExecutedEvent;
-      try {
-        // Generate unique match ID using Redis INCR (atomic operation)
-        Long matchId = generateMatchId();
-
-        log.info("Match ID: {}, Buyer: {}, Seller: {}, Amount: {}, Price: {}",
-            matchId,
-            isBuy ? incomingOrder.getUserId() : matchOrder.getUserId(),
-            isBuy ? matchOrder.getUserId() : incomingOrder.getUserId(),
-            matchedAmount,
-            matchOrder.getPrice());
-
-        // Create and publish match event
-        matchedEvent = OrderMatchedEvent.builder()
-            .matchId(matchId.intValue())
-            .buyerId(isBuy ? incomingOrder.getUserId() : matchOrder.getUserId())
-            .sellerId(isBuy ? matchOrder.getUserId() : incomingOrder.getUserId())
-            .buyerOrderId(isBuy ? incomingOrder.getOrderId() : matchOrder.getOrderId())
-            .sellerOrderId(isBuy ? matchOrder.getOrderId() : incomingOrder.getOrderId())
-            .marketId(incomingOrder.getMarketId())
-            .buyerMarketSequence(isBuy ? incomingOrder.getMarketSequence() : matchOrder.getMarketSequence())
-            .sellerMarketSequence(isBuy ? matchOrder.getMarketSequence() : incomingOrder.getMarketSequence())
-            .originBuyerPrice(isBuy ? incomingOrder.getPrice(): matchOrder.getPrice())
-            .originSellerPrice(isBuy ? matchOrder.getPrice() : incomingOrder.getPrice())
-            .dealPrice(matchOrder.getPrice())
-            .amount(matchedAmount)
-            .matchedAt(LocalDateTime.now())
-            .orderType(incomingOrder.getOrderType())
-            .build();
-
-        tradeExecutedEvent = toTradeExecutedEvent(matchedEvent);
-        tradeExecutionRecorder.record(tradeExecutedEvent);
-      } catch (RuntimeException e) {
-        releaseReservedRestingOrder(matchOrder, matchOrderAmountBeforeMatch, e);
-        throw e;
-      }
-      log.debug("Persisted TradeExecutedEvent for tradeId={}", tradeExecutedEvent.getTradeId());
-
-      // Update amounts only after the durable trade fact is committed. If persistence fails,
-      // the popped resting order is restored with its original amount and the incoming order can retry.
-      incomingOrder.setAmount(incomingAmountBeforeMatch - matchedAmount);
-      matchOrder.setAmount(matchOrderAmountBeforeMatch - matchedAmount);
-
-      if (legacyOrderMatchedPublishEnabled) {
-        // Legacy event path kept for backward compatibility during migration.
-        rabbitTemplate.convertAndSend(ORDER_EXCHANGE, ORDER_MATCHED_KEY, matchedEvent);
-        log.debug("Published legacy OrderMatchedEvent for matchId={}", matchedEvent.getMatchId());
-      }
-
-      // Handle partial match with distributed lock to prevent race conditions
-      if (matchOrder.getAmount() > 0) {
-        // Partial match: release remaining amount back to the visible orderbook with lock protection
-        String lockKey = ORDER_LOCK_PREFIX + matchOrder.getOrderId();
-        RLock lock = redissonClient.getLock(lockKey);
-
-        try {
-          // Try to acquire lock with timeout (wait up to 5s, auto-release after 10s)
-          boolean locked = lock.tryLock(5, 10, TimeUnit.SECONDS);
-
-          if (locked) {
-            try {
-              orderBookService.releaseReservedOrder(matchOrder);
-              log.info("Partial match: released remaining reserved order atomically: orderId={}, remainingAmount={}",
-                  matchOrder.getOrderId(), matchOrder.getAmount());
-            } catch (JsonProcessingException e) {
-              log.error("Failed to release partial reserved order: orderId={}", matchOrder.getOrderId(), e);
-              throw new RuntimeException("Failed to release partial reserved order", e);
-            } finally {
-              lock.unlock();
-            }
-          } else {
-            log.error("Failed to acquire lock for order: orderId={}", matchOrder.getOrderId());
-            throw new RuntimeException("Failed to acquire lock for partial order re-add");
+        if (matchOrder == null) {
+          // No matching order found, add remaining order to orderbook atomically
+          try {
+            addOrder(incomingOrder);
+            log.info("No matching order found, added to order book: orderId={}, amount={}",
+                incomingOrder.getOrderId(), incomingOrder.getAmount());
+          } catch (JsonProcessingException e) {
+            log.error("Failed to add order to orderbook", e);
+            throw new RuntimeException("Failed to add order to orderbook", e);
           }
-        } catch (InterruptedException e) {
-          log.error("Interrupted while waiting for lock: orderId={}", matchOrder.getOrderId(), e);
-          Thread.currentThread().interrupt();
-          throw new RuntimeException("Interrupted while waiting for lock", e);
+          break;
         }
-      } else {
-        orderBookService.completeReservedOrder(matchOrder);
-        log.info("Order fully matched and completed from reservation: orderId={}", matchOrder.getOrderId());
+
+        int incomingAmountBeforeMatch = incomingOrder.getAmount();
+        int matchOrderAmountBeforeMatch = matchOrder.getAmount();
+
+        // Calculate match amount
+        int matchedAmount = Math.min(incomingOrder.getAmount(), matchOrder.getAmount());
+
+        OrderMatchedEvent matchedEvent;
+        TradeExecutedEvent tradeExecutedEvent;
+        try {
+          // Generate unique match ID using Redis INCR (atomic operation)
+          Long matchId = generateMatchId();
+
+          log.info("Match ID: {}, Buyer: {}, Seller: {}, Amount: {}, Price: {}",
+              matchId,
+              isBuy ? incomingOrder.getUserId() : matchOrder.getUserId(),
+              isBuy ? matchOrder.getUserId() : incomingOrder.getUserId(),
+              matchedAmount,
+              matchOrder.getPrice());
+
+          // Create and publish match event
+          matchedEvent = OrderMatchedEvent.builder()
+              .matchId(matchId.intValue())
+              .buyerId(isBuy ? incomingOrder.getUserId() : matchOrder.getUserId())
+              .sellerId(isBuy ? matchOrder.getUserId() : incomingOrder.getUserId())
+              .buyerOrderId(isBuy ? incomingOrder.getOrderId() : matchOrder.getOrderId())
+              .sellerOrderId(isBuy ? matchOrder.getOrderId() : incomingOrder.getOrderId())
+              .marketId(incomingOrder.getMarketId())
+              .buyerMarketSequence(isBuy ? incomingOrder.getMarketSequence() : matchOrder.getMarketSequence())
+              .sellerMarketSequence(isBuy ? matchOrder.getMarketSequence() : incomingOrder.getMarketSequence())
+              .originBuyerPrice(isBuy ? incomingOrder.getPrice() : matchOrder.getPrice())
+              .originSellerPrice(isBuy ? matchOrder.getPrice() : incomingOrder.getPrice())
+              .dealPrice(matchOrder.getPrice())
+              .amount(matchedAmount)
+              .matchedAt(LocalDateTime.now())
+              .orderType(incomingOrder.getOrderType())
+              .build();
+
+          tradeExecutedEvent = toTradeExecutedEvent(matchedEvent);
+          recordTrade(tradeExecutedEvent);
+        } catch (RuntimeException e) {
+          releaseReservedRestingOrder(matchOrder, matchOrderAmountBeforeMatch, e);
+          throw e;
+        }
+        log.debug("Persisted TradeExecutedEvent for tradeId={}", tradeExecutedEvent.getTradeId());
+
+        // Update amounts only after the durable trade fact is committed. If persistence fails,
+        // the popped resting order is restored with its original amount and the incoming order can retry.
+        incomingOrder.setAmount(incomingAmountBeforeMatch - matchedAmount);
+        matchOrder.setAmount(matchOrderAmountBeforeMatch - matchedAmount);
+
+        if (legacyOrderMatchedPublishEnabled) {
+          // Legacy event path kept for backward compatibility during migration.
+          Instant legacyPublishStartedAt = Instant.now();
+          try {
+            rabbitTemplate.convertAndSend(ORDER_EXCHANGE, ORDER_MATCHED_KEY, matchedEvent);
+          } finally {
+            metrics.recordLegacyPublish(Duration.between(legacyPublishStartedAt, Instant.now()));
+          }
+          log.debug("Published legacy OrderMatchedEvent for matchId={}", matchedEvent.getMatchId());
+        }
+
+        // Handle partial match with distributed lock to prevent race conditions
+        if (matchOrder.getAmount() > 0) {
+          // Partial match: release remaining amount back to the visible orderbook with lock protection
+          String lockKey = ORDER_LOCK_PREFIX + matchOrder.getOrderId();
+          RLock lock = redissonClient.getLock(lockKey);
+
+          try {
+            // Try to acquire lock with timeout (wait up to 5s, auto-release after 10s)
+            boolean locked = lock.tryLock(5, 10, TimeUnit.SECONDS);
+
+            if (locked) {
+              try {
+                releaseReservedOrder(matchOrder);
+                log.info("Partial match: released remaining reserved order atomically: orderId={}, remainingAmount={}",
+                    matchOrder.getOrderId(), matchOrder.getAmount());
+              } catch (JsonProcessingException e) {
+                log.error("Failed to release partial reserved order: orderId={}", matchOrder.getOrderId(), e);
+                throw new RuntimeException("Failed to release partial reserved order", e);
+              } finally {
+                lock.unlock();
+              }
+            } else {
+              log.error("Failed to acquire lock for order: orderId={}", matchOrder.getOrderId());
+              throw new RuntimeException("Failed to acquire lock for partial order re-add");
+            }
+          } catch (InterruptedException e) {
+            log.error("Interrupted while waiting for lock: orderId={}", matchOrder.getOrderId(), e);
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for lock", e);
+          }
+        } else {
+          completeReservedOrder(matchOrder);
+          log.info("Order fully matched and completed from reservation: orderId={}", matchOrder.getOrderId());
+        }
       }
+    } finally {
+      metrics.recordTryMatch(Duration.between(tryMatchStartedAt, Instant.now()));
+    }
+  }
+
+  private OrderConfirmedEvent reserveBestMatchOrder(OrderConfirmedEvent incomingOrder) {
+    Instant startedAt = Instant.now();
+    try {
+      return orderBookService.reserveBestMatchOrderLua(incomingOrder);
+    } finally {
+      metrics.recordReserve(Duration.between(startedAt, Instant.now()));
+    }
+  }
+
+  private void addOrder(OrderConfirmedEvent incomingOrder) throws JsonProcessingException {
+    Instant startedAt = Instant.now();
+    try {
+      orderBookService.addOrder(incomingOrder);
+      metrics.orderAdded();
+    } finally {
+      metrics.recordAddOrder(Duration.between(startedAt, Instant.now()));
+    }
+  }
+
+  private void recordTrade(TradeExecutedEvent tradeExecutedEvent) {
+    Instant startedAt = Instant.now();
+    try {
+      tradeExecutionRecorder.record(tradeExecutedEvent);
+      metrics.tradeRecorded();
+    } finally {
+      metrics.recordTradeRecord(Duration.between(startedAt, Instant.now()));
+    }
+  }
+
+  private void completeReservedOrder(OrderConfirmedEvent matchOrder) {
+    Instant startedAt = Instant.now();
+    try {
+      orderBookService.completeReservedOrder(matchOrder);
+      metrics.reservationCompleted();
+    } finally {
+      metrics.recordCompleteReservation(Duration.between(startedAt, Instant.now()));
+    }
+  }
+
+  private void releaseReservedOrder(OrderConfirmedEvent matchOrder) throws JsonProcessingException {
+    Instant startedAt = Instant.now();
+    try {
+      orderBookService.releaseReservedOrder(matchOrder);
+      metrics.reservationReleased();
+    } finally {
+      metrics.recordReleaseReservation(Duration.between(startedAt, Instant.now()));
     }
   }
 
@@ -189,7 +256,7 @@ public class MatchingEngineService {
       RuntimeException cause) {
     matchOrder.setAmount(originalAmount);
     try {
-      orderBookService.releaseReservedOrder(matchOrder);
+      releaseReservedOrder(matchOrder);
       log.warn("Released reserved resting order after trade persistence failure: orderId={}, amount={}",
           matchOrder.getOrderId(), originalAmount, cause);
     } catch (JsonProcessingException compensationFailure) {

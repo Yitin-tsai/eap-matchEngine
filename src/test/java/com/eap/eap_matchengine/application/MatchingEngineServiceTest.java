@@ -30,12 +30,14 @@ class MatchingEngineServiceTest {
     private final ValueOperations<String, String> valueOperations = mock(ValueOperations.class);
     private final RedissonClient redissonClient = mock(RedissonClient.class);
     private final TradeExecutionRecorder tradeExecutionRecorder = mock(TradeExecutionRecorder.class);
+    private final MatchingEngineMetrics matchingEngineMetrics = mock(MatchingEngineMetrics.class);
     private final MatchingEngineService service = new MatchingEngineService(
             orderBookService,
             rabbitTemplate,
             redisTemplate,
             redissonClient,
-            tradeExecutionRecorder);
+            tradeExecutionRecorder,
+            matchingEngineMetrics);
 
     @Test
     void tryMatch_whenTradePersistenceSucceeds_shouldCompleteReservedRestingOrder() throws Exception {

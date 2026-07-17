@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import com.eap.common.event.OrderConfirmedEvent;
 import com.eap.common.event.OrderMatchedEvent;
+import com.eap.eap_matchengine.application.MatchingEngineMetrics;
 import com.eap.eap_matchengine.application.MatchingEngineService;
 import com.eap.eap_matchengine.application.NoopTradeExecutionRecorder;
 import com.eap.eap_matchengine.application.RedisOrderBookService;
@@ -22,6 +23,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ConcurrentHashMap;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.mockito.Mockito;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
@@ -82,7 +84,8 @@ public class MatchEngineCoreLoadGenerator {
                 rabbitTemplate,
                 redisTemplate,
                 redissonClient,
-                new NoopTradeExecutionRecorder());
+                new NoopTradeExecutionRecorder(),
+                new MatchingEngineMetrics(new SimpleMeterRegistry()));
         ReflectionTestUtils.setField(matchingEngineService, "legacyOrderMatchedPublishEnabled", true);
 
         try {
