@@ -7,8 +7,6 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.redisson.api.RedissonClient;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -21,20 +19,16 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-@SuppressWarnings({"unchecked", "rawtypes"})
 class MatchingEngineServiceTest {
 
     private final RedisOrderBookService orderBookService = mock(RedisOrderBookService.class);
     private final RabbitTemplate rabbitTemplate = mock(RabbitTemplate.class);
-    private final RedisTemplate<String, String> redisTemplate = mock(RedisTemplate.class);
-    private final ValueOperations<String, String> valueOperations = mock(ValueOperations.class);
     private final RedissonClient redissonClient = mock(RedissonClient.class);
     private final TradeExecutionRecorder tradeExecutionRecorder = mock(TradeExecutionRecorder.class);
     private final MatchingEngineMetrics matchingEngineMetrics = mock(MatchingEngineMetrics.class);
     private final MatchingEngineService service = new MatchingEngineService(
             orderBookService,
             rabbitTemplate,
-            redisTemplate,
             redissonClient,
             tradeExecutionRecorder,
             matchingEngineMetrics);
@@ -55,9 +49,8 @@ class MatchingEngineServiceTest {
                 300L,
                 1);
 
-        when(orderBookService.reserveBestMatchOrderLua(incomingBuy)).thenReturn(restingSell);
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
-        when(valueOperations.increment("match:id:sequence")).thenReturn(42L);
+        when(orderBookService.reserveBestMatchOrderWithSequenceLua(incomingBuy))
+                .thenReturn(new RedisOrderBookService.ReservedMatch(restingSell, 42L));
 
         service.tryMatch(incomingBuy);
 
@@ -89,9 +82,8 @@ class MatchingEngineServiceTest {
                 100L,
                 1);
 
-        when(orderBookService.reserveBestMatchOrderLua(incomingBuy)).thenReturn(restingSell);
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
-        when(valueOperations.increment("match:id:sequence")).thenReturn(42L);
+        when(orderBookService.reserveBestMatchOrderWithSequenceLua(incomingBuy))
+                .thenReturn(new RedisOrderBookService.ReservedMatch(restingSell, 42L));
         doThrow(new IllegalStateException("db unavailable"))
                 .when(tradeExecutionRecorder).record(any(TradeExecutedEvent.class));
 
@@ -110,7 +102,7 @@ class MatchingEngineServiceTest {
     }
 
     @Test
-    void tryMatch_whenMatchIdGenerationFailsAfterReservation_shouldReleaseRestingOrder() throws Exception {
+    void tryMatch_whenCombinedReservationFails_shouldNotRecordTrade() throws Exception {
         ReflectionTestUtils.setField(service, "legacyOrderMatchedPublishEnabled", false);
         OrderConfirmedEvent incomingBuy = order(
                 "BUY",
@@ -118,30 +110,18 @@ class MatchingEngineServiceTest {
                 "00000000-0000-0000-0000-000000000012",
                 201L,
                 1);
-        OrderConfirmedEvent restingSell = order(
-                "SELL",
-                "00000000-0000-0000-0000-000000000013",
-                "00000000-0000-0000-0000-000000000014",
-                200L,
-                1);
 
-        when(orderBookService.reserveBestMatchOrderLua(incomingBuy)).thenReturn(restingSell);
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
-        when(valueOperations.increment("match:id:sequence"))
-                .thenThrow(new IllegalStateException("redis increment unavailable"));
+        when(orderBookService.reserveBestMatchOrderWithSequenceLua(incomingBuy))
+                .thenThrow(new IllegalStateException("redis reservation unavailable"));
 
         assertThatThrownBy(() -> service.tryMatch(incomingBuy))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("redis increment unavailable");
+                .hasMessageContaining("redis reservation unavailable");
 
-        verify(orderBookService).releaseReservedOrder(argThat(order ->
-                order.getOrderId().equals(restingSell.getOrderId())
-                        && order.getAmount() == 1
-                        && order.getOrderType().equals("SELL")));
         verify(tradeExecutionRecorder, never()).record(any());
         verify(orderBookService, never()).completeReservedOrder(any());
+        verify(orderBookService, never()).releaseReservedOrder(any());
         assertThat(incomingBuy.getAmount()).isEqualTo(1);
-        assertThat(restingSell.getAmount()).isEqualTo(1);
     }
 
     private OrderConfirmedEvent order(

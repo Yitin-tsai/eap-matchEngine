@@ -82,7 +82,6 @@ public class MatchEngineCoreLoadGenerator {
         MatchingEngineService matchingEngineService = new MatchingEngineService(
                 orderBookService,
                 rabbitTemplate,
-                redisTemplate,
                 redissonClient,
                 new NoopTradeExecutionRecorder(),
                 new MatchingEngineMetrics(new SimpleMeterRegistry()));

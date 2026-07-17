@@ -19,7 +19,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 /**
@@ -37,7 +36,6 @@ public class MatchingEngineService {
 
   private final RedisOrderBookService orderBookService;
   private final RabbitTemplate rabbitTemplate;
-  private final RedisTemplate<String, String> redisTemplate;
   private final RedissonClient redissonClient;
   private final TradeExecutionRecorder tradeExecutionRecorder;
   private final MatchingEngineMetrics metrics;
@@ -45,23 +43,7 @@ public class MatchingEngineService {
   @Value("${eap.match-engine.legacy-order-matched-publish.enabled:true}")
   private boolean legacyOrderMatchedPublishEnabled;
 
-  private static final String MATCH_ID_KEY = "match:id:sequence";
   private static final String ORDER_LOCK_PREFIX = "lock:order:";
-
-  /**
-   * Generates a unique match ID using Redis INCR operation.
-   * This ensures thread-safe, distributed unique ID generation.
-   *
-   * @return A unique match ID as Long
-   */
-  private Long generateMatchId() {
-    Instant startedAt = Instant.now();
-    try {
-      return redisTemplate.opsForValue().increment(MATCH_ID_KEY);
-    } finally {
-      metrics.recordMatchId(Duration.between(startedAt, Instant.now()));
-    }
-  }
 
   /**
    * Attempts to match an incoming order with existing orders in the order book.
@@ -85,9 +67,9 @@ public class MatchingEngineService {
       while (incomingOrder.getAmount() > 0) {
         // Reserve the resting order before writing the durable trade fact. The order is removed
         // from the visible orderbook but remains in a known Redis reservation state until commit.
-        OrderConfirmedEvent matchOrder = reserveBestMatchOrder(incomingOrder);
+        RedisOrderBookService.ReservedMatch reservedMatch = reserveBestMatchOrder(incomingOrder);
 
-        if (matchOrder == null) {
+        if (reservedMatch == null) {
           // No matching order found, add remaining order to orderbook atomically
           try {
             addOrder(incomingOrder);
@@ -100,6 +82,7 @@ public class MatchingEngineService {
           break;
         }
 
+        OrderConfirmedEvent matchOrder = reservedMatch.order();
         int incomingAmountBeforeMatch = incomingOrder.getAmount();
         int matchOrderAmountBeforeMatch = matchOrder.getAmount();
 
@@ -109,8 +92,7 @@ public class MatchingEngineService {
         OrderMatchedEvent matchedEvent;
         TradeExecutedEvent tradeExecutedEvent;
         try {
-          // Generate unique match ID using Redis INCR (atomic operation)
-          Long matchId = generateMatchId();
+          Long matchId = reservedMatch.matchId();
 
           log.info("Match ID: {}, Buyer: {}, Seller: {}, Amount: {}, Price: {}",
               matchId,
@@ -201,10 +183,10 @@ public class MatchingEngineService {
     }
   }
 
-  private OrderConfirmedEvent reserveBestMatchOrder(OrderConfirmedEvent incomingOrder) {
+  private RedisOrderBookService.ReservedMatch reserveBestMatchOrder(OrderConfirmedEvent incomingOrder) {
     Instant startedAt = Instant.now();
     try {
-      return orderBookService.reserveBestMatchOrderLua(incomingOrder);
+      return orderBookService.reserveBestMatchOrderWithSequenceLua(incomingOrder);
     } finally {
       metrics.recordReserve(Duration.between(startedAt, Instant.now()));
     }

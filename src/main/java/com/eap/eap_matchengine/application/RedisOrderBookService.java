@@ -38,6 +38,7 @@ public class RedisOrderBookService {
 
     private static final String DEFAULT_MARKET_ID = "ENERGY-SPOT";
     private static final long SCORE_FACTOR = 1_000_000_000L;
+    private static final String MATCH_ID_KEY = "match:id:sequence";
     private static final String MISSING_ORDER_DETAIL_PREFIX = "__MISSING_ORDER_DETAIL__:";
     private static final String RESERVATION_EXISTS_PREFIX = "__RESERVATION_EXISTS__:";
     private static final String RESERVATION_KEY_PATTERN = "order:reservation:*";
@@ -256,6 +257,80 @@ public class RedisOrderBookService {
             log.error("Failed to deserialize reserved order", e);
             throw new IllegalStateException("Failed to deserialize reserved Redis order", e);
         }
+    }
+
+    /**
+     * Atomically reserves the best matching resting order and generates the match sequence.
+     *
+     * The match ID is generated inside the same Redis Lua script after the reservation is
+     * created. No-match orders do not consume a sequence value.
+     */
+    public ReservedMatch reserveBestMatchOrderWithSequenceLua(OrderConfirmedEvent incomingOrder) {
+        boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
+        String orderbookKey = isBuy
+                ? orderbookKey(marketId(incomingOrder), "sell")
+                : orderbookKey(marketId(incomingOrder), "buy");
+        String luaScript = isBuy ? reserveMatchOrderBuyLuaScript : reserveMatchOrderSellLuaScript;
+        double priceBoundary = isBuy
+                ? maxSellScore(incomingOrder.getPrice())
+                : minBuyScore(incomingOrder.getPrice());
+
+        List<String> keys = List.of(orderbookKey, MATCH_ID_KEY);
+        List<String> args = List.of(
+                String.valueOf(priceBoundary),
+                String.valueOf(Instant.now().toEpochMilli()));
+
+        @SuppressWarnings("unchecked")
+        List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
+            byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] argsBytes = args.stream().map(a -> a.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] allParams = new byte[keysBytes.length + argsBytes.length][];
+            System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
+            System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
+
+            Object res = connection.eval(
+                    luaScript.getBytes(StandardCharsets.UTF_8),
+                    ReturnType.MULTI,
+                    keys.size(),
+                    allParams
+            );
+            return (List<byte[]>) res;
+        });
+
+        if (rawResult == null || rawResult.isEmpty()) {
+            log.debug("No matching order found for price {}, isBuy={}", incomingOrder.getPrice(), isBuy);
+            return null;
+        }
+
+        String orderJson = new String(rawResult.get(0), StandardCharsets.UTF_8);
+        if (orderJson.startsWith(MISSING_ORDER_DETAIL_PREFIX)) {
+            String missingOrderId = orderJson.substring(MISSING_ORDER_DETAIL_PREFIX.length());
+            log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
+                    missingOrderId);
+            throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+        }
+        if (orderJson.startsWith(RESERVATION_EXISTS_PREFIX)) {
+            String orderId = orderJson.substring(RESERVATION_EXISTS_PREFIX.length());
+            log.error("Redis orderbook is inconsistent: order {} is visible but already reserved", orderId);
+            throw new IllegalStateException("Redis order already reserved for order " + orderId);
+        }
+        if (rawResult.size() < 2) {
+            throw new IllegalStateException("Redis reserve script did not return a match sequence");
+        }
+
+        try {
+            OrderConfirmedEvent reservedOrder = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+            Long matchId = Long.valueOf(new String(rawResult.get(1), StandardCharsets.UTF_8));
+            log.debug("Successfully reserved order {} for matching with matchId={}",
+                    reservedOrder.getOrderId(), matchId);
+            return new ReservedMatch(reservedOrder, matchId);
+        } catch (Exception e) {
+            log.error("Failed to deserialize reserved order or match sequence", e);
+            throw new IllegalStateException("Failed to deserialize reserved Redis order with sequence", e);
+        }
+    }
+
+    public record ReservedMatch(OrderConfirmedEvent order, Long matchId) {
     }
 
     /**
