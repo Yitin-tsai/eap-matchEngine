@@ -3,8 +3,6 @@ package com.eap.eap_matchengine.application;
 import com.eap.common.constants.RabbitMQConstants;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_matchengine.configuration.observability.TradeOutboxMetrics;
-import com.eap.eap_matchengine.configuration.repository.TradeOutboxRepository;
-import com.eap.eap_matchengine.domain.entity.TradeOutboxEntity;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.junit.jupiter.api.Test;
@@ -12,16 +10,20 @@ import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitOperations;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.data.domain.Pageable;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 
+import java.sql.ResultSet;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -31,19 +33,18 @@ import static org.mockito.Mockito.when;
 
 class TradeOutboxRelayTest {
 
-    private final TradeOutboxRepository repository = mock(TradeOutboxRepository.class);
+    private final JdbcTemplate jdbcTemplate = mock(JdbcTemplate.class);
+    private final NamedParameterJdbcTemplate namedJdbcTemplate = mock(NamedParameterJdbcTemplate.class);
     private final RabbitTemplate rabbitTemplate = mock(RabbitTemplate.class);
     private final TradeOutboxMetrics metrics = mock(TradeOutboxMetrics.class);
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
     @Test
     void marksConfirmedPublishesAsSent() throws Exception {
-        TradeOutboxEntity entry = entry("TRADE-1");
-        when(repository.findByStatusAndNextRetryAtLessThanEqualOrderByCreatedAtAsc(
-                eq("PENDING"), any(LocalDateTime.class), any(Pageable.class)))
-                .thenReturn(List.of(entry))
-                .thenReturn(List.of());
-        when(repository.markPendingAsSent(anyList(), any(LocalDateTime.class))).thenReturn(1);
+        TestOutboxRow entry = entry("TRADE-1");
+        stubPendingRows(List.of(entry), List.of());
+        when(namedJdbcTemplate.update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class)))
+                .thenReturn(1);
         doAnswer(invocation -> {
             CorrelationData correlationData = invocation.getArgument(3);
             correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
@@ -56,17 +57,15 @@ class TradeOutboxRelayTest {
 
         relay().pollAndPublish();
 
-        verify(repository).markPendingAsSent(eq(List.of(entry.getId())), any(LocalDateTime.class));
+        verify(namedJdbcTemplate).update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class));
         verify(metrics).published();
         verify(metrics).recordPublish(any(Duration.class));
     }
 
     @Test
     void schedulesRetryWhenBrokerNacks() throws Exception {
-        TradeOutboxEntity entry = entry("TRADE-2");
-        when(repository.findByStatusAndNextRetryAtLessThanEqualOrderByCreatedAtAsc(
-                eq("PENDING"), any(LocalDateTime.class), any(Pageable.class)))
-                .thenReturn(List.of(entry));
+        TestOutboxRow entry = entry("TRADE-2");
+        stubPendingRows(List.of(entry));
         doAnswer(invocation -> {
             CorrelationData correlationData = invocation.getArgument(3);
             correlationData.getFuture().complete(new CorrelationData.Confirm(false, "test nack"));
@@ -79,22 +78,20 @@ class TradeOutboxRelayTest {
 
         relay().pollAndPublish();
 
-        verify(repository).save(entry);
+        verify(namedJdbcTemplate).update(contains("SET attempt_count = :attemptCount"), any(MapSqlParameterSource.class));
         verify(metrics).publishFailed();
         verify(metrics).retryScheduled();
     }
 
     @Test
     void usesDedicatedTemplateInvokeChannelForParallelPublishChunks() throws Exception {
-        TradeOutboxEntity first = entry(1L, "TRADE-1");
-        TradeOutboxEntity second = entry(2L, "TRADE-2");
-        TradeOutboxEntity third = entry(3L, "TRADE-3");
-        TradeOutboxEntity fourth = entry(4L, "TRADE-4");
-        when(repository.findByStatusAndNextRetryAtLessThanEqualOrderByCreatedAtAsc(
-                eq("PENDING"), any(LocalDateTime.class), any(Pageable.class)))
-                .thenReturn(List.of(first, second, third, fourth))
-                .thenReturn(List.of());
-        when(repository.markPendingAsSent(anyList(), any(LocalDateTime.class))).thenReturn(4);
+        TestOutboxRow first = entry(1L, "TRADE-1");
+        TestOutboxRow second = entry(2L, "TRADE-2");
+        TestOutboxRow third = entry(3L, "TRADE-3");
+        TestOutboxRow fourth = entry(4L, "TRADE-4");
+        stubPendingRows(List.of(first, second, third, fourth), List.of());
+        when(namedJdbcTemplate.update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class)))
+                .thenReturn(4);
 
         doAnswer(invocation -> {
             RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
@@ -115,7 +112,7 @@ class TradeOutboxRelayTest {
         relay(2).pollAndPublish();
 
         verify(rabbitTemplate, times(2)).invoke(any(RabbitOperations.OperationsCallback.class));
-        verify(repository).markPendingAsSent(eq(List.of(1L, 2L, 3L, 4L)), any(LocalDateTime.class));
+        verify(namedJdbcTemplate).update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class));
         verify(metrics, times(4)).published();
     }
 
@@ -125,7 +122,8 @@ class TradeOutboxRelayTest {
 
     private TradeOutboxRelay relay(int publishConcurrency) {
         return new TradeOutboxRelay(
-                repository,
+                jdbcTemplate,
+                namedJdbcTemplate,
                 rabbitTemplate,
                 metrics,
                 10,
@@ -136,11 +134,43 @@ class TradeOutboxRelayTest {
                 1000);
     }
 
-    private TradeOutboxEntity entry(String tradeId) throws Exception {
+    private void stubPendingRows(List<TestOutboxRow> firstBatch) {
+        stubPendingRows(firstBatch, List.of());
+    }
+
+    @SafeVarargs
+    private void stubPendingRows(List<TestOutboxRow>... batches) {
+        doAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            RowMapper<Object> mapper = invocation.getArgument(1);
+            int invocationIndex = stubInvocationCount++;
+            List<TestOutboxRow> batch = invocationIndex < batches.length ? batches[invocationIndex] : List.of();
+            java.util.ArrayList<Object> rows = new java.util.ArrayList<>(batch.size());
+            for (int i = 0; i < batch.size(); i++) {
+                rows.add(mapper.mapRow(resultSet(batch.get(i)), i));
+            }
+            return rows;
+        }).when(jdbcTemplate).query(anyString(), any(RowMapper.class), any());
+    }
+
+    private int stubInvocationCount;
+
+    private ResultSet resultSet(TestOutboxRow row) throws Exception {
+        ResultSet rs = mock(ResultSet.class);
+        when(rs.getLong("id")).thenReturn(row.id());
+        when(rs.getString("event_type")).thenReturn(row.eventType());
+        when(rs.getString("aggregate_id")).thenReturn(row.aggregateId());
+        when(rs.getString("routing_key")).thenReturn(row.routingKey());
+        when(rs.getString("payload")).thenReturn(row.payload());
+        when(rs.getInt("attempt_count")).thenReturn(row.attemptCount());
+        return rs;
+    }
+
+    private TestOutboxRow entry(String tradeId) throws Exception {
         return entry(1L, tradeId);
     }
 
-    private TradeOutboxEntity entry(Long id, String tradeId) throws Exception {
+    private TestOutboxRow entry(Long id, String tradeId) throws Exception {
         TradeExecutedEvent event = TradeExecutedEvent.builder()
                 .tradeId(tradeId)
                 .sequence(1L)
@@ -156,13 +186,21 @@ class TradeOutboxRelayTest {
                 .quantity(1)
                 .occurredAt(LocalDateTime.now())
                 .build();
-        TradeOutboxEntity entity = new TradeOutboxEntity(
+        return new TestOutboxRow(
+                id,
                 "TradeExecutedEvent",
-                "TRADE",
                 tradeId,
                 RabbitMQConstants.TRADE_EXECUTED_KEY,
-                objectMapper.writeValueAsString(event));
-        entity.setId(id);
-        return entity;
+                objectMapper.writeValueAsString(event),
+                0);
+    }
+
+    private record TestOutboxRow(
+            long id,
+            String eventType,
+            String aggregateId,
+            String routingKey,
+            String payload,
+            int attemptCount) {
     }
 }

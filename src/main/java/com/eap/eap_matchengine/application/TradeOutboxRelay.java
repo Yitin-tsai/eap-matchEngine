@@ -2,8 +2,6 @@ package com.eap.eap_matchengine.application;
 
 import com.eap.common.constants.RabbitMQConstants;
 import com.eap.eap_matchengine.configuration.observability.TradeOutboxMetrics;
-import com.eap.eap_matchengine.configuration.repository.TradeOutboxRepository;
-import com.eap.eap_matchengine.domain.entity.TradeOutboxEntity;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.AmqpException;
 import org.springframework.amqp.core.Message;
@@ -14,7 +12,9 @@ import org.springframework.amqp.rabbit.core.RabbitOperations;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.data.domain.PageRequest;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -40,7 +40,8 @@ import java.util.concurrent.atomic.AtomicInteger;
         matchIfMissing = true)
 public class TradeOutboxRelay {
 
-    private final TradeOutboxRepository tradeOutboxRepository;
+    private final JdbcTemplate jdbcTemplate;
+    private final NamedParameterJdbcTemplate namedJdbcTemplate;
     private final RabbitTemplate rabbitTemplate;
     private final TradeOutboxMetrics metrics;
     private final int batchSize;
@@ -52,7 +53,8 @@ public class TradeOutboxRelay {
     private final long maxBackoffMs;
 
     public TradeOutboxRelay(
-            TradeOutboxRepository tradeOutboxRepository,
+            JdbcTemplate jdbcTemplate,
+            NamedParameterJdbcTemplate namedJdbcTemplate,
             RabbitTemplate rabbitTemplate,
             TradeOutboxMetrics metrics,
             @Value("${eap.match-engine.trade-outbox-relay.batch-size:200}") int batchSize,
@@ -61,7 +63,8 @@ public class TradeOutboxRelay {
             @Value("${eap.match-engine.trade-outbox-relay.max-attempts:10}") int maxAttempts,
             @Value("${eap.match-engine.trade-outbox-relay.initial-backoff-ms:1000}") long initialBackoffMs,
             @Value("${eap.match-engine.trade-outbox-relay.max-backoff-ms:300000}") long maxBackoffMs) {
-        this.tradeOutboxRepository = tradeOutboxRepository;
+        this.jdbcTemplate = jdbcTemplate;
+        this.namedJdbcTemplate = namedJdbcTemplate;
         this.rabbitTemplate = rabbitTemplate;
         this.metrics = metrics;
         this.batchSize = batchSize;
@@ -88,13 +91,24 @@ public class TradeOutboxRelay {
         do {
             Instant batchStartedAt = Instant.now();
             Instant selectStartedAt = Instant.now();
-            List<TradeOutboxEntity> pending;
+            List<OutboxRow> pending;
             try {
-                pending = tradeOutboxRepository
-                        .findByStatusAndNextRetryAtLessThanEqualOrderByCreatedAtAsc(
-                                "PENDING",
-                                LocalDateTime.now(),
-                                PageRequest.of(0, batchSize));
+                pending = jdbcTemplate.query("""
+                                SELECT id, event_type, aggregate_id, routing_key, payload, attempt_count
+                                FROM match_engine.trade_outbox
+                                WHERE status = 'PENDING'
+                                  AND next_retry_at <= CURRENT_TIMESTAMP
+                                ORDER BY created_at, id
+                                LIMIT ?
+                                """,
+                        (rs, rowNum) -> new OutboxRow(
+                                rs.getLong("id"),
+                                rs.getString("event_type"),
+                                rs.getString("aggregate_id"),
+                                rs.getString("routing_key"),
+                                rs.getString("payload"),
+                                rs.getInt("attempt_count")),
+                        batchSize);
             } finally {
                 metrics.recordSelect(Duration.between(selectStartedAt, Instant.now()));
             }
@@ -122,7 +136,7 @@ public class TradeOutboxRelay {
             List<PublishAttempt> confirmedAttempts = new ArrayList<>(attempts.size());
 
             for (PublishAttempt attempt : attempts) {
-                TradeOutboxEntity entry = attempt.entry();
+                OutboxRow entry = attempt.entry();
                 Instant confirmStartedAt = Instant.now();
                 try {
                     awaitBrokerConfirmation(entry, attempt.correlationData(), confirmationDeadlineNanos);
@@ -130,7 +144,7 @@ public class TradeOutboxRelay {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     metrics.publishFailed();
-                    log.warn("Trade outbox relay interrupted while waiting for broker confirmation: id={}", entry.getId());
+                    log.warn("Trade outbox relay interrupted while waiting for broker confirmation: id={}", entry.id());
                     return;
                 } catch (Exception e) {
                     batchSucceeded = false;
@@ -160,16 +174,16 @@ public class TradeOutboxRelay {
         } while (continueDraining);
     }
 
-    private List<PublishResult> publishBatch(List<TradeOutboxEntity> pending) {
+    private List<PublishResult> publishBatch(List<OutboxRow> pending) {
         if (publishConcurrency == 1 || pending.size() <= 1) {
             List<PublishResult> results = new ArrayList<>(pending.size());
-            for (TradeOutboxEntity entry : pending) {
+            for (OutboxRow entry : pending) {
                 results.add(publishOne(entry, rabbitTemplate));
             }
             return results;
         }
 
-        List<List<TradeOutboxEntity>> chunks = partition(pending, publishConcurrency);
+        List<List<OutboxRow>> chunks = partition(pending, publishConcurrency);
         List<CompletableFuture<List<PublishResult>>> futures = chunks.stream()
                 .map(chunk -> CompletableFuture.supplyAsync(() -> publishChunk(chunk), publishExecutor))
                 .toList();
@@ -179,11 +193,11 @@ public class TradeOutboxRelay {
                 .toList();
     }
 
-    private List<PublishResult> publishChunk(List<TradeOutboxEntity> chunk) {
+    private List<PublishResult> publishChunk(List<OutboxRow> chunk) {
         List<PublishResult> results = new ArrayList<>(chunk.size());
         try {
             rabbitTemplate.invoke(operations -> {
-                for (TradeOutboxEntity entry : chunk) {
+                for (OutboxRow entry : chunk) {
                     results.add(publishOne(entry, operations));
                 }
                 return null;
@@ -197,24 +211,24 @@ public class TradeOutboxRelay {
         return results;
     }
 
-    private List<List<TradeOutboxEntity>> partition(List<TradeOutboxEntity> pending, int maxChunks) {
+    private List<List<OutboxRow>> partition(List<OutboxRow> pending, int maxChunks) {
         int chunkCount = Math.min(maxChunks, pending.size());
         int chunkSize = (int) Math.ceil(pending.size() / (double) chunkCount);
-        List<List<TradeOutboxEntity>> chunks = new ArrayList<>(chunkCount);
+        List<List<OutboxRow>> chunks = new ArrayList<>(chunkCount);
         for (int start = 0; start < pending.size(); start += chunkSize) {
             chunks.add(pending.subList(start, Math.min(start + chunkSize, pending.size())));
         }
         return chunks;
     }
 
-    private PublishResult publishOne(TradeOutboxEntity entry, RabbitOperations operations) {
+    private PublishResult publishOne(OutboxRow entry, RabbitOperations operations) {
         Instant startedAt = Instant.now();
         Instant enqueueStartedAt = Instant.now();
         try {
-            CorrelationData correlationData = new CorrelationData(entry.getId().toString());
+            CorrelationData correlationData = new CorrelationData(Long.toString(entry.id()));
             operations.send(
                     RabbitMQConstants.TRADE_EXCHANGE,
-                    entry.getRoutingKey(),
+                    entry.routingKey(),
                     toJsonMessage(entry),
                     correlationData);
             return PublishResult.success(entry, correlationData, startedAt);
@@ -225,19 +239,19 @@ public class TradeOutboxRelay {
         }
     }
 
-    private Message toJsonMessage(TradeOutboxEntity entry) {
-        if (!"TradeExecutedEvent".equals(entry.getEventType())) {
-            throw new IllegalArgumentException("Unknown trade outbox event type: " + entry.getEventType());
+    private Message toJsonMessage(OutboxRow entry) {
+        if (!"TradeExecutedEvent".equals(entry.eventType())) {
+            throw new IllegalArgumentException("Unknown trade outbox event type: " + entry.eventType());
         }
         MessageProperties properties = new MessageProperties();
         properties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
         properties.setContentEncoding(StandardCharsets.UTF_8.name());
         properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
-        return new Message(entry.getPayload().getBytes(StandardCharsets.UTF_8), properties);
+        return new Message(entry.payload().getBytes(StandardCharsets.UTF_8), properties);
     }
 
     private void awaitBrokerConfirmation(
-            TradeOutboxEntity entry,
+            OutboxRow entry,
             CorrelationData correlationData,
             long confirmationDeadlineNanos) throws Exception {
         long remainingNanos = confirmationDeadlineNanos - System.nanoTime();
@@ -249,19 +263,29 @@ public class TradeOutboxRelay {
             throw new AmqpException("RabbitMQ nack: " + confirm.getReason());
         }
         if (correlationData.getReturned() != null) {
-            throw new AmqpException("Unroutable TradeExecutedEvent: id=" + entry.getId());
+            throw new AmqpException("Unroutable TradeExecutedEvent: id=" + entry.id());
         }
     }
 
     private void markConfirmedAsSent(List<PublishAttempt> confirmedAttempts) {
         List<Long> ids = confirmedAttempts.stream()
-                .map(attempt -> attempt.entry().getId())
+                .map(attempt -> attempt.entry().id())
                 .toList();
         LocalDateTime updatedAt = LocalDateTime.now();
         Instant markStartedAt = Instant.now();
         int marked;
         try {
-            marked = tradeOutboxRepository.markPendingAsSent(ids, updatedAt);
+            marked = namedJdbcTemplate.update("""
+                    UPDATE match_engine.trade_outbox
+                    SET status = 'SENT',
+                        next_retry_at = NULL,
+                        last_error = NULL,
+                        updated_at = :updatedAt
+                    WHERE id IN (:ids)
+                      AND status = 'PENDING'
+                    """, new MapSqlParameterSource()
+                    .addValue("updatedAt", updatedAt)
+                    .addValue("ids", ids));
         } finally {
             metrics.recordMarkSent(Duration.between(markStartedAt, Instant.now()));
         }
@@ -272,39 +296,59 @@ public class TradeOutboxRelay {
 
         Instant completedAt = Instant.now();
         for (PublishAttempt attempt : confirmedAttempts) {
-            TradeOutboxEntity entry = attempt.entry();
-            entry.setStatus("SENT");
-            entry.setNextRetryAt(null);
-            entry.setLastError(null);
-            entry.setUpdatedAt(updatedAt);
             metrics.published();
             metrics.recordPublish(Duration.between(attempt.startedAt(), completedAt));
-            log.debug("Trade outbox event published: id={}, aggregateId={}", entry.getId(), entry.getAggregateId());
+            log.debug("Trade outbox event published: id={}, aggregateId={}",
+                    attempt.entry().id(), attempt.entry().aggregateId());
         }
     }
 
-    private void recordFailure(TradeOutboxEntity entry, Exception failure) {
-        int attemptCount = entry.getAttemptCount() + 1;
+    private void recordFailure(OutboxRow entry, Exception failure) {
+        int attemptCount = entry.attemptCount() + 1;
         String error = failure.getClass().getSimpleName() + ": "
                 + (failure.getMessage() == null ? "no message" : failure.getMessage());
-
-        entry.setAttemptCount(attemptCount);
-        entry.setLastError(error.substring(0, Math.min(error.length(), 1000)));
-        entry.setUpdatedAt(LocalDateTime.now());
+        String truncatedError = error.substring(0, Math.min(error.length(), 1000));
+        LocalDateTime updatedAt = LocalDateTime.now();
 
         if (attemptCount >= maxAttempts) {
-            entry.setStatus("FAILED");
-            entry.setNextRetryAt(null);
             log.error("Trade outbox event permanently failed: id={}, aggregateId={}, attempts={}, error={}",
-                    entry.getId(), entry.getAggregateId(), attemptCount, entry.getLastError());
+                    entry.id(), entry.aggregateId(), attemptCount, truncatedError);
+            namedJdbcTemplate.update("""
+                    UPDATE match_engine.trade_outbox
+                    SET attempt_count = :attemptCount,
+                        status = 'FAILED',
+                        next_retry_at = NULL,
+                        last_error = :lastError,
+                        updated_at = :updatedAt
+                    WHERE id = :id
+                      AND status = 'PENDING'
+                    """, new MapSqlParameterSource()
+                    .addValue("attemptCount", attemptCount)
+                    .addValue("lastError", truncatedError)
+                    .addValue("updatedAt", updatedAt)
+                    .addValue("id", entry.id()));
         } else {
             long backoffMs = calculateBackoffMs(attemptCount);
-            entry.setNextRetryAt(LocalDateTime.now().plusNanos(TimeUnit.MILLISECONDS.toNanos(backoffMs)));
+            LocalDateTime nextRetryAt = updatedAt.plusNanos(TimeUnit.MILLISECONDS.toNanos(backoffMs));
+            namedJdbcTemplate.update("""
+                    UPDATE match_engine.trade_outbox
+                    SET attempt_count = :attemptCount,
+                        status = 'PENDING',
+                        next_retry_at = :nextRetryAt,
+                        last_error = :lastError,
+                        updated_at = :updatedAt
+                    WHERE id = :id
+                      AND status = 'PENDING'
+                    """, new MapSqlParameterSource()
+                    .addValue("attemptCount", attemptCount)
+                    .addValue("nextRetryAt", nextRetryAt)
+                    .addValue("lastError", truncatedError)
+                    .addValue("updatedAt", updatedAt)
+                    .addValue("id", entry.id()));
             metrics.retryScheduled();
             log.warn("Trade outbox publish failed; retry scheduled: id={}, aggregateId={}, attempt={}/{}, backoffMs={}, error={}",
-                    entry.getId(), entry.getAggregateId(), attemptCount, maxAttempts, backoffMs, entry.getLastError());
+                    entry.id(), entry.aggregateId(), attemptCount, maxAttempts, backoffMs, truncatedError);
         }
-        tradeOutboxRepository.save(entry);
     }
 
     private long calculateBackoffMs(int attemptCount) {
@@ -316,23 +360,32 @@ public class TradeOutboxRelay {
         return Math.min(initialBackoffMs * multiplier, maxBackoffMs);
     }
 
+    private record OutboxRow(
+            long id,
+            String eventType,
+            String aggregateId,
+            String routingKey,
+            String payload,
+            int attemptCount) {
+    }
+
     private record PublishAttempt(
-            TradeOutboxEntity entry,
+            OutboxRow entry,
             CorrelationData correlationData,
             Instant startedAt) {
     }
 
     private record PublishResult(
-            TradeOutboxEntity entry,
+            OutboxRow entry,
             CorrelationData correlationData,
             Instant startedAt,
             Exception failure) {
 
-        static PublishResult success(TradeOutboxEntity entry, CorrelationData correlationData, Instant startedAt) {
+        static PublishResult success(OutboxRow entry, CorrelationData correlationData, Instant startedAt) {
             return new PublishResult(entry, correlationData, startedAt, null);
         }
 
-        static PublishResult failure(TradeOutboxEntity entry, Instant startedAt, Exception failure) {
+        static PublishResult failure(OutboxRow entry, Instant startedAt, Exception failure) {
             return new PublishResult(entry, null, startedAt, failure);
         }
 
