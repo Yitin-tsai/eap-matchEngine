@@ -73,8 +73,9 @@ public class MatchingEngineService {
     boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
 
     while (incomingOrder.getAmount() > 0) {
-      // Use Lua script to atomically get and remove best match order
-      OrderConfirmedEvent matchOrder = orderBookService.getAndRemoveBestMatchOrderLua(incomingOrder);
+      // Reserve the resting order before writing the durable trade fact. The order is removed
+      // from the visible orderbook but remains in a known Redis reservation state until commit.
+      OrderConfirmedEvent matchOrder = orderBookService.reserveBestMatchOrderLua(incomingOrder);
 
       if (matchOrder == null) {
         // No matching order found, add remaining order to orderbook atomically
@@ -129,7 +130,7 @@ public class MatchingEngineService {
         tradeExecutedEvent = toTradeExecutedEvent(matchedEvent);
         tradeExecutionRecorder.record(tradeExecutedEvent);
       } catch (RuntimeException e) {
-        reAddPoppedRestingOrder(matchOrder, matchOrderAmountBeforeMatch, e);
+        releaseReservedRestingOrder(matchOrder, matchOrderAmountBeforeMatch, e);
         throw e;
       }
       log.debug("Persisted TradeExecutedEvent for tradeId={}", tradeExecutedEvent.getTradeId());
@@ -147,7 +148,7 @@ public class MatchingEngineService {
 
       // Handle partial match with distributed lock to prevent race conditions
       if (matchOrder.getAmount() > 0) {
-        // Partial match: re-add remaining amount with lock protection
+        // Partial match: release remaining amount back to the visible orderbook with lock protection
         String lockKey = ORDER_LOCK_PREFIX + matchOrder.getOrderId();
         RLock lock = redissonClient.getLock(lockKey);
 
@@ -157,13 +158,12 @@ public class MatchingEngineService {
 
           if (locked) {
             try {
-              // Re-add the partial order atomically
-              orderBookService.addOrder(matchOrder);
-              log.info("Partial match: re-added remaining order atomically: orderId={}, remainingAmount={}",
+              orderBookService.releaseReservedOrder(matchOrder);
+              log.info("Partial match: released remaining reserved order atomically: orderId={}, remainingAmount={}",
                   matchOrder.getOrderId(), matchOrder.getAmount());
             } catch (JsonProcessingException e) {
-              log.error("Failed to re-add partial order: orderId={}", matchOrder.getOrderId(), e);
-              throw new RuntimeException("Failed to re-add partial order", e);
+              log.error("Failed to release partial reserved order: orderId={}", matchOrder.getOrderId(), e);
+              throw new RuntimeException("Failed to release partial reserved order", e);
             } finally {
               lock.unlock();
             }
@@ -177,26 +177,24 @@ public class MatchingEngineService {
           throw new RuntimeException("Interrupted while waiting for lock", e);
         }
       } else {
-        // Fully matched: getAndRemoveBestMatchOrderLua already removed the orderbook entry and order detail.
-        // Only unlink the order from the user's open-order set here to avoid a redundant Redis Lua round trip.
-        orderBookService.unlinkUserOrder(matchOrder);
-        log.info("Order fully matched and unlinked from user open orders: orderId={}", matchOrder.getOrderId());
+        orderBookService.completeReservedOrder(matchOrder);
+        log.info("Order fully matched and completed from reservation: orderId={}", matchOrder.getOrderId());
       }
     }
   }
 
-  private void reAddPoppedRestingOrder(
+  private void releaseReservedRestingOrder(
       OrderConfirmedEvent matchOrder,
       int originalAmount,
       RuntimeException cause) {
     matchOrder.setAmount(originalAmount);
     try {
-      orderBookService.addOrder(matchOrder);
-      log.warn("Re-added popped resting order after trade persistence failure: orderId={}, amount={}",
+      orderBookService.releaseReservedOrder(matchOrder);
+      log.warn("Released reserved resting order after trade persistence failure: orderId={}, amount={}",
           matchOrder.getOrderId(), originalAmount, cause);
     } catch (JsonProcessingException compensationFailure) {
       cause.addSuppressed(compensationFailure);
-      log.error("Failed to re-add popped resting order after trade persistence failure: orderId={}",
+      log.error("Failed to release reserved resting order after trade persistence failure: orderId={}",
           matchOrder.getOrderId(), compensationFailure);
     }
   }

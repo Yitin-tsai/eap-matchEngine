@@ -39,8 +39,10 @@ public class RedisOrderBookService {
 
     // Lua scripts loaded from classpath
     private String addOrderLuaScript;
-    private String getAndRemoveMatchOrderBuyLuaScript;
-    private String getAndRemoveMatchOrderSellLuaScript;
+    private String reserveMatchOrderBuyLuaScript;
+    private String reserveMatchOrderSellLuaScript;
+    private String releaseReservedOrderLuaScript;
+    private String completeReservedOrderLuaScript;
     private String removeOrderLuaScript;
 
     public RedisOrderBookService(RedisTemplate<String, String> redisTemplate, ObjectMapper objectMapper) {
@@ -55,8 +57,10 @@ public class RedisOrderBookService {
     public void init() {
         try {
             addOrderLuaScript = loadLuaScript("lua/add_order.lua");
-            getAndRemoveMatchOrderBuyLuaScript = loadLuaScript("lua/get_and_remove_match_order_buy.lua");
-            getAndRemoveMatchOrderSellLuaScript = loadLuaScript("lua/get_and_remove_match_order_sell.lua");
+            reserveMatchOrderBuyLuaScript = loadLuaScript("lua/reserve_match_order_buy.lua");
+            reserveMatchOrderSellLuaScript = loadLuaScript("lua/reserve_match_order_sell.lua");
+            releaseReservedOrderLuaScript = loadLuaScript("lua/release_reserved_order.lua");
+            completeReservedOrderLuaScript = loadLuaScript("lua/complete_reserved_order.lua");
             removeOrderLuaScript = loadLuaScript("lua/remove_order.lua");
             log.info("Successfully loaded all Lua scripts for atomic Redis operations");
         } catch (IOException e) {
@@ -183,6 +187,140 @@ public class RedisOrderBookService {
     }
 
     /**
+     * Reserves the best matching resting order without deleting the order detail.
+     *
+     * The order is removed from the visible orderbook and written to a reservation key. This
+     * prevents another incoming order from matching the same resting order while the durable
+     * TradeExecuted fact is being persisted. If persistence fails, the reservation can be
+     * released back to the orderbook with the original amount.
+     */
+    public OrderConfirmedEvent reserveBestMatchOrderLua(OrderConfirmedEvent incomingOrder) {
+        boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
+        String orderbookKey = isBuy
+                ? orderbookKey(marketId(incomingOrder), "sell")
+                : orderbookKey(marketId(incomingOrder), "buy");
+        String luaScript = isBuy ? reserveMatchOrderBuyLuaScript : reserveMatchOrderSellLuaScript;
+        double priceBoundary = isBuy
+                ? maxSellScore(incomingOrder.getPrice())
+                : minBuyScore(incomingOrder.getPrice());
+
+        List<String> keys = List.of(orderbookKey);
+        List<String> args = List.of(String.valueOf(priceBoundary));
+
+        String orderJson = redisTemplate.execute((RedisCallback<String>) connection -> {
+            byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] argsBytes = args.stream().map(a -> a.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] allParams = new byte[keysBytes.length + argsBytes.length][];
+            System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
+            System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
+
+            Object res = connection.eval(
+                    luaScript.getBytes(StandardCharsets.UTF_8),
+                    ReturnType.VALUE,
+                    keys.size(),
+                    allParams
+            );
+            return res != null ? new String((byte[]) res, StandardCharsets.UTF_8) : null;
+        });
+
+        if (orderJson == null) {
+            log.debug("No matching order found for price {}, isBuy={}", incomingOrder.getPrice(), isBuy);
+            return null;
+        }
+        if (orderJson.startsWith(MISSING_ORDER_DETAIL_PREFIX)) {
+            String missingOrderId = orderJson.substring(MISSING_ORDER_DETAIL_PREFIX.length());
+            log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
+                    missingOrderId);
+            throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+        }
+
+        try {
+            OrderConfirmedEvent reservedOrder = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+            log.debug("Successfully reserved order {} for matching", reservedOrder.getOrderId());
+            return reservedOrder;
+        } catch (Exception e) {
+            log.error("Failed to deserialize reserved order", e);
+            throw new IllegalStateException("Failed to deserialize reserved Redis order", e);
+        }
+    }
+
+    /**
+     * Releases a reserved order back to the visible orderbook.
+     */
+    public void releaseReservedOrder(OrderConfirmedEvent event) throws JsonProcessingException {
+        String orderbookKey = orderbookKey(event);
+        String orderIdKey = "order:" + event.getOrderId();
+        String userOrdersKey = "user:" + event.getUserId() + ":orders";
+        String reservationKey = reservationKey(event);
+        String orderJson = objectMapper.writeValueAsString(event);
+        double orderScore = scoreFor(event);
+
+        List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey, reservationKey);
+        List<String> args = List.of(
+                event.getOrderId().toString(),
+                String.valueOf(orderScore),
+                orderJson
+        );
+
+        Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
+            byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] argsBytes = args.stream().map(a -> a.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] allParams = new byte[keysBytes.length + argsBytes.length][];
+            System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
+            System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
+
+            Object res = connection.eval(
+                    releaseReservedOrderLuaScript.getBytes(StandardCharsets.UTF_8),
+                    ReturnType.INTEGER,
+                    keys.size(),
+                    allParams
+            );
+            return res != null ? (Long) res : 0L;
+        });
+
+        if (result != null && result == 1L) {
+            log.debug("Successfully released reserved order {} back to orderbook", event.getOrderId());
+        } else {
+            log.error("Failed to release reserved order {} back to orderbook", event.getOrderId());
+            throw new RuntimeException("Failed to release reserved order to Redis");
+        }
+    }
+
+    /**
+     * Completes a reserved order after its corresponding TradeExecuted fact is durable.
+     */
+    public void completeReservedOrder(OrderConfirmedEvent event) {
+        String orderIdKey = "order:" + event.getOrderId();
+        String userOrdersKey = "user:" + event.getUserId() + ":orders";
+        String reservationKey = reservationKey(event);
+
+        List<String> keys = List.of(orderIdKey, userOrdersKey, reservationKey);
+        List<String> args = List.of(event.getOrderId().toString());
+
+        Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
+            byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] argsBytes = args.stream().map(a -> a.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] allParams = new byte[keysBytes.length + argsBytes.length][];
+            System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
+            System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
+
+            Object res = connection.eval(
+                    completeReservedOrderLuaScript.getBytes(StandardCharsets.UTF_8),
+                    ReturnType.INTEGER,
+                    keys.size(),
+                    allParams
+            );
+            return res != null ? (Long) res : 0L;
+        });
+
+        if (result != null && result == 1L) {
+            log.debug("Successfully completed reserved order {}", event.getOrderId());
+        } else {
+            log.warn("Reserved order {} had no Redis state to complete", event.getOrderId());
+        }
+    }
+
+    /**
      * Atomically cancels an order.
      * First retrieves order details, then uses Lua script to remove atomically.
      *
@@ -270,73 +408,6 @@ public class RedisOrderBookService {
     }
 
     /**
-     * Atomically finds the best matching order and removes it from orderbook.
-     * Uses Lua script to ensure complete atomicity:
-     * 1. Find best match by price
-     * 2. Remove from orderbook ZSet
-     * 3. Get order details
-     * 4. Delete order details key
-     *
-     * This prevents race conditions where order is removed but details are not available.
-     *
-     * @param isBuy whether the incoming order is a buy order
-     * @param price the price limit for matching
-     * @return the matched order, or null if no match found
-     */
-    public OrderConfirmedEvent getAndRemoveBestMatchOrderLua(OrderConfirmedEvent incomingOrder) {
-        boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
-        String orderbookKey = isBuy
-                ? orderbookKey(marketId(incomingOrder), "sell")
-                : orderbookKey(marketId(incomingOrder), "buy");
-        String luaScript = isBuy ? getAndRemoveMatchOrderBuyLuaScript : getAndRemoveMatchOrderSellLuaScript;
-        double priceBoundary = isBuy
-                ? maxSellScore(incomingOrder.getPrice())
-                : minBuyScore(incomingOrder.getPrice());
-
-        List<String> keys = List.of(orderbookKey);
-        List<String> args = List.of(String.valueOf(priceBoundary));
-
-        String orderJson = redisTemplate.execute((RedisCallback<String>) connection -> {
-            // Flatten keys and args into single byte[] varargs array
-            byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
-            byte[][] argsBytes = args.stream().map(a -> a.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
-
-            // Combine keys and args into single varargs array
-            byte[][] allParams = new byte[keysBytes.length + argsBytes.length][];
-            System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
-            System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
-
-            Object res = connection.eval(
-                luaScript.getBytes(StandardCharsets.UTF_8),
-                ReturnType.VALUE,
-                keys.size(),
-                allParams
-            );
-            return res != null ? new String((byte[]) res, StandardCharsets.UTF_8) : null;
-        });
-
-        if (orderJson == null) {
-            log.debug("No matching order found for price {}, isBuy={}", incomingOrder.getPrice(), isBuy);
-            return null;
-        }
-        if (orderJson.startsWith(MISSING_ORDER_DETAIL_PREFIX)) {
-            String missingOrderId = orderJson.substring(MISSING_ORDER_DETAIL_PREFIX.length());
-            log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
-                    missingOrderId);
-            throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
-        }
-
-        try {
-            OrderConfirmedEvent matchedOrder = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
-            log.debug("Successfully matched and removed order {} atomically", matchedOrder.getOrderId());
-            return matchedOrder;
-        } catch (Exception e) {
-            log.error("Failed to deserialize matched order", e);
-            throw new IllegalStateException("Failed to deserialize matched Redis order", e);
-        }
-    }
-
-    /**
      * Retrieves matchable orders for an incoming order based on price matching rules:
      * - For buy orders: finds sell orders with prices less than or equal to the buy price
      * - For sell orders: finds buy orders with prices greater than or equal to the sell price
@@ -388,6 +459,10 @@ public class RedisOrderBookService {
 
     private String orderbookKey(String marketId, String side) {
         return "orderbook:" + marketId + ":" + side;
+    }
+
+    private String reservationKey(OrderConfirmedEvent event) {
+        return "order:reservation:" + event.getOrderId();
     }
 
     private String marketId(OrderConfirmedEvent event) {

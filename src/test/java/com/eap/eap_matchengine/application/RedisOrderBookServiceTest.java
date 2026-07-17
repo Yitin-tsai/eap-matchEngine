@@ -22,12 +22,12 @@ class RedisOrderBookServiceTest {
     private final RedisOrderBookService service = new RedisOrderBookService(redisTemplate, new ObjectMapper());
 
     @Test
-    void getAndRemoveBestMatchOrderLua_whenOrderbookDetailIsMissing_shouldFailFast() {
+    void reserveBestMatchOrderLua_whenOrderbookDetailIsMissing_shouldFailFast() {
         UUID missingOrderId = UUID.fromString("00000000-0000-0000-0000-000000000001");
         doReturn("__MISSING_ORDER_DETAIL__:" + missingOrderId)
                 .when(redisTemplate).execute(any(RedisCallback.class));
 
-        assertThatThrownBy(() -> service.getAndRemoveBestMatchOrderLua(incomingBuyOrder()))
+        assertThatThrownBy(() -> service.reserveBestMatchOrderLua(incomingBuyOrder()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Redis orderbook detail missing")
                 .hasMessageContaining(missingOrderId.toString());
