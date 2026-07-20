@@ -19,6 +19,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.ScanOptions;
+import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -52,6 +53,12 @@ public class RedisOrderBookService {
     private String releaseReservedOrderLuaScript;
     private String completeReservedOrderLuaScript;
     private String removeOrderLuaScript;
+    private String addOrderLuaSha;
+    private String reserveMatchOrderBuyLuaSha;
+    private String reserveMatchOrderSellLuaSha;
+    private String releaseReservedOrderLuaSha;
+    private String completeReservedOrderLuaSha;
+    private String removeOrderLuaSha;
 
     public RedisOrderBookService(RedisTemplate<String, String> redisTemplate, ObjectMapper objectMapper) {
         this.redisTemplate = redisTemplate;
@@ -70,6 +77,12 @@ public class RedisOrderBookService {
             releaseReservedOrderLuaScript = loadLuaScript("lua/release_reserved_order.lua");
             completeReservedOrderLuaScript = loadLuaScript("lua/complete_reserved_order.lua");
             removeOrderLuaScript = loadLuaScript("lua/remove_order.lua");
+            addOrderLuaSha = loadLuaScriptSha(addOrderLuaScript);
+            reserveMatchOrderBuyLuaSha = loadLuaScriptSha(reserveMatchOrderBuyLuaScript);
+            reserveMatchOrderSellLuaSha = loadLuaScriptSha(reserveMatchOrderSellLuaScript);
+            releaseReservedOrderLuaSha = loadLuaScriptSha(releaseReservedOrderLuaScript);
+            completeReservedOrderLuaSha = loadLuaScriptSha(completeReservedOrderLuaScript);
+            removeOrderLuaSha = loadLuaScriptSha(removeOrderLuaScript);
             log.info("Successfully loaded all Lua scripts for atomic Redis operations");
         } catch (IOException e) {
             log.error("Failed to load Lua scripts", e);
@@ -80,6 +93,40 @@ public class RedisOrderBookService {
     private String loadLuaScript(String path) throws IOException {
         ClassPathResource resource = new ClassPathResource(path);
         return StreamUtils.copyToString(resource.getInputStream(), StandardCharsets.UTF_8);
+    }
+
+    private String loadLuaScriptSha(String script) {
+        return redisTemplate.execute((RedisCallback<String>) connection ->
+                connection.scriptLoad(script.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private Object evalLoadedScript(
+            RedisConnection connection,
+            String scriptSha,
+            String script,
+            ReturnType returnType,
+            int numKeys,
+            byte[]... keysAndArgs) {
+        try {
+            return connection.evalSha(scriptSha, returnType, numKeys, keysAndArgs);
+        } catch (RuntimeException e) {
+            if (!isNoScript(e)) {
+                throw e;
+            }
+            return connection.eval(script.getBytes(StandardCharsets.UTF_8), returnType, numKeys, keysAndArgs);
+        }
+    }
+
+    private boolean isNoScript(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            String message = current.getMessage();
+            if (message != null && message.contains("NOSCRIPT")) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     /**
@@ -116,8 +163,10 @@ public class RedisOrderBookService {
             System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
             System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
 
-            Object res = connection.eval(
-                addOrderLuaScript.getBytes(StandardCharsets.UTF_8),
+            Object res = evalLoadedScript(
+                connection,
+                addOrderLuaSha,
+                addOrderLuaScript,
                 ReturnType.INTEGER,
                 keys.size(),
                 allParams
@@ -160,8 +209,10 @@ public class RedisOrderBookService {
             System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
             System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
 
-            Object res = connection.eval(
-                removeOrderLuaScript.getBytes(StandardCharsets.UTF_8),
+            Object res = evalLoadedScript(
+                connection,
+                removeOrderLuaSha,
+                removeOrderLuaScript,
                 ReturnType.INTEGER,
                 keys.size(),
                 allParams
@@ -224,8 +275,10 @@ public class RedisOrderBookService {
             System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
             System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
 
-            Object res = connection.eval(
-                    luaScript.getBytes(StandardCharsets.UTF_8),
+            Object res = evalLoadedScript(
+                    connection,
+                    isBuy ? reserveMatchOrderBuyLuaSha : reserveMatchOrderSellLuaSha,
+                    luaScript,
                     ReturnType.VALUE,
                     keys.size(),
                     allParams
@@ -288,8 +341,10 @@ public class RedisOrderBookService {
             System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
             System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
 
-            Object res = connection.eval(
-                    luaScript.getBytes(StandardCharsets.UTF_8),
+            Object res = evalLoadedScript(
+                    connection,
+                    isBuy ? reserveMatchOrderBuyLuaSha : reserveMatchOrderSellLuaSha,
+                    luaScript,
                     ReturnType.MULTI,
                     keys.size(),
                     allParams
@@ -358,8 +413,10 @@ public class RedisOrderBookService {
             System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
             System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
 
-            Object res = connection.eval(
-                    releaseReservedOrderLuaScript.getBytes(StandardCharsets.UTF_8),
+            Object res = evalLoadedScript(
+                    connection,
+                    releaseReservedOrderLuaSha,
+                    releaseReservedOrderLuaScript,
                     ReturnType.INTEGER,
                     keys.size(),
                     allParams
@@ -393,8 +450,10 @@ public class RedisOrderBookService {
             System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
             System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
 
-            Object res = connection.eval(
-                    completeReservedOrderLuaScript.getBytes(StandardCharsets.UTF_8),
+            Object res = evalLoadedScript(
+                    connection,
+                    completeReservedOrderLuaSha,
+                    completeReservedOrderLuaScript,
                     ReturnType.INTEGER,
                     keys.size(),
                     allParams
