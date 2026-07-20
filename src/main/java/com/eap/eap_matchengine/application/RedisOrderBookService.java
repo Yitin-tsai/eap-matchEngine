@@ -50,12 +50,16 @@ public class RedisOrderBookService {
     private String addOrderLuaScript;
     private String reserveMatchOrderBuyLuaScript;
     private String reserveMatchOrderSellLuaScript;
+    private String reserveOrAddOrderBuyLuaScript;
+    private String reserveOrAddOrderSellLuaScript;
     private String releaseReservedOrderLuaScript;
     private String completeReservedOrderLuaScript;
     private String removeOrderLuaScript;
     private String addOrderLuaSha;
     private String reserveMatchOrderBuyLuaSha;
     private String reserveMatchOrderSellLuaSha;
+    private String reserveOrAddOrderBuyLuaSha;
+    private String reserveOrAddOrderSellLuaSha;
     private String releaseReservedOrderLuaSha;
     private String completeReservedOrderLuaSha;
     private String removeOrderLuaSha;
@@ -74,12 +78,16 @@ public class RedisOrderBookService {
             addOrderLuaScript = loadLuaScript("lua/add_order.lua");
             reserveMatchOrderBuyLuaScript = loadLuaScript("lua/reserve_match_order_buy.lua");
             reserveMatchOrderSellLuaScript = loadLuaScript("lua/reserve_match_order_sell.lua");
+            reserveOrAddOrderBuyLuaScript = loadLuaScript("lua/reserve_or_add_order_buy.lua");
+            reserveOrAddOrderSellLuaScript = loadLuaScript("lua/reserve_or_add_order_sell.lua");
             releaseReservedOrderLuaScript = loadLuaScript("lua/release_reserved_order.lua");
             completeReservedOrderLuaScript = loadLuaScript("lua/complete_reserved_order.lua");
             removeOrderLuaScript = loadLuaScript("lua/remove_order.lua");
             addOrderLuaSha = loadLuaScriptSha(addOrderLuaScript);
             reserveMatchOrderBuyLuaSha = loadLuaScriptSha(reserveMatchOrderBuyLuaScript);
             reserveMatchOrderSellLuaSha = loadLuaScriptSha(reserveMatchOrderSellLuaScript);
+            reserveOrAddOrderBuyLuaSha = loadLuaScriptSha(reserveOrAddOrderBuyLuaScript);
+            reserveOrAddOrderSellLuaSha = loadLuaScriptSha(reserveOrAddOrderSellLuaScript);
             releaseReservedOrderLuaSha = loadLuaScriptSha(releaseReservedOrderLuaScript);
             completeReservedOrderLuaSha = loadLuaScriptSha(completeReservedOrderLuaScript);
             removeOrderLuaSha = loadLuaScriptSha(removeOrderLuaScript);
@@ -385,7 +393,117 @@ public class RedisOrderBookService {
         }
     }
 
+    /**
+     * Atomically reserves the best matching resting order, or adds the incoming order to the
+     * visible orderbook when no match exists.
+     *
+     * This removes the no-match hot-path round trip where Java first ran a reserve Lua script,
+     * observed null, and then ran add_order.lua.
+     */
+    public MatchOrAddResult reserveBestMatchOrAddOrderWithSequenceLua(OrderConfirmedEvent incomingOrder) {
+        boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
+        String oppositeOrderbookKey = isBuy
+                ? orderbookKey(marketId(incomingOrder), "sell")
+                : orderbookKey(marketId(incomingOrder), "buy");
+        String ownOrderbookKey = orderbookKey(incomingOrder);
+        String incomingOrderIdKey = "order:" + incomingOrder.getOrderId();
+        String incomingUserOrdersKey = "user:" + incomingOrder.getUserId() + ":orders";
+        String luaScript = isBuy ? reserveOrAddOrderBuyLuaScript : reserveOrAddOrderSellLuaScript;
+        String scriptSha = isBuy ? reserveOrAddOrderBuyLuaSha : reserveOrAddOrderSellLuaSha;
+        double priceBoundary = isBuy
+                ? maxSellScore(incomingOrder.getPrice())
+                : minBuyScore(incomingOrder.getPrice());
+
+        String incomingOrderJson;
+        try {
+            incomingOrderJson = objectMapper.writeValueAsString(incomingOrder);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Failed to serialize incoming Redis order", e);
+        }
+
+        List<String> keys = List.of(
+                oppositeOrderbookKey,
+                ownOrderbookKey,
+                incomingOrderIdKey,
+                incomingUserOrdersKey,
+                MATCH_ID_KEY);
+        List<String> args = List.of(
+                String.valueOf(priceBoundary),
+                String.valueOf(Instant.now().toEpochMilli()),
+                incomingOrder.getOrderId().toString(),
+                String.valueOf(scoreFor(incomingOrder)),
+                incomingOrderJson);
+
+        @SuppressWarnings("unchecked")
+        List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
+            byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] argsBytes = args.stream().map(a -> a.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
+            byte[][] allParams = new byte[keysBytes.length + argsBytes.length][];
+            System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
+            System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
+
+            Object res = evalLoadedScript(
+                    connection,
+                    scriptSha,
+                    luaScript,
+                    ReturnType.MULTI,
+                    keys.size(),
+                    allParams
+            );
+            return (List<byte[]>) res;
+        });
+
+        if (rawResult == null || rawResult.isEmpty()) {
+            throw new IllegalStateException("Redis reserve-or-add script returned no result");
+        }
+
+        String status = new String(rawResult.get(0), StandardCharsets.UTF_8);
+        if ("__ADDED__".equals(status)) {
+            log.debug("No matching order found; added incoming order {} to orderbook", incomingOrder.getOrderId());
+            return MatchOrAddResult.added();
+        }
+        if (status.startsWith(MISSING_ORDER_DETAIL_PREFIX)) {
+            String missingOrderId = status.substring(MISSING_ORDER_DETAIL_PREFIX.length());
+            log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
+                    missingOrderId);
+            throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+        }
+        if (status.startsWith(RESERVATION_EXISTS_PREFIX)) {
+            String orderId = status.substring(RESERVATION_EXISTS_PREFIX.length());
+            log.error("Redis orderbook is inconsistent: order {} is visible but already reserved", orderId);
+            throw new IllegalStateException("Redis order already reserved for order " + orderId);
+        }
+        if (!"__MATCH__".equals(status)) {
+            throw new IllegalStateException("Redis reserve-or-add script returned unknown status " + status);
+        }
+        if (rawResult.size() < 3) {
+            throw new IllegalStateException("Redis reserve-or-add script did not return reserved order and sequence");
+        }
+
+        try {
+            String orderJson = new String(rawResult.get(1), StandardCharsets.UTF_8);
+            OrderConfirmedEvent reservedOrder = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+            Long matchId = Long.valueOf(new String(rawResult.get(2), StandardCharsets.UTF_8));
+            log.debug("Successfully reserved order {} for matching with matchId={}",
+                    reservedOrder.getOrderId(), matchId);
+            return MatchOrAddResult.matched(new ReservedMatch(reservedOrder, matchId));
+        } catch (Exception e) {
+            log.error("Failed to deserialize reserve-or-add result", e);
+            throw new IllegalStateException("Failed to deserialize reserve-or-add Redis result", e);
+        }
+    }
+
     public record ReservedMatch(OrderConfirmedEvent order, Long matchId) {
+    }
+
+    public record MatchOrAddResult(boolean orderAdded, ReservedMatch reservedMatch) {
+        public static MatchOrAddResult added() {
+            return new MatchOrAddResult(true, null);
+        }
+
+        public static MatchOrAddResult matched(ReservedMatch reservedMatch) {
+            return new MatchOrAddResult(false, reservedMatch);
+        }
     }
 
     /**

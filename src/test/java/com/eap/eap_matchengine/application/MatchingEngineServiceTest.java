@@ -49,8 +49,9 @@ class MatchingEngineServiceTest {
                 300L,
                 1);
 
-        when(orderBookService.reserveBestMatchOrderWithSequenceLua(incomingBuy))
-                .thenReturn(new RedisOrderBookService.ReservedMatch(restingSell, 42L));
+        when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
+                .thenReturn(RedisOrderBookService.MatchOrAddResult.matched(
+                        new RedisOrderBookService.ReservedMatch(restingSell, 42L)));
 
         service.tryMatch(incomingBuy);
 
@@ -82,8 +83,9 @@ class MatchingEngineServiceTest {
                 100L,
                 1);
 
-        when(orderBookService.reserveBestMatchOrderWithSequenceLua(incomingBuy))
-                .thenReturn(new RedisOrderBookService.ReservedMatch(restingSell, 42L));
+        when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
+                .thenReturn(RedisOrderBookService.MatchOrAddResult.matched(
+                        new RedisOrderBookService.ReservedMatch(restingSell, 42L)));
         doThrow(new IllegalStateException("db unavailable"))
                 .when(tradeExecutionRecorder).record(any(TradeExecutedEvent.class));
 
@@ -111,7 +113,7 @@ class MatchingEngineServiceTest {
                 201L,
                 1);
 
-        when(orderBookService.reserveBestMatchOrderWithSequenceLua(incomingBuy))
+        when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
                 .thenThrow(new IllegalStateException("redis reservation unavailable"));
 
         assertThatThrownBy(() -> service.tryMatch(incomingBuy))
@@ -122,6 +124,29 @@ class MatchingEngineServiceTest {
         verify(orderBookService, never()).completeReservedOrder(any());
         verify(orderBookService, never()).releaseReservedOrder(any());
         assertThat(incomingBuy.getAmount()).isEqualTo(1);
+    }
+
+    @Test
+    void tryMatch_whenNoMatch_shouldKeepOrderInRedisWithoutSecondAddCall() throws Exception {
+        ReflectionTestUtils.setField(service, "legacyOrderMatchedPublishEnabled", false);
+        OrderConfirmedEvent incomingSell = order(
+                "SELL",
+                "00000000-0000-0000-0000-000000000031",
+                "00000000-0000-0000-0000-000000000032",
+                401L,
+                1);
+
+        when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingSell))
+                .thenReturn(RedisOrderBookService.MatchOrAddResult.added());
+
+        service.tryMatch(incomingSell);
+
+        verify(tradeExecutionRecorder, never()).record(any());
+        verify(orderBookService, never()).addOrder(any());
+        verify(orderBookService, never()).completeReservedOrder(any());
+        verify(orderBookService, never()).releaseReservedOrder(any());
+        verify(matchingEngineMetrics).orderAdded();
+        assertThat(incomingSell.getAmount()).isEqualTo(1);
     }
 
     private OrderConfirmedEvent order(

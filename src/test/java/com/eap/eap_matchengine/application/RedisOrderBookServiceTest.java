@@ -80,6 +80,46 @@ class RedisOrderBookServiceTest {
     }
 
     @Test
+    void reserveBestMatchOrAddOrderWithSequenceLua_whenNoMatch_shouldReturnAdded() {
+        doReturn(List.of("__ADDED__".getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+
+        RedisOrderBookService.MatchOrAddResult result =
+                service.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuyOrder());
+
+        assertThat(result.orderAdded()).isTrue();
+        assertThat(result.reservedMatch()).isNull();
+        verify(redisTemplate).execute(any(RedisCallback.class));
+    }
+
+    @Test
+    void reserveBestMatchOrAddOrderWithSequenceLua_whenMatched_shouldReturnReservedOrderAndMatchId() throws Exception {
+        OrderConfirmedEvent restingSell = OrderConfirmedEvent.builder()
+                .orderId(UUID.fromString("00000000-0000-0000-0000-000000000014"))
+                .userId(UUID.fromString("00000000-0000-0000-0000-000000000015"))
+                .marketId("TEST-MARKET")
+                .marketSequence(2L)
+                .price(100)
+                .amount(1)
+                .orderType("SELL")
+                .createdAt(LocalDateTime.of(2026, 7, 13, 12, 1))
+                .build();
+        doReturn(List.of(
+                "__MATCH__".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                objectMapper.writeValueAsString(restingSell).getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                "43".getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+
+        RedisOrderBookService.MatchOrAddResult result =
+                service.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuyOrder());
+
+        assertThat(result.orderAdded()).isFalse();
+        assertThat(result.reservedMatch().matchId()).isEqualTo(43L);
+        assertThat(result.reservedMatch().order().getOrderId()).isEqualTo(restingSell.getOrderId());
+        verify(redisTemplate).execute(any(RedisCallback.class));
+    }
+
+    @Test
     void releaseReservedOrder_whenReservationDoesNotExist_shouldFailWithoutResurrectingOrder() {
         doReturn(0L).when(redisTemplate).execute(any(RedisCallback.class));
 

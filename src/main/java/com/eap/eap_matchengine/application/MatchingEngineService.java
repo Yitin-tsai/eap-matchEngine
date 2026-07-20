@@ -65,23 +65,18 @@ public class MatchingEngineService {
       boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
 
       while (incomingOrder.getAmount() > 0) {
-        // Reserve the resting order before writing the durable trade fact. The order is removed
-        // from the visible orderbook but remains in a known Redis reservation state until commit.
-        RedisOrderBookService.ReservedMatch reservedMatch = reserveBestMatchOrder(incomingOrder);
+        // Reserve the resting order before writing the durable trade fact. If no match exists,
+        // Redis adds the incoming order in the same Lua call to avoid a second no-match round trip.
+        RedisOrderBookService.MatchOrAddResult matchAttempt = reserveBestMatchOrAddOrder(incomingOrder);
 
-        if (reservedMatch == null) {
-          // No matching order found, add remaining order to orderbook atomically
-          try {
-            addOrder(incomingOrder);
-            log.info("No matching order found, added to order book: orderId={}, amount={}",
-                incomingOrder.getOrderId(), incomingOrder.getAmount());
-          } catch (JsonProcessingException e) {
-            log.error("Failed to add order to orderbook", e);
-            throw new RuntimeException("Failed to add order to orderbook", e);
-          }
+        if (matchAttempt.orderAdded()) {
+          metrics.orderAdded();
+          log.info("No matching order found, added to order book: orderId={}, amount={}",
+              incomingOrder.getOrderId(), incomingOrder.getAmount());
           break;
         }
 
+        RedisOrderBookService.ReservedMatch reservedMatch = matchAttempt.reservedMatch();
         OrderConfirmedEvent matchOrder = reservedMatch.order();
         int incomingAmountBeforeMatch = incomingOrder.getAmount();
         int matchOrderAmountBeforeMatch = matchOrder.getAmount();
@@ -183,22 +178,12 @@ public class MatchingEngineService {
     }
   }
 
-  private RedisOrderBookService.ReservedMatch reserveBestMatchOrder(OrderConfirmedEvent incomingOrder) {
+  private RedisOrderBookService.MatchOrAddResult reserveBestMatchOrAddOrder(OrderConfirmedEvent incomingOrder) {
     Instant startedAt = Instant.now();
     try {
-      return orderBookService.reserveBestMatchOrderWithSequenceLua(incomingOrder);
+      return orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingOrder);
     } finally {
       metrics.recordReserve(Duration.between(startedAt, Instant.now()));
-    }
-  }
-
-  private void addOrder(OrderConfirmedEvent incomingOrder) throws JsonProcessingException {
-    Instant startedAt = Instant.now();
-    try {
-      orderBookService.addOrder(incomingOrder);
-      metrics.orderAdded();
-    } finally {
-      metrics.recordAddOrder(Duration.between(startedAt, Instant.now()));
     }
   }
 
