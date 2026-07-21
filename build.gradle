@@ -73,3 +73,10 @@ tasks.register('matchDbCeilingProbe', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.eap.eap_matchengine.loadtest.MatchDbCeilingProbe'
 }
+
+tasks.register('outboxRelayCeilingProbe', JavaExec) {
+    group = 'verification'
+    description = 'Measure isolated Match/Order/Wallet outbox relay select, RabbitMQ confirm, and mark-SENT ceiling.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_matchengine.loadtest.OutboxRelayCeilingProbe'
+}
