@@ -3,6 +3,8 @@
 > 建立日期：2026-06-30  
 > 目的：定義 MatchEngine 媒合後的成交事實來源、Order / Wallet 如何在非同步架構下對齊成交結果，以及後續實作工項。
 
+> Current status: this design has been superseded by the `TradeExecuted -> OrderTradeApplied / WalletTradeSettled -> completion markers` runtime flow. The legacy `OrderMatchedEvent` runtime bus and matched queues were retired in TPS-80; references below describe the migration history, not the current architecture.
+
 ## 背景
 
 EAP 目前已完成：
@@ -463,7 +465,7 @@ Reconciliation
   - `routing_key`
   - `payload`
   - `status / attempt_count / retry metadata`
-- `MatchingEngineService` 在 Redis/Lua 撮合成功後，先透過 `TradeExecutionRecorder` 寫入 `trade_executions + trade_outbox`，再保留既有 `OrderMatchedEvent` publish。
+- `MatchingEngineService` 在 Redis/Lua 撮合成功後，先透過 `TradeExecutionRecorder` 寫入 `trade_executions + trade_outbox`。TPS-80 後不再 publish legacy `OrderMatchedEvent`。
 
 驗證：
 
@@ -479,7 +481,7 @@ DB schema check: match_engine.trade_executions / trade_outbox exist
 - MatchEngine `trade_outbox` relay 已在後續 Phase 3 補上。
 - Order 已在後續 Phase 4 補上 `TradeExecuted` consumer。
 - Wallet 尚未 consume `TradeExecuted`。
-- 舊 `OrderMatchedEvent` 流程仍保留，避免一次切斷現有業務流程。
+- 舊 `OrderMatchedEvent` 流程已在 TPS-80 退役；現行流程以 `TradeExecutedEvent` 為成交事實。
 
 ### 2026-06-30 Phase 3 / Phase 4 實作快照
 
@@ -505,7 +507,7 @@ Phase 4 已完成 Order 第一段落地：
   - 對 buyer order append `OrderMatchedV1`
   - 對 seller order append `OrderMatchedV1`
   - 寫入 `order_execution_links` 作為 tradeId 對齊與冪等紀錄
-- 舊 `OrderMatchedEvent` listener 仍保留，避免一次切斷既有 `match_history` / WebSocket / market data flow。
+- 舊 `OrderMatchedEvent` listener 已在 TPS-80 退役；`match_history` / WebSocket / market data 不再由 legacy matched bus 同步推進。
 
 驗證：
 
@@ -521,7 +523,7 @@ eap-order test: PASS
 - Order 已能 consume `TradeExecuted` 並對齊本地 Order Event Store。
 - Wallet 尚未 consume `TradeExecuted`，settlement ledger 還沒切換。
 - `OrderTradeApplied` outbox event 尚未實作；目前 Phase 4 只先落地本地 order state alignment。
-- 舊 `OrderMatchedEvent` 與新 `TradeExecutedEvent` 可能短期並行；兩者對 Order Event Store 使用相同 `legacyMatchId` discriminator，目標是讓重送或並行事件走 idempotent append，而不是重複推進訂單狀態。
+- 舊 `OrderMatchedEvent` 與新 `TradeExecutedEvent` 的短期並行期已結束；現行 Order 成交套用只支援 `TradeExecutedEvent`。
 
 ### Phase 1：設計落地與 schema 準備
 
@@ -532,7 +534,7 @@ eap-order test: PASS
 - [x] 在 MatchEngine 新增 `trade_outbox` schema。
 - [x] 定義 `tradeId` 產生規則。
 - [x] 定義 `marketId + sequence` unique constraint。
-- [ ] 文件化 `TradeExecuted` 與舊 `OrderMatchedEvent` 的關係。
+- [x] 文件化 `TradeExecuted` 與舊 `OrderMatchedEvent` 的關係：TPS-80 後 legacy event bus retired。
 
 驗收：
 
@@ -578,7 +580,7 @@ eap-order test: PASS
 - [x] 以 `tradeId` unique constraint 做冪等。
 - [x] 更新 buyer / seller filled quantity 與 order status。
 - [ ] 發布 `OrderTradeApplied` outbox event。
-- [ ] 評估是否逐步淘汰舊 `OrderMatchedEvent` consumer hot path。
+- [x] 淘汰舊 `OrderMatchedEvent` consumer hot path：TPS-80 completed。
 
 驗收：
 

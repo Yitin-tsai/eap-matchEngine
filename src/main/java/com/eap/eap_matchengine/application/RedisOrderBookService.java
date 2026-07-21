@@ -16,6 +16,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.ScanOptions;
@@ -23,10 +24,12 @@ import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StreamUtils;
 
 import jakarta.annotation.PostConstruct;
+import java.time.Duration;
 
 /**
  * Redis-based implementation of an order book service for managing buy and sell orders.
@@ -45,6 +48,8 @@ public class RedisOrderBookService {
     private static final String RESERVATION_KEY_PATTERN = "order:reservation:*";
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
+    private final MatchingEngineMetrics metrics;
+    private final boolean userOpenOrderIndexEnabled;
 
     // Lua scripts loaded from classpath
     private String addOrderLuaScript;
@@ -65,8 +70,27 @@ public class RedisOrderBookService {
     private String removeOrderLuaSha;
 
     public RedisOrderBookService(RedisTemplate<String, String> redisTemplate, ObjectMapper objectMapper) {
+        this(redisTemplate, objectMapper, null, true);
+    }
+
+    @Autowired
+    public RedisOrderBookService(
+            RedisTemplate<String, String> redisTemplate,
+            ObjectMapper objectMapper,
+            MatchingEngineMetrics metrics,
+            @Value("${eap.match-engine.orderbook.user-open-order-index-enabled:true}")
+            boolean userOpenOrderIndexEnabled) {
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
+        this.metrics = metrics;
+        this.userOpenOrderIndexEnabled = userOpenOrderIndexEnabled;
+    }
+
+    RedisOrderBookService(
+            RedisTemplate<String, String> redisTemplate,
+            ObjectMapper objectMapper,
+            MatchingEngineMetrics metrics) {
+        this(redisTemplate, objectMapper, metrics, true);
     }
 
     /**
@@ -158,7 +182,8 @@ public class RedisOrderBookService {
         List<String> args = List.of(
             event.getOrderId().toString(),
             String.valueOf(orderScore),
-            orderJson
+            orderJson,
+            userOpenOrderIndexEnabledArg()
         );
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -205,7 +230,7 @@ public class RedisOrderBookService {
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
 
         List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey);
-        List<String> args = List.of(event.getOrderId().toString());
+        List<String> args = List.of(event.getOrderId().toString(), userOpenOrderIndexEnabledArg());
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
             // Flatten keys and args into single byte[] varargs array
@@ -244,6 +269,9 @@ public class RedisOrderBookService {
      * remove_order.lua round trip on the trade hot path.
      */
     public void unlinkUserOrder(OrderConfirmedEvent event) {
+        if (!userOpenOrderIndexEnabled) {
+            return;
+        }
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
         Long removed = redisTemplate.opsForSet().remove(userOrdersKey, event.getOrderId().toString());
         if (removed != null && removed > 0) {
@@ -432,7 +460,8 @@ public class RedisOrderBookService {
                 String.valueOf(Instant.now().toEpochMilli()),
                 incomingOrder.getOrderId().toString(),
                 String.valueOf(scoreFor(incomingOrder)),
-                incomingOrderJson);
+                incomingOrderJson,
+                userOpenOrderIndexEnabledArg());
 
         @SuppressWarnings("unchecked")
         List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
@@ -521,7 +550,8 @@ public class RedisOrderBookService {
         List<String> args = List.of(
                 event.getOrderId().toString(),
                 String.valueOf(orderScore),
-                orderJson
+                orderJson,
+                userOpenOrderIndexEnabledArg()
         );
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -554,12 +584,14 @@ public class RedisOrderBookService {
      * Completes a reserved order after its corresponding TradeExecuted fact is durable.
      */
     public void completeReservedOrder(OrderConfirmedEvent event) {
+        Instant prepareStartedAt = Instant.now();
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
         String reservationKey = reservationKey(event);
 
         List<String> keys = List.of(orderIdKey, userOrdersKey, reservationKey);
-        List<String> args = List.of(event.getOrderId().toString());
+        List<String> args = List.of(event.getOrderId().toString(), userOpenOrderIndexEnabledArg());
+        recordCompleteReservationPrepare(Duration.between(prepareStartedAt, Instant.now()));
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
             byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
@@ -568,22 +600,48 @@ public class RedisOrderBookService {
             System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
             System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
 
-            Object res = evalLoadedScript(
-                    connection,
-                    completeReservedOrderLuaSha,
-                    completeReservedOrderLuaScript,
-                    ReturnType.INTEGER,
-                    keys.size(),
-                    allParams
-            );
+            Instant redisEvalStartedAt = Instant.now();
+            Object res;
+            try {
+                res = evalLoadedScript(
+                        connection,
+                        completeReservedOrderLuaSha,
+                        completeReservedOrderLuaScript,
+                        ReturnType.INTEGER,
+                        keys.size(),
+                        allParams
+                );
+            } finally {
+                recordCompleteReservationRedisEval(Duration.between(redisEvalStartedAt, Instant.now()));
+            }
             return res != null ? (Long) res : 0L;
         });
 
+        Instant resultStartedAt = Instant.now();
         if (result != null && result == 1L) {
             log.debug("Successfully completed reserved order {}", event.getOrderId());
         } else {
             log.warn("Reserved order {} had no matching Redis reservation to complete, result={}",
                     event.getOrderId(), result);
+        }
+        recordCompleteReservationResult(Duration.between(resultStartedAt, Instant.now()));
+    }
+
+    private void recordCompleteReservationPrepare(Duration duration) {
+        if (metrics != null) {
+            metrics.recordCompleteReservationPrepare(duration);
+        }
+    }
+
+    private void recordCompleteReservationRedisEval(Duration duration) {
+        if (metrics != null) {
+            metrics.recordCompleteReservationRedisEval(duration);
+        }
+    }
+
+    private void recordCompleteReservationResult(Duration duration) {
+        if (metrics != null) {
+            metrics.recordCompleteReservationResult(duration);
         }
     }
 
@@ -684,7 +742,7 @@ public class RedisOrderBookService {
             String userOrdersKey = "user:" + order.getUserId() + ":orders";
 
             List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey);
-            List<String> args = List.of(event.getOrderId().toString());
+            List<String> args = List.of(event.getOrderId().toString(), userOpenOrderIndexEnabledArg());
 
             Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
                 // Flatten keys and args into single byte[] varargs array
@@ -725,6 +783,9 @@ public class RedisOrderBookService {
      * @return List of orders for the user
      */
     public List<OrderConfirmedEvent> getOrderByUserId(UUID userId) {
+        if (!userOpenOrderIndexEnabled) {
+            return List.of();
+        }
         String userOrdersKey = "user:" + userId + ":orders";
         Set<String> orderIds = redisTemplate.opsForSet().members(userOrdersKey);
         if (orderIds == null || orderIds.isEmpty()) {
@@ -802,6 +863,10 @@ public class RedisOrderBookService {
 
     private String reservationKey(OrderConfirmedEvent event) {
         return "order:reservation:" + event.getOrderId();
+    }
+
+    private String userOpenOrderIndexEnabledArg() {
+        return userOpenOrderIndexEnabled ? "1" : "0";
     }
 
     private String marketId(OrderConfirmedEvent event) {

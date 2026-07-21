@@ -22,7 +22,8 @@ import static com.eap.common.constants.RabbitMQConstants.*;
  * - auction.bid.confirmed events (wallet-confirmed auction bids for Redis collection)
  *
  * This module publishes:
- * - order.matched events (match results)
+ * - TradeExecuted events through the transactional trade outbox
+ * - completion markers are consumed from trade.exchange
  * - auction.created events (new auction opened)
  * - auction.cleared events (auction clearing results)
  *

@@ -3,9 +3,13 @@ package com.eap.eap_matchengine.application;
 import com.eap.common.event.OrderConfirmedEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.springframework.data.redis.connection.RedisConnection;
+import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
@@ -13,9 +17,13 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 @SuppressWarnings({"unchecked", "rawtypes"})
 class RedisOrderBookServiceTest {
@@ -93,6 +101,29 @@ class RedisOrderBookServiceTest {
     }
 
     @Test
+    void reserveBestMatchOrAddOrderWithSequenceLua_whenUserIndexDisabled_shouldPassDisabledFlagToLua() {
+        RedisConnection connection = mock(RedisConnection.class);
+        RedisOrderBookService serviceWithoutUserIndex =
+                new RedisOrderBookService(redisTemplate, objectMapper, null, false);
+        doAnswer(invocation -> {
+            Object[] arguments = invocation.getArguments();
+            byte[] lastArgument = (byte[]) arguments[arguments.length - 1];
+            assertThat(new String(lastArgument, StandardCharsets.UTF_8)).isEqualTo("0");
+            return List.of("__ADDED__".getBytes(StandardCharsets.UTF_8));
+        }).when(connection).evalSha(nullable(String.class), eq(ReturnType.MULTI), eq(5), any(byte[][].class));
+        doAnswer(invocation -> {
+            RedisCallback<?> callback = invocation.getArgument(0);
+            return callback.doInRedis(connection);
+        }).when(redisTemplate).execute(any(RedisCallback.class));
+
+        RedisOrderBookService.MatchOrAddResult result =
+                serviceWithoutUserIndex.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuyOrder());
+
+        assertThat(result.orderAdded()).isTrue();
+        verify(redisTemplate).execute(any(RedisCallback.class));
+    }
+
+    @Test
     void reserveBestMatchOrAddOrderWithSequenceLua_whenMatched_shouldReturnReservedOrderAndMatchId() throws Exception {
         OrderConfirmedEvent restingSell = OrderConfirmedEvent.builder()
                 .orderId(UUID.fromString("00000000-0000-0000-0000-000000000014"))
@@ -128,6 +159,28 @@ class RedisOrderBookServiceTest {
                 .hasMessageContaining("Failed to release reserved order");
 
         verify(redisTemplate).execute(any(RedisCallback.class));
+    }
+
+    @Test
+    void completeReservedOrder_whenMetricsProvided_shouldRecordPreparationAndResultPhases() {
+        MatchingEngineMetrics metrics = mock(MatchingEngineMetrics.class);
+        RedisOrderBookService serviceWithMetrics = new RedisOrderBookService(redisTemplate, objectMapper, metrics);
+        doReturn(1L).when(redisTemplate).execute(any(RedisCallback.class));
+
+        serviceWithMetrics.completeReservedOrder(incomingBuyOrder());
+
+        verify(metrics).recordCompleteReservationPrepare(any(Duration.class));
+        verify(metrics).recordCompleteReservationResult(any(Duration.class));
+    }
+
+    @Test
+    void getOrderByUserId_whenUserIndexDisabled_shouldNotReadRedisIndex() {
+        RedisOrderBookService serviceWithoutUserIndex =
+                new RedisOrderBookService(redisTemplate, objectMapper, null, false);
+
+        assertThat(serviceWithoutUserIndex.getOrderByUserId(UUID.randomUUID())).isEmpty();
+
+        verifyNoInteractions(redisTemplate);
     }
 
     private OrderConfirmedEvent incomingBuyOrder() {

@@ -7,6 +7,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_TRADE_APPLIED_QUEUE;
@@ -18,6 +20,7 @@ import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_WALLET_TRA
 public class TradeCompletionListener {
 
     private final TradeCompletionService tradeCompletionService;
+    private final TradeCompletionMarkerMetrics markerMetrics;
 
     @RabbitListener(
             queues = MATCH_ENGINE_ORDER_TRADE_APPLIED_QUEUE,
@@ -27,8 +30,13 @@ public class TradeCompletionListener {
         if (events == null || events.isEmpty()) {
             return;
         }
-        tradeCompletionService.markOrderAppliedBatch(events);
-        log.debug("Order trade applied marker batch consumed: size={}", events.size());
+        Instant startedAt = Instant.now();
+        try {
+            tradeCompletionService.markOrderAppliedBatch(events);
+            log.debug("Order trade applied marker batch consumed: size={}", events.size());
+        } finally {
+            markerMetrics.recordListener("ORDER_APPLIED", Duration.between(startedAt, Instant.now()));
+        }
     }
 
     @RabbitListener(
@@ -39,7 +47,12 @@ public class TradeCompletionListener {
         if (events == null || events.isEmpty()) {
             return;
         }
-        tradeCompletionService.markWalletSettledBatch(events);
-        log.debug("Wallet trade settled marker batch consumed: size={}", events.size());
+        Instant startedAt = Instant.now();
+        try {
+            tradeCompletionService.markWalletSettledBatch(events);
+            log.debug("Wallet trade settled marker batch consumed: size={}", events.size());
+        } finally {
+            markerMetrics.recordListener("WALLET_SETTLED", Duration.between(startedAt, Instant.now()));
+        }
     }
 }

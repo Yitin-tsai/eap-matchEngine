@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -22,8 +23,10 @@ class JpaTradeExecutionRecorderTest {
 
     private final JdbcTemplate jdbcTemplate = mock(JdbcTemplate.class);
     private final TradeCompletionService tradeCompletionService = mock(TradeCompletionService.class);
+    private final MatchingEngineMetrics metrics = mock(MatchingEngineMetrics.class);
     private final JpaTradeExecutionRecorder recorder =
-            new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService, new ObjectMapper().findAndRegisterModules());
+            new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService,
+                    new ObjectMapper().findAndRegisterModules(), metrics);
 
     @Test
     void record_shouldInsertTradeAndOutboxInOneStatementWithoutPreselect() {
@@ -35,6 +38,12 @@ class JpaTradeExecutionRecorderTest {
 
         verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class));
         verify(tradeCompletionService).markTradeExecuted(event);
+        verify(metrics).recordTradeRecordSerialize(any(Duration.class));
+        verify(metrics).recordTradeRecordInsert(any(Duration.class));
+        verify(metrics).recordTradeRecordCompletionMark(any(Duration.class));
+        verify(metrics).recordTradeRecordTransactionBody(any(Duration.class));
+        verify(metrics).recordTradeRecordTransactionTotal(any(Duration.class));
+        verify(metrics).recordTradeRecordCommitGap(any(Duration.class));
         verifyNoMoreInteractions(tradeCompletionService);
     }
 
@@ -51,6 +60,12 @@ class JpaTradeExecutionRecorderTest {
 
         verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class));
         verify(tradeCompletionService, never()).markTradeExecuted(any());
+        verify(metrics).recordTradeRecordSerialize(any(Duration.class));
+        verify(metrics).recordTradeRecordInsert(any(Duration.class));
+        verify(metrics, never()).recordTradeRecordCompletionMark(any(Duration.class));
+        verify(metrics).recordTradeRecordTransactionBody(any(Duration.class));
+        verify(metrics).recordTradeRecordTransactionTotal(any(Duration.class));
+        verify(metrics).recordTradeRecordCommitGap(any(Duration.class));
     }
 
     @Test

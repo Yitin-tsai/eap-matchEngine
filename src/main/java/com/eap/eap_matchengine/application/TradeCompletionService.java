@@ -263,10 +263,9 @@ public class TradeCompletionService {
                 SET status = 'PENDING',
                     attempt_count = 0,
                     next_retry_at = CURRENT_TIMESTAMP,
-                    last_error = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE event_type = 'TradeExecutedEvent'
-                  AND aggregate_id = ?
+                    last_error = NULL
+                WHERE aggregate_id = ?
+                  AND event_type = 'TradeExecutedEvent'
                   AND status <> 'PENDING'
                 """, delayed.tradeId());
         return requeued > 0;

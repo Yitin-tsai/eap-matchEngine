@@ -13,6 +13,7 @@
 -- ARGV[3]: incoming order ID
 -- ARGV[4]: incoming order composite score
 -- ARGV[5]: incoming order JSON
+-- ARGV[6]: maintain user open-order index flag ("1" or "0")
 --
 -- Returns:
 --   {'__MATCH__', resting order JSON, match ID}
@@ -31,13 +32,16 @@ local reserved_at = tonumber(ARGV[2])
 local incoming_order_id = ARGV[3]
 local incoming_score = tonumber(ARGV[4])
 local incoming_order_json = ARGV[5]
+local user_order_index_enabled = ARGV[6] ~= '0'
 
 local orders = redis.call('ZREVRANGEBYSCORE', buy_orderbook_key, '+inf', min_score, 'LIMIT', 0, 1)
 
 if #orders == 0 then
     redis.call('ZADD', sell_orderbook_key, incoming_score, incoming_order_id)
     redis.call('SET', incoming_order_id_key, incoming_order_json)
-    redis.call('SADD', incoming_user_orders_key, incoming_order_id)
+    if user_order_index_enabled then
+        redis.call('SADD', incoming_user_orders_key, incoming_order_id)
+    end
     return {'__ADDED__'}
 end
 

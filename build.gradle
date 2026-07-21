@@ -66,10 +66,3 @@ tasks.register('matchEngineCoreLoadTest', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.eap.eap_matchengine.loadtest.MatchEngineCoreLoadGenerator'
 }
-
-tasks.register('matchEngineAmqpLoadTest', JavaExec) {
-    group = 'verification'
-    description = 'Publish OrderConfirmedEvent through RabbitMQ and capture OrderMatchedEvent output.'
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.eap.eap_matchengine.loadtest.MatchEngineAmqpLoadGenerator'
-}

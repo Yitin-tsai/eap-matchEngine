@@ -3,11 +3,11 @@ package com.eap.eap_matchengine.loadtest;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import com.eap.common.event.OrderConfirmedEvent;
-import com.eap.common.event.OrderMatchedEvent;
+import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_matchengine.application.MatchingEngineMetrics;
 import com.eap.eap_matchengine.application.MatchingEngineService;
-import com.eap.eap_matchengine.application.NoopTradeExecutionRecorder;
 import com.eap.eap_matchengine.application.RedisOrderBookService;
+import com.eap.eap_matchengine.application.TradeExecutionRecorder;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import java.time.LocalDateTime;
@@ -24,20 +24,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ConcurrentHashMap;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-import org.mockito.Mockito;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
 import org.redisson.config.Config;
 import org.slf4j.LoggerFactory;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
-import org.springframework.test.util.ReflectionTestUtils;
-
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doAnswer;
 
 public class MatchEngineCoreLoadGenerator {
 
@@ -67,29 +60,19 @@ public class MatchEngineCoreLoadGenerator {
                 .setAddress("redis://" + config.redisHost() + ":" + config.redisPort());
         RedissonClient redissonClient = Redisson.create(redissonConfig);
 
-        List<OrderMatchedEvent> publishedEvents = Collections.synchronizedList(new ArrayList<>());
-        RabbitTemplate rabbitTemplate = Mockito.mock(RabbitTemplate.class);
-        doAnswer(invocation -> {
-            Object payload = invocation.getArgument(2);
-            if (payload instanceof OrderMatchedEvent matchedEvent) {
-                publishedEvents.add(matchedEvent);
-            }
-            return null;
-        }).when(rabbitTemplate).convertAndSend(anyString(), anyString(), any(Object.class));
+        List<TradeExecutedEvent> recordedTrades = Collections.synchronizedList(new ArrayList<>());
 
         RedisOrderBookService orderBookService = new RedisOrderBookService(redisTemplate, objectMapper);
         orderBookService.init();
         MatchingEngineService matchingEngineService = new MatchingEngineService(
                 orderBookService,
-                rabbitTemplate,
                 redissonClient,
-                new NoopTradeExecutionRecorder(),
+                new CapturingTradeExecutionRecorder(recordedTrades),
                 new MatchingEngineMetrics(new SimpleMeterRegistry()));
-        ReflectionTestUtils.setField(matchingEngineService, "legacyOrderMatchedPublishEnabled", true);
 
         try {
-            runCorrectnessChecks(matchingEngineService, orderBookService, redisTemplate, publishedEvents);
-            runBenchmark(config, matchingEngineService, redisTemplate, publishedEvents);
+            runCorrectnessChecks(matchingEngineService, orderBookService, redisTemplate, recordedTrades);
+            runBenchmark(config, matchingEngineService, redisTemplate, recordedTrades);
         } finally {
             cleanupGeneratedKeys(redisTemplate);
             redissonClient.shutdown();
@@ -113,21 +96,21 @@ public class MatchEngineCoreLoadGenerator {
             MatchingEngineService service,
             RedisOrderBookService orderBookService,
             RedisTemplate<String, String> redisTemplate,
-            List<OrderMatchedEvent> publishedEvents) {
-        verifyPricePriority(service, redisTemplate, publishedEvents);
-        verifyTimePriority(service, redisTemplate, publishedEvents);
-        verifyPartialFill(service, orderBookService, redisTemplate, publishedEvents);
-        verifyNoCrossingOrdersRemainOpen(service, orderBookService, redisTemplate, publishedEvents);
+            List<TradeExecutedEvent> recordedTrades) {
+        verifyPricePriority(service, redisTemplate, recordedTrades);
+        verifyTimePriority(service, redisTemplate, recordedTrades);
+        verifyPartialFill(service, orderBookService, redisTemplate, recordedTrades);
+        verifyNoCrossingOrdersRemainOpen(service, orderBookService, redisTemplate, recordedTrades);
         System.out.println("correctness: PASS");
     }
 
     private static void verifyPricePriority(
             MatchingEngineService service,
             RedisTemplate<String, String> redisTemplate,
-            List<OrderMatchedEvent> publishedEvents) {
+            List<TradeExecutedEvent> recordedTrades) {
         String marketId = uniqueMarket("PRICE");
         cleanMarket(redisTemplate, marketId);
-        publishedEvents.clear();
+        recordedTrades.clear();
 
         OrderConfirmedEvent firstSell = order(marketId, "SELL", 100, 1, 1);
         OrderConfirmedEvent secondSell = order(marketId, "SELL", 99, 1, 2);
@@ -136,10 +119,10 @@ public class MatchEngineCoreLoadGenerator {
         service.tryMatch(secondSell);
         service.tryMatch(buy);
 
-        require(publishedEvents.size() == 2, "price priority should produce 2 matches");
-        require(publishedEvents.get(0).getDealPrice() == 99, "lowest sell price should match first");
-        require(publishedEvents.get(1).getDealPrice() == 100, "higher sell price should match second");
-        require(totalMatchedAmount(publishedEvents) == 2, "price priority matched amount should conserve quantity");
+        require(recordedTrades.size() == 2, "price priority should produce 2 trades");
+        require(recordedTrades.get(0).getDealPrice() == 99, "lowest sell price should match first");
+        require(recordedTrades.get(1).getDealPrice() == 100, "higher sell price should match second");
+        require(totalMatchedAmount(recordedTrades) == 2, "price priority matched amount should conserve quantity");
         require(userOrderSetSize(redisTemplate, firstSell) == 0, "fully matched first sell should leave no user order reference");
         require(userOrderSetSize(redisTemplate, secondSell) == 0, "fully matched second sell should leave no user order reference");
         require(userOrderSetSize(redisTemplate, buy) == 0, "fully matched incoming buy should leave no user order reference");
@@ -148,35 +131,35 @@ public class MatchEngineCoreLoadGenerator {
     private static void verifyTimePriority(
             MatchingEngineService service,
             RedisTemplate<String, String> redisTemplate,
-            List<OrderMatchedEvent> publishedEvents) {
+            List<TradeExecutedEvent> recordedTrades) {
         String marketId = uniqueMarket("TIME");
         cleanMarket(redisTemplate, marketId);
-        publishedEvents.clear();
+        recordedTrades.clear();
 
         service.tryMatch(order(marketId, "SELL", 100, 1, 1));
         service.tryMatch(order(marketId, "SELL", 100, 1, 2));
         service.tryMatch(order(marketId, "BUY", 100, 2, 3));
 
-        require(publishedEvents.size() == 2, "time priority should produce 2 matches");
-        require(publishedEvents.get(0).getSellerMarketSequence() == 1L, "earlier sell sequence should match first");
-        require(publishedEvents.get(1).getSellerMarketSequence() == 2L, "later sell sequence should match second");
+        require(recordedTrades.size() == 2, "time priority should produce 2 trades");
+        require(recordedTrades.get(0).getSellerMarketSequence() == 1L, "earlier sell sequence should match first");
+        require(recordedTrades.get(1).getSellerMarketSequence() == 2L, "later sell sequence should match second");
     }
 
     private static void verifyPartialFill(
             MatchingEngineService service,
             RedisOrderBookService orderBookService,
             RedisTemplate<String, String> redisTemplate,
-            List<OrderMatchedEvent> publishedEvents) {
+            List<TradeExecutedEvent> recordedTrades) {
         String marketId = uniqueMarket("PARTIAL");
         cleanMarket(redisTemplate, marketId);
-        publishedEvents.clear();
+        recordedTrades.clear();
 
         OrderConfirmedEvent sell = order(marketId, "SELL", 100, 5, 1);
         service.tryMatch(sell);
         service.tryMatch(order(marketId, "BUY", 100, 2, 2));
 
-        require(publishedEvents.size() == 1, "partial fill should produce 1 match");
-        require(publishedEvents.get(0).getAmount() == 2, "partial fill should match incoming buy amount");
+        require(recordedTrades.size() == 1, "partial fill should produce 1 trade");
+        require(recordedTrades.get(0).getQuantity() == 2, "partial fill should match incoming buy amount");
 
         List<OrderConfirmedEvent> sellerOrders = orderBookService.getOrderByUserId(sell.getUserId());
         require(sellerOrders.size() == 1, "partial resting order should remain in seller open orders");
@@ -188,17 +171,17 @@ public class MatchEngineCoreLoadGenerator {
             MatchingEngineService service,
             RedisOrderBookService orderBookService,
             RedisTemplate<String, String> redisTemplate,
-            List<OrderMatchedEvent> publishedEvents) {
+            List<TradeExecutedEvent> recordedTrades) {
         String marketId = uniqueMarket("NO_CROSS");
         cleanMarket(redisTemplate, marketId);
-        publishedEvents.clear();
+        recordedTrades.clear();
 
         OrderConfirmedEvent sell = order(marketId, "SELL", 110, 1, 1);
         OrderConfirmedEvent buy = order(marketId, "BUY", 100, 1, 2);
         service.tryMatch(sell);
         service.tryMatch(buy);
 
-        require(publishedEvents.isEmpty(), "non-crossing orders should not match");
+        require(recordedTrades.isEmpty(), "non-crossing orders should not match");
         require(orderBookService.getOrderByUserId(sell.getUserId()).size() == 1, "non-crossing sell should remain open");
         require(orderBookService.getOrderByUserId(buy.getUserId()).size() == 1, "non-crossing buy should remain open");
     }
@@ -207,10 +190,10 @@ public class MatchEngineCoreLoadGenerator {
             LoadConfig config,
             MatchingEngineService service,
             RedisTemplate<String, String> redisTemplate,
-            List<OrderMatchedEvent> publishedEvents) throws InterruptedException {
+            List<TradeExecutedEvent> recordedTrades) throws InterruptedException {
         String marketId = uniqueMarket("BENCH");
         cleanMarket(redisTemplate, marketId);
-        publishedEvents.clear();
+        recordedTrades.clear();
 
         int restingSellOrders = config.events();
         System.out.printf(
@@ -220,7 +203,7 @@ public class MatchEngineCoreLoadGenerator {
         for (int i = 0; i < restingSellOrders; i++) {
             service.tryMatch(order(marketId, "SELL", 100, 1, i + 1L));
         }
-        publishedEvents.clear();
+        recordedTrades.clear();
 
         ExecutorService executor = Executors.newFixedThreadPool(config.workers());
         CountDownLatch done = new CountDownLatch(config.events());
@@ -257,8 +240,8 @@ public class MatchEngineCoreLoadGenerator {
         List<Long> sortedLatencies = new ArrayList<>(latenciesNanos);
         Collections.sort(sortedLatencies);
 
-        int matchedEvents = publishedEvents.size();
-        int matchedAmount = totalMatchedAmount(publishedEvents);
+        int matchedEvents = recordedTrades.size();
+        int matchedAmount = totalMatchedAmount(recordedTrades);
         long remainingSellOrders = zsetSize(redisTemplate, "orderbook:" + marketId + ":sell");
         long remainingBuyOrders = zsetSize(redisTemplate, "orderbook:" + marketId + ":buy");
 
@@ -329,9 +312,9 @@ public class MatchEngineCoreLoadGenerator {
         return size == null ? 0L : size;
     }
 
-    private static int totalMatchedAmount(List<OrderMatchedEvent> events) {
+    private static int totalMatchedAmount(List<TradeExecutedEvent> events) {
         return events.stream()
-                .map(OrderMatchedEvent::getAmount)
+                .map(TradeExecutedEvent::getQuantity)
                 .filter(amount -> amount != null)
                 .mapToInt(Integer::intValue)
                 .sum();
@@ -376,6 +359,20 @@ public class MatchEngineCoreLoadGenerator {
                 }
             }
             return defaultValue;
+        }
+    }
+
+    private static final class CapturingTradeExecutionRecorder implements TradeExecutionRecorder {
+
+        private final List<TradeExecutedEvent> events;
+
+        private CapturingTradeExecutionRecorder(List<TradeExecutedEvent> events) {
+            this.events = events;
+        }
+
+        @Override
+        public void record(TradeExecutedEvent event) {
+            events.add(event);
         }
     }
 }

@@ -231,4 +231,15 @@
                 DROP COLUMN IF EXISTS id;
         </sql>
     </changeSet>
+
+    <changeSet id="match-trade-012" author="eap">
+        <comment>Drop unused trade execution uniqueness constraints that are not part of runtime idempotency</comment>
+        <sql>
+            ALTER TABLE match_engine.trade_executions
+                DROP CONSTRAINT IF EXISTS uk_trade_executions_legacy_match_id;
+            ALTER TABLE match_engine.trade_executions
+                DROP CONSTRAINT IF EXISTS uk_trade_executions_market_sequence;
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

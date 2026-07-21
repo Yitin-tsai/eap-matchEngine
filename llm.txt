@@ -45,26 +45,29 @@ Pricing: Maker Price — dealPrice = resting order's price (passive side determi
 tryMatch(incomingOrder) — while loop:
   1. Lua script 原子取出最佳對手方訂單（ZREM + GET + DEL from ZSet/String）
   2. matchQty = Math.min(incoming.amount, match.amount)
-  3. 產生 matchId（Redis INCR）→ 冪等檢查（SETNX match:processed:{matchId}）
-  4. publish OrderMatchedEvent → order.matched（fan-out to order + wallet）
-  5. 對手方剩餘數量 > 0（partial fill of resting order）：
+  3. 產生 matchId / sequence（Redis INCR）
+  4. persist TradeExecuted + trade_outbox in PostgreSQL
+  5. TradeOutboxRelay publishes TradeExecutedEvent → trade.exchange / trade.executed
+  6. 對手方剩餘數量 > 0（partial fill of resting order）：
      → Redisson lock (lock:order:{orderId}, tryLock 5s, autoRelease 10s)
      → addOrder() 重新加回訂單簿（ZSet + String + user Set）
      → ⚠️ 風險：lock 取得失敗時，剩餘數量會從訂單簿遺失（無補償機制）
-  6. 對手方完全成交：removeOrder() 清理 user:{userId}:orders
-  7. incoming 仍有剩餘 → 繼續 loop 尋找下一個對手方
-  8. loop 結束後，incoming 仍有剩餘 → addOrder() 加入訂單簿等待
+  7. 對手方完全成交：removeOrder() 清理 user:{userId}:orders
+  8. incoming 仍有剩餘 → 繼續 loop 尋找下一個對手方
+  9. loop 結束後，incoming 仍有剩餘 → addOrder() 加入訂單簿等待
 ```
 
-**重點**：matchEngine **不消費** order.matched 事件。訂單簿清理在 tryMatch() 內同步完成，不是透過獨立的 RabbitMQ listener。order.matched 只 fan-out 到 eap-order 和 eap-wallet。
+**重點**：legacy `order.matched` bus 已退役。Order / Wallet 都消費 `TradeExecutedEvent`，再各自發布 `OrderTradeAppliedEvent` / `WalletTradeSettledEvent` completion markers。
 
 ## RabbitMQ Listeners
 
 | Queue | Listener Class | Handles |
 |-------|---------------|---------|
-| matchEngine.orderConfirmed.queue | OrderConfirmedListener | Try match → publish OrderMatchedEvent or add to order book |
+| matchEngine.orderConfirmed.queue | OrderConfirmedListener | Try match → persist TradeExecuted or add to order book |
+| matchEngine.orderTradeApplied.queue | TradeCompletionListener | Record ORDER_APPLIED marker |
+| matchEngine.walletTradeSettled.queue | TradeCompletionListener | Record WALLET_SETTLED marker |
 
-Note: matchEngine 只有這一個 listener。它是 order.matched 的 **publisher**，不是 consumer。
+Note: MatchEngine publishes `TradeExecutedEvent` through `trade_outbox`; it no longer publishes `OrderMatchedEvent`.
 
 ## Key Files
 

@@ -6,8 +6,6 @@ import java.time.LocalDateTime;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.redisson.api.RedissonClient;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -22,20 +20,17 @@ import static org.mockito.Mockito.when;
 class MatchingEngineServiceTest {
 
     private final RedisOrderBookService orderBookService = mock(RedisOrderBookService.class);
-    private final RabbitTemplate rabbitTemplate = mock(RabbitTemplate.class);
     private final RedissonClient redissonClient = mock(RedissonClient.class);
     private final TradeExecutionRecorder tradeExecutionRecorder = mock(TradeExecutionRecorder.class);
     private final MatchingEngineMetrics matchingEngineMetrics = mock(MatchingEngineMetrics.class);
     private final MatchingEngineService service = new MatchingEngineService(
             orderBookService,
-            rabbitTemplate,
             redissonClient,
             tradeExecutionRecorder,
             matchingEngineMetrics);
 
     @Test
     void tryMatch_whenTradePersistenceSucceeds_shouldCompleteReservedRestingOrder() throws Exception {
-        ReflectionTestUtils.setField(service, "legacyOrderMatchedPublishEnabled", false);
         OrderConfirmedEvent incomingBuy = order(
                 "BUY",
                 "00000000-0000-0000-0000-000000000021",
@@ -62,14 +57,12 @@ class MatchingEngineServiceTest {
                         && trade.getQuantity() == 1));
         verify(orderBookService).completeReservedOrder(restingSell);
         verify(orderBookService, never()).releaseReservedOrder(any());
-        verify(rabbitTemplate, never()).convertAndSend(any(String.class), any(String.class), any(Object.class));
         assertThat(incomingBuy.getAmount()).isZero();
         assertThat(restingSell.getAmount()).isZero();
     }
 
     @Test
     void tryMatch_whenTradePersistenceFailsAfterReservation_shouldReleaseRestingOrder() throws Exception {
-        ReflectionTestUtils.setField(service, "legacyOrderMatchedPublishEnabled", false);
         OrderConfirmedEvent incomingBuy = order(
                 "BUY",
                 "00000000-0000-0000-0000-000000000001",
@@ -98,14 +91,12 @@ class MatchingEngineServiceTest {
                         && order.getAmount() == 1
                         && order.getOrderType().equals("SELL")));
         verify(orderBookService, never()).completeReservedOrder(any());
-        verify(rabbitTemplate, never()).convertAndSend(any(String.class), any(String.class), any(Object.class));
         assertThat(incomingBuy.getAmount()).isEqualTo(1);
         assertThat(restingSell.getAmount()).isEqualTo(1);
     }
 
     @Test
     void tryMatch_whenCombinedReservationFails_shouldNotRecordTrade() throws Exception {
-        ReflectionTestUtils.setField(service, "legacyOrderMatchedPublishEnabled", false);
         OrderConfirmedEvent incomingBuy = order(
                 "BUY",
                 "00000000-0000-0000-0000-000000000011",
@@ -128,7 +119,6 @@ class MatchingEngineServiceTest {
 
     @Test
     void tryMatch_whenNoMatch_shouldKeepOrderInRedisWithoutSecondAddCall() throws Exception {
-        ReflectionTestUtils.setField(service, "legacyOrderMatchedPublishEnabled", false);
         OrderConfirmedEvent incomingSell = order(
                 "SELL",
                 "00000000-0000-0000-0000-000000000031",

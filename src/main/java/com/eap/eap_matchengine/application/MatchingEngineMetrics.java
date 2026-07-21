@@ -15,9 +15,17 @@ public class MatchingEngineMetrics {
     private final Timer addOrderDuration;
     private final Timer matchIdDuration;
     private final Timer tradeRecordDuration;
+    private final Timer tradeRecordSerializeDuration;
+    private final Timer tradeRecordInsertDuration;
+    private final Timer tradeRecordCompletionMarkDuration;
+    private final Timer tradeRecordTransactionBodyDuration;
+    private final Timer tradeRecordTransactionTotalDuration;
+    private final Timer tradeRecordCommitGapDuration;
     private final Timer completeReservationDuration;
+    private final Timer completeReservationPrepareDuration;
+    private final Timer completeReservationRedisEvalDuration;
+    private final Timer completeReservationResultDuration;
     private final Timer releaseReservationDuration;
-    private final Timer legacyPublishDuration;
     private final Counter tradeRecordedTotal;
     private final Counter orderAddedTotal;
     private final Counter reservationCompletedTotal;
@@ -34,12 +42,28 @@ public class MatchingEngineMetrics {
                 "Time spent generating the distributed match id");
         this.tradeRecordDuration = timer(registry, "match_engine_trade_record_duration",
                 "Time spent persisting TradeExecuted and its outbox record");
+        this.tradeRecordSerializeDuration = tradeRecordPhaseTimer(registry, "serialize",
+                "Time spent serializing TradeExecuted payload before persistence");
+        this.tradeRecordInsertDuration = tradeRecordPhaseTimer(registry, "insert_trade_outbox",
+                "Time spent inserting TradeExecuted fact and outbox row");
+        this.tradeRecordCompletionMarkDuration = tradeRecordPhaseTimer(registry, "mark_trade_executed",
+                "Time spent marking local TradeExecuted completion state");
+        this.tradeRecordTransactionBodyDuration = tradeRecordPhaseTimer(registry, "transaction_body",
+                "Time spent inside the TradeExecuted transactional method before commit");
+        this.tradeRecordTransactionTotalDuration = tradeRecordPhaseTimer(registry, "transaction_total",
+                "Time spent from entering the TradeExecuted transaction method until transaction completion");
+        this.tradeRecordCommitGapDuration = tradeRecordPhaseTimer(registry, "commit_gap",
+                "Time between TradeExecuted transaction method body completion and transaction completion callback");
         this.completeReservationDuration = timer(registry, "match_engine_complete_reservation_duration",
                 "Time spent completing a reserved resting order in Redis");
+        this.completeReservationPrepareDuration = completeReservationPhaseTimer(registry, "prepare",
+                "Time spent preparing Redis complete-reservation keys and arguments");
+        this.completeReservationRedisEvalDuration = completeReservationPhaseTimer(registry, "redis_eval",
+                "Time spent executing the complete-reservation Redis Lua script");
+        this.completeReservationResultDuration = completeReservationPhaseTimer(registry, "result",
+                "Time spent handling the complete-reservation Redis Lua result");
         this.releaseReservationDuration = timer(registry, "match_engine_release_reservation_duration",
                 "Time spent releasing a reserved resting order back to Redis");
-        this.legacyPublishDuration = timer(registry, "match_engine_legacy_publish_duration",
-                "Time spent publishing the legacy OrderMatched event");
         this.tradeRecordedTotal = Counter.builder("match_engine_trade_recorded_total")
                 .description("Total TradeExecuted records persisted by MatchEngine")
                 .register(registry);
@@ -74,16 +98,48 @@ public class MatchingEngineMetrics {
         tradeRecordDuration.record(duration);
     }
 
+    void recordTradeRecordSerialize(Duration duration) {
+        tradeRecordSerializeDuration.record(duration);
+    }
+
+    void recordTradeRecordInsert(Duration duration) {
+        tradeRecordInsertDuration.record(duration);
+    }
+
+    void recordTradeRecordCompletionMark(Duration duration) {
+        tradeRecordCompletionMarkDuration.record(duration);
+    }
+
+    void recordTradeRecordTransactionBody(Duration duration) {
+        tradeRecordTransactionBodyDuration.record(duration);
+    }
+
+    void recordTradeRecordTransactionTotal(Duration duration) {
+        tradeRecordTransactionTotalDuration.record(duration);
+    }
+
+    void recordTradeRecordCommitGap(Duration duration) {
+        tradeRecordCommitGapDuration.record(duration);
+    }
+
     void recordCompleteReservation(Duration duration) {
         completeReservationDuration.record(duration);
     }
 
-    void recordReleaseReservation(Duration duration) {
-        releaseReservationDuration.record(duration);
+    void recordCompleteReservationPrepare(Duration duration) {
+        completeReservationPrepareDuration.record(duration);
     }
 
-    void recordLegacyPublish(Duration duration) {
-        legacyPublishDuration.record(duration);
+    void recordCompleteReservationRedisEval(Duration duration) {
+        completeReservationRedisEvalDuration.record(duration);
+    }
+
+    void recordCompleteReservationResult(Duration duration) {
+        completeReservationResultDuration.record(duration);
+    }
+
+    void recordReleaseReservation(Duration duration) {
+        releaseReservationDuration.record(duration);
     }
 
     void tradeRecorded() {
@@ -104,6 +160,22 @@ public class MatchingEngineMetrics {
 
     private Timer timer(MeterRegistry registry, String name, String description) {
         return Timer.builder(name)
+                .description(description)
+                .publishPercentileHistogram()
+                .register(registry);
+    }
+
+    private Timer tradeRecordPhaseTimer(MeterRegistry registry, String phase, String description) {
+        return Timer.builder("match_engine_trade_record_phase_duration")
+                .tag("phase", phase)
+                .description(description)
+                .publishPercentileHistogram()
+                .register(registry);
+    }
+
+    private Timer completeReservationPhaseTimer(MeterRegistry registry, String phase, String description) {
+        return Timer.builder("match_engine_complete_reservation_phase_duration")
+                .tag("phase", phase)
                 .description(description)
                 .publishPercentileHistogram()
                 .register(registry);

@@ -158,6 +158,11 @@ class TradeCompletionServiceTest {
                 .tag("marker_type", "ORDER_APPLIED")
                 .timer()
                 .count()).isEqualTo(1);
+        metrics.recordListener("ORDER_APPLIED", java.time.Duration.ofMillis(5));
+        assertThat(registry.get("trade_completion_marker_listener_duration")
+                .tag("marker_type", "ORDER_APPLIED")
+                .timer()
+                .count()).isEqualTo(1);
     }
 
     @Test

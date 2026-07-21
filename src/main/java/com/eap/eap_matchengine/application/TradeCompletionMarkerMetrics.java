@@ -4,6 +4,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -16,7 +17,9 @@ public class TradeCompletionMarkerMetrics {
     private final Map<String, Counter> eventTotals;
     private final Map<String, DistributionSummary> batchSizes;
     private final Map<String, Timer> insertDurations;
+    private final Map<String, Timer> listenerDurations;
 
+    @Autowired
     public TradeCompletionMarkerMetrics(MeterRegistry registry) {
         this.batchTotals = Map.of(
                 "ORDER_APPLIED", counter(
@@ -46,6 +49,9 @@ public class TradeCompletionMarkerMetrics {
         this.insertDurations = Map.of(
                 "ORDER_APPLIED", insertDuration(registry, "ORDER_APPLIED"),
                 "WALLET_SETTLED", insertDuration(registry, "WALLET_SETTLED"));
+        this.listenerDurations = Map.of(
+                "ORDER_APPLIED", listenerDuration(registry, "ORDER_APPLIED"),
+                "WALLET_SETTLED", listenerDuration(registry, "WALLET_SETTLED"));
     }
 
     private TradeCompletionMarkerMetrics() {
@@ -53,6 +59,7 @@ public class TradeCompletionMarkerMetrics {
         this.eventTotals = Map.of();
         this.batchSizes = Map.of();
         this.insertDurations = Map.of();
+        this.listenerDurations = Map.of();
     }
 
     static TradeCompletionMarkerMetrics noop() {
@@ -73,6 +80,14 @@ public class TradeCompletionMarkerMetrics {
         insertDuration.record(duration);
     }
 
+    void recordListener(String markerType, Duration duration) {
+        Timer listenerDuration = listenerDurations.get(markerType);
+        if (listenerDuration == null) {
+            return;
+        }
+        listenerDuration.record(duration);
+    }
+
     private Counter counter(MeterRegistry registry, String name, String markerType, String description) {
         return Counter.builder(name)
                 .tag("marker_type", markerType)
@@ -91,6 +106,14 @@ public class TradeCompletionMarkerMetrics {
         return Timer.builder("trade_completion_marker_insert_duration")
                 .tag("marker_type", markerType)
                 .description("Time spent inserting downstream completion markers")
+                .publishPercentileHistogram()
+                .register(registry);
+    }
+
+    private Timer listenerDuration(MeterRegistry registry, String markerType) {
+        return Timer.builder("trade_completion_marker_listener_duration")
+                .tag("marker_type", markerType)
+                .description("Wall-clock time spent in downstream completion marker listener batches")
                 .publishPercentileHistogram()
                 .register(registry);
     }

@@ -100,9 +100,9 @@ private Long marketSequence;
 
 Wallet listener 必須原樣 pass-through，不可重新產生 sequence。
 
-### OrderMatchedEvent
+### TradeExecutedEvent
 
-建議至少保留買賣雙方 order sequence：
+TPS-80 後 legacy `OrderMatchedEvent` 已退役。成交事實由 `TradeExecutedEvent` 表示，需保留買賣雙方 order sequence：
 
 ```java
 private String marketId;

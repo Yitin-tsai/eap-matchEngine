@@ -28,14 +28,14 @@ eap:
       completion-marker:
         batch-size: 50
         receive-timeout-ms: 25
-    legacy-order-matched-publish:
-      enabled: false
     trade-outbox-relay:
       batch-size: 500
       publish-concurrency: 4
       poll-interval-ms: 100
     trade-completion-view:
       hot-path-enabled: false
+    orderbook:
+      user-open-order-index-enabled: ${EAP_MATCH_USER_OPEN_ORDER_INDEX_ENABLED:true}
     trade-completion-reconciler:
       enabled: false
       batch-size: 500
