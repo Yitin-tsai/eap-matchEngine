@@ -66,3 +66,10 @@ tasks.register('matchEngineCoreLoadTest', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.eap.eap_matchengine.loadtest.MatchEngineCoreLoadGenerator'
 }
+
+tasks.register('matchDbCeilingProbe', JavaExec) {
+    group = 'verification'
+    description = 'Measure MatchEngine PostgreSQL durable write ceiling without Redis, RabbitMQ, or Spring listeners.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_matchengine.loadtest.MatchDbCeilingProbe'
+}
