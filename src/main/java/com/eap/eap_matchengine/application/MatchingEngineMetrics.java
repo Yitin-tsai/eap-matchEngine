@@ -12,6 +12,12 @@ public class MatchingEngineMetrics {
 
     private final Timer tryMatchDuration;
     private final Timer reserveDuration;
+    private final Timer reservePrepareDuration;
+    private final Timer reserveCallbackPrepareDuration;
+    private final Timer reserveSerializeIncomingDuration;
+    private final Timer reserveRedisEvalDuration;
+    private final Timer reserveDeserializeRestingDuration;
+    private final Timer reserveResultDuration;
     private final Timer addOrderDuration;
     private final Timer matchIdDuration;
     private final Timer tradeRecordDuration;
@@ -36,6 +42,18 @@ public class MatchingEngineMetrics {
                 "Wall-clock time spent handling one OrderConfirmed event");
         this.reserveDuration = timer(registry, "match_engine_reserve_order_duration",
                 "Time spent reserving the best resting order from Redis");
+        this.reservePrepareDuration = reservePhaseTimer(registry, "prepare",
+                "Time spent preparing Redis reserve-or-add keys and arguments");
+        this.reserveCallbackPrepareDuration = reservePhaseTimer(registry, "callback_prepare",
+                "Time spent preparing Redis reserve-or-add byte-array callback arguments");
+        this.reserveSerializeIncomingDuration = reservePhaseTimer(registry, "serialize_incoming",
+                "Time spent serializing incoming order before Redis reserve-or-add");
+        this.reserveRedisEvalDuration = reservePhaseTimer(registry, "redis_eval",
+                "Time spent executing Redis reserve-or-add Lua script");
+        this.reserveDeserializeRestingDuration = reservePhaseTimer(registry, "deserialize_resting",
+                "Time spent deserializing reserved resting order from Redis");
+        this.reserveResultDuration = reservePhaseTimer(registry, "result",
+                "Time spent interpreting Redis reserve-or-add result");
         this.addOrderDuration = timer(registry, "match_engine_add_order_duration",
                 "Time spent adding an unmatched order to the Redis order book");
         this.matchIdDuration = timer(registry, "match_engine_match_id_duration",
@@ -84,6 +102,30 @@ public class MatchingEngineMetrics {
 
     void recordReserve(Duration duration) {
         reserveDuration.record(duration);
+    }
+
+    void recordReservePrepare(Duration duration) {
+        reservePrepareDuration.record(duration);
+    }
+
+    void recordReserveCallbackPrepare(Duration duration) {
+        reserveCallbackPrepareDuration.record(duration);
+    }
+
+    void recordReserveSerializeIncoming(Duration duration) {
+        reserveSerializeIncomingDuration.record(duration);
+    }
+
+    void recordReserveRedisEval(Duration duration) {
+        reserveRedisEvalDuration.record(duration);
+    }
+
+    void recordReserveDeserializeResting(Duration duration) {
+        reserveDeserializeRestingDuration.record(duration);
+    }
+
+    void recordReserveResult(Duration duration) {
+        reserveResultDuration.record(duration);
     }
 
     void recordAddOrder(Duration duration) {
@@ -167,6 +209,14 @@ public class MatchingEngineMetrics {
 
     private Timer tradeRecordPhaseTimer(MeterRegistry registry, String phase, String description) {
         return Timer.builder("match_engine_trade_record_phase_duration")
+                .tag("phase", phase)
+                .description(description)
+                .publishPercentileHistogram()
+                .register(registry);
+    }
+
+    private Timer reservePhaseTimer(MeterRegistry registry, String phase, String description) {
+        return Timer.builder("match_engine_reserve_order_phase_duration")
                 .tag("phase", phase)
                 .description(description)
                 .publishPercentileHistogram()

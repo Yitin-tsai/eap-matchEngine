@@ -429,6 +429,7 @@ public class RedisOrderBookService {
      * observed null, and then ran add_order.lua.
      */
     public MatchOrAddResult reserveBestMatchOrAddOrderWithSequenceLua(OrderConfirmedEvent incomingOrder) {
+        Instant prepareStartedAt = Instant.now();
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
         String oppositeOrderbookKey = isBuy
                 ? orderbookKey(marketId(incomingOrder), "sell")
@@ -441,12 +442,16 @@ public class RedisOrderBookService {
         double priceBoundary = isBuy
                 ? maxSellScore(incomingOrder.getPrice())
                 : minBuyScore(incomingOrder.getPrice());
+        recordReservePrepare(Duration.between(prepareStartedAt, Instant.now()));
 
+        Instant serializeStartedAt = Instant.now();
         String incomingOrderJson;
         try {
             incomingOrderJson = objectMapper.writeValueAsString(incomingOrder);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Failed to serialize incoming Redis order", e);
+        } finally {
+            recordReserveSerializeIncoming(Duration.between(serializeStartedAt, Instant.now()));
         }
 
         List<String> keys = List.of(
@@ -465,23 +470,31 @@ public class RedisOrderBookService {
 
         @SuppressWarnings("unchecked")
         List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
+            Instant callbackPrepareStartedAt = Instant.now();
             byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
             byte[][] argsBytes = args.stream().map(a -> a.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
             byte[][] allParams = new byte[keysBytes.length + argsBytes.length][];
             System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
             System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
+            recordReserveCallbackPrepare(Duration.between(callbackPrepareStartedAt, Instant.now()));
 
-            Object res = evalLoadedScript(
-                    connection,
-                    scriptSha,
-                    luaScript,
-                    ReturnType.MULTI,
-                    keys.size(),
-                    allParams
-            );
-            return (List<byte[]>) res;
+            Instant redisEvalStartedAt = Instant.now();
+            try {
+                Object res = evalLoadedScript(
+                        connection,
+                        scriptSha,
+                        luaScript,
+                        ReturnType.MULTI,
+                        keys.size(),
+                        allParams
+                );
+                return (List<byte[]>) res;
+            } finally {
+                recordReserveRedisEval(Duration.between(redisEvalStartedAt, Instant.now()));
+            }
         });
 
+        Instant resultStartedAt = Instant.now();
         if (rawResult == null || rawResult.isEmpty()) {
             throw new IllegalStateException("Redis reserve-or-add script returned no result");
         }
@@ -508,7 +521,9 @@ public class RedisOrderBookService {
         if (rawResult.size() < 3) {
             throw new IllegalStateException("Redis reserve-or-add script did not return reserved order and sequence");
         }
+        recordReserveResult(Duration.between(resultStartedAt, Instant.now()));
 
+        Instant deserializeStartedAt = Instant.now();
         try {
             String orderJson = new String(rawResult.get(1), StandardCharsets.UTF_8);
             OrderConfirmedEvent reservedOrder = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
@@ -519,6 +534,8 @@ public class RedisOrderBookService {
         } catch (Exception e) {
             log.error("Failed to deserialize reserve-or-add result", e);
             throw new IllegalStateException("Failed to deserialize reserve-or-add Redis result", e);
+        } finally {
+            recordReserveDeserializeResting(Duration.between(deserializeStartedAt, Instant.now()));
         }
     }
 
@@ -630,6 +647,42 @@ public class RedisOrderBookService {
     private void recordCompleteReservationPrepare(Duration duration) {
         if (metrics != null) {
             metrics.recordCompleteReservationPrepare(duration);
+        }
+    }
+
+    private void recordReservePrepare(Duration duration) {
+        if (metrics != null) {
+            metrics.recordReservePrepare(duration);
+        }
+    }
+
+    private void recordReserveCallbackPrepare(Duration duration) {
+        if (metrics != null) {
+            metrics.recordReserveCallbackPrepare(duration);
+        }
+    }
+
+    private void recordReserveSerializeIncoming(Duration duration) {
+        if (metrics != null) {
+            metrics.recordReserveSerializeIncoming(duration);
+        }
+    }
+
+    private void recordReserveRedisEval(Duration duration) {
+        if (metrics != null) {
+            metrics.recordReserveRedisEval(duration);
+        }
+    }
+
+    private void recordReserveDeserializeResting(Duration duration) {
+        if (metrics != null) {
+            metrics.recordReserveDeserializeResting(duration);
+        }
+    }
+
+    private void recordReserveResult(Duration duration) {
+        if (metrics != null) {
+            metrics.recordReserveResult(duration);
         }
     }
 
