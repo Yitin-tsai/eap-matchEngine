@@ -242,4 +242,12 @@
         </sql>
     </changeSet>
 
+    <changeSet id="match-trade-014" author="eap">
+        <comment>Allow TradeExecuted outbox rows to reference durable trade facts instead of duplicating payload</comment>
+        <sql>
+            ALTER TABLE match_engine.trade_outbox
+                ALTER COLUMN payload DROP NOT NULL;
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

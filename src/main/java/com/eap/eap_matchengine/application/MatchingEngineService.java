@@ -52,6 +52,8 @@ public class MatchingEngineService {
    */
   public void tryMatch(OrderConfirmedEvent incomingOrder) {
     Instant tryMatchStartedAt = Instant.now();
+    boolean addedToBook = false;
+    int recordedTrades = 0;
     try {
       boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
 
@@ -61,6 +63,7 @@ public class MatchingEngineService {
         RedisOrderBookService.MatchOrAddResult matchAttempt = reserveBestMatchOrAddOrder(incomingOrder);
 
         if (matchAttempt.orderAdded()) {
+          addedToBook = true;
           metrics.orderAdded();
           log.info("No matching order found, added to order book: orderId={}, amount={}",
               incomingOrder.getOrderId(), incomingOrder.getAmount());
@@ -88,6 +91,7 @@ public class MatchingEngineService {
 
           tradeExecutedEvent = toTradeExecutedEvent(incomingOrder, matchOrder, isBuy, matchId, matchedAmount);
           recordTrade(tradeExecutedEvent);
+          recordedTrades++;
         } catch (RuntimeException e) {
           releaseReservedRestingOrder(matchOrder, matchOrderAmountBeforeMatch, e);
           throw e;
@@ -135,8 +139,23 @@ public class MatchingEngineService {
         }
       }
     } finally {
-      metrics.recordTryMatch(Duration.between(tryMatchStartedAt, Instant.now()));
+      Duration duration = Duration.between(tryMatchStartedAt, Instant.now());
+      metrics.recordTryMatch(duration);
+      metrics.recordTryMatchOutcome(tryMatchOutcome(recordedTrades, addedToBook, incomingOrder.getAmount()), duration);
     }
+  }
+
+  private String tryMatchOutcome(int recordedTrades, boolean addedToBook, int remainingAmount) {
+    if (recordedTrades == 0 && addedToBook) {
+      return "added_to_book";
+    }
+    if (recordedTrades > 0 && remainingAmount <= 0) {
+      return "fully_matched";
+    }
+    if (recordedTrades > 0) {
+      return "matched_with_remainder";
+    }
+    return "no_op";
   }
 
   private RedisOrderBookService.MatchOrAddResult reserveBestMatchOrAddOrder(OrderConfirmedEvent incomingOrder) {

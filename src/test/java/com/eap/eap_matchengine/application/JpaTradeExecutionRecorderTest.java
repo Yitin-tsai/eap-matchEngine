@@ -1,7 +1,6 @@
 package com.eap.eap_matchengine.application;
 
 import com.eap.common.event.TradeExecutedEvent;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 
@@ -25,8 +24,7 @@ class JpaTradeExecutionRecorderTest {
     private final TradeCompletionService tradeCompletionService = mock(TradeCompletionService.class);
     private final MatchingEngineMetrics metrics = mock(MatchingEngineMetrics.class);
     private final JpaTradeExecutionRecorder recorder =
-            new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService,
-                    new ObjectMapper().findAndRegisterModules(), metrics);
+            new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService, metrics);
 
     @Test
     void record_shouldInsertTradeAndOutboxInOneStatementWithoutPreselect() {
@@ -69,7 +67,7 @@ class JpaTradeExecutionRecorderTest {
     }
 
     @Test
-    void record_shouldUseTradeExecutedRoutingKeyAndPayload() {
+    void record_shouldInsertTradeExecutedOutboxMetadataWithoutDuplicatingPayload() {
         TradeExecutedEvent event = event("trade-payload");
         when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class)))
                 .thenReturn(1);
@@ -95,8 +93,7 @@ class JpaTradeExecutionRecorderTest {
                 eq(LocalDateTime.of(2026, 7, 8, 12, 0)),
                 eq("TradeExecutedEvent"),
                 eq("TRADE"),
-                eq("trade.executed"),
-                contains("\"tradeId\":\"trade-payload\""));
+                eq("trade.executed"));
     }
 
     private TradeExecutedEvent event(String tradeId) {

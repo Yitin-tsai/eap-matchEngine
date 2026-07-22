@@ -42,7 +42,7 @@ if sequence_key then
 end
 
 redis.call('ZREM', orderbook_key, order_id)
-local reservation_json = '{"reservedAtEpochMillis":' .. reserved_at .. ',"order":' .. order_json .. '}'
+local reservation_json = '{"reservedAtEpochMillis":' .. reserved_at .. ',"orderId":"' .. order_id .. '"}'
 local reserved = redis.call('SET', reservation_key, reservation_json, 'NX')
 if not reserved then
     if sequence_key then

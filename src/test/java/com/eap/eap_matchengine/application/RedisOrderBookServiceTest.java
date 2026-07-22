@@ -7,6 +7,7 @@ import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -151,6 +152,37 @@ class RedisOrderBookServiceTest {
     }
 
     @Test
+    void reserveBestMatchOrAddOrderWithSequenceLua_whenMatchedWithCompactRedisOrder_shouldReturnReservedOrder()
+            throws Exception {
+        OrderConfirmedEvent restingSell = OrderConfirmedEvent.builder()
+                .orderId(UUID.fromString("00000000-0000-0000-0000-000000000024"))
+                .userId(UUID.fromString("00000000-0000-0000-0000-000000000025"))
+                .marketId("TEST-MARKET")
+                .marketSequence(22L)
+                .price(101)
+                .amount(3)
+                .orderType("SELL")
+                .createdAt(LocalDateTime.of(2026, 7, 13, 12, 2))
+                .build();
+        doReturn(List.of(
+                "__MATCH__".getBytes(StandardCharsets.UTF_8),
+                compactRedisOrderJson(restingSell).getBytes(StandardCharsets.UTF_8),
+                "44".getBytes(StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+
+        RedisOrderBookService.MatchOrAddResult result =
+                service.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuyOrder());
+
+        assertThat(result.orderAdded()).isFalse();
+        assertThat(result.reservedMatch().matchId()).isEqualTo(44L);
+        assertThat(result.reservedMatch().order().getOrderId()).isEqualTo(restingSell.getOrderId());
+        assertThat(result.reservedMatch().order().getUserId()).isEqualTo(restingSell.getUserId());
+        assertThat(result.reservedMatch().order().getMarketSequence()).isEqualTo(22L);
+        assertThat(result.reservedMatch().order().getCreatedAt()).isEqualTo(restingSell.getCreatedAt());
+        verify(redisTemplate).execute(any(RedisCallback.class));
+    }
+
+    @Test
     void releaseReservedOrder_whenReservationDoesNotExist_shouldFailWithoutResurrectingOrder() {
         doReturn(0L).when(redisTemplate).execute(any(RedisCallback.class));
 
@@ -183,6 +215,37 @@ class RedisOrderBookServiceTest {
         verifyNoInteractions(redisTemplate);
     }
 
+    @Test
+    void scanReservations_whenReservationStoresOrderId_shouldResolveOrderDetail() {
+        UUID orderId = UUID.fromString("00000000-0000-0000-0000-000000000034");
+        OrderConfirmedEvent restingSell = OrderConfirmedEvent.builder()
+                .orderId(orderId)
+                .userId(UUID.fromString("00000000-0000-0000-0000-000000000035"))
+                .marketId("TEST-MARKET")
+                .marketSequence(32L)
+                .price(102)
+                .amount(4)
+                .orderType("SELL")
+                .createdAt(LocalDateTime.of(2026, 7, 13, 12, 3))
+                .build();
+        ValueOperations<String, String> valueOperations = mock(ValueOperations.class);
+        doReturn(List.of("order:reservation:" + orderId))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+        doReturn(valueOperations).when(redisTemplate).opsForValue();
+        doReturn("{\"reservedAtEpochMillis\":1783934580000,\"orderId\":\"" + orderId + "\"}")
+                .when(valueOperations).get("order:reservation:" + orderId);
+        doReturn(compactRedisOrderJson(restingSell))
+                .when(valueOperations).get("order:" + orderId);
+
+        List<RedisOrderBookService.ReservationSnapshot> snapshots = service.scanReservations(10);
+
+        assertThat(snapshots).hasSize(1);
+        assertThat(snapshots.get(0).valid()).isTrue();
+        assertThat(snapshots.get(0).reservedAtEpochMillis()).isEqualTo(1783934580000L);
+        assertThat(snapshots.get(0).order().getOrderId()).isEqualTo(orderId);
+        assertThat(snapshots.get(0).order().getAmount()).isEqualTo(4);
+    }
+
     private OrderConfirmedEvent incomingBuyOrder() {
         return OrderConfirmedEvent.builder()
                 .orderId(UUID.fromString("00000000-0000-0000-0000-000000000002"))
@@ -194,5 +257,19 @@ class RedisOrderBookServiceTest {
                 .orderType("BUY")
                 .createdAt(LocalDateTime.of(2026, 7, 13, 12, 0))
                 .build();
+    }
+
+    private String compactRedisOrderJson(OrderConfirmedEvent event) {
+        return """
+                {"i":"%s","u":"%s","m":"%s","s":%d,"p":%d,"a":%d,"t":"%s","c":"%s"}
+                """.formatted(
+                event.getOrderId(),
+                event.getUserId(),
+                event.getMarketId(),
+                event.getMarketSequence(),
+                event.getPrice(),
+                event.getAmount(),
+                event.getOrderType(),
+                event.getCreatedAt());
     }
 }

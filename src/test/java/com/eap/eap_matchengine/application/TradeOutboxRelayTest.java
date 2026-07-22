@@ -45,15 +45,7 @@ class TradeOutboxRelayTest {
         stubPendingRows(List.of(entry), List.of());
         when(namedJdbcTemplate.update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class)))
                 .thenReturn(1);
-        doAnswer(invocation -> {
-            CorrelationData correlationData = invocation.getArgument(3);
-            correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
-            return null;
-        }).when(rabbitTemplate).send(
-                eq(RabbitMQConstants.TRADE_EXCHANGE),
-                eq(RabbitMQConstants.TRADE_EXECUTED_KEY),
-                any(Message.class),
-                any(CorrelationData.class));
+        stubInvokeSendConfirm(true, null);
 
         relay().pollAndPublish();
 
@@ -66,15 +58,7 @@ class TradeOutboxRelayTest {
     void schedulesRetryWhenBrokerNacks() throws Exception {
         TestOutboxRow entry = entry("TRADE-2");
         stubPendingRows(List.of(entry));
-        doAnswer(invocation -> {
-            CorrelationData correlationData = invocation.getArgument(3);
-            correlationData.getFuture().complete(new CorrelationData.Confirm(false, "test nack"));
-            return null;
-        }).when(rabbitTemplate).send(
-                anyString(),
-                anyString(),
-                any(Message.class),
-                any(CorrelationData.class));
+        stubInvokeSendConfirm(false, "test nack");
 
         relay().pollAndPublish();
 
@@ -116,22 +100,103 @@ class TradeOutboxRelayTest {
         verify(metrics, times(4)).published();
     }
 
+    @Test
+    void batchConfirmEnabled_waitsForChannelConfirmsBeforeMarkingSent() throws Exception {
+        TestOutboxRow first = entry(1L, "TRADE-1");
+        TestOutboxRow second = entry(2L, "TRADE-2");
+        stubPendingRows(List.of(first, second), List.of());
+        when(namedJdbcTemplate.update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class)))
+                .thenReturn(2);
+
+        doAnswer(invocation -> {
+            RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
+            RabbitOperations operations = mock(RabbitOperations.class);
+            callback.doInRabbit(operations);
+            verify(operations).waitForConfirmsOrDie(1000);
+            return null;
+        }).when(rabbitTemplate).invoke(any(RabbitOperations.OperationsCallback.class));
+
+        relay(1, true).pollAndPublish();
+
+        verify(namedJdbcTemplate).update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class));
+        verify(metrics, times(2)).published();
+    }
+
+    @Test
+    void rebuildsTradeExecutedPayloadWhenOutboxPayloadIsNull() throws Exception {
+        TestOutboxRow entry = entryWithoutPayload(1L, "TRADE-REBUILD");
+        stubPendingRows(List.of(entry), List.of());
+        when(namedJdbcTemplate.update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class)))
+                .thenReturn(1);
+
+        doAnswer(invocation -> {
+            RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
+            RabbitOperations operations = mock(RabbitOperations.class);
+            doAnswer(sendInvocation -> {
+                Message message = sendInvocation.getArgument(2);
+                TradeExecutedEvent published =
+                        objectMapper.readValue(message.getBody(), TradeExecutedEvent.class);
+                org.assertj.core.api.Assertions.assertThat(published.getTradeId()).isEqualTo("TRADE-REBUILD");
+                org.assertj.core.api.Assertions.assertThat(published.getBuyerId()).isEqualTo(entry.event().getBuyerId());
+                org.assertj.core.api.Assertions.assertThat(published.getQuantity()).isEqualTo(2);
+                CorrelationData correlationData = sendInvocation.getArgument(3);
+                correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
+                return null;
+            }).when(operations).send(
+                    eq(RabbitMQConstants.TRADE_EXCHANGE),
+                    eq(RabbitMQConstants.TRADE_EXECUTED_KEY),
+                    any(Message.class),
+                    any(CorrelationData.class));
+            callback.doInRabbit(operations);
+            return null;
+        }).when(rabbitTemplate).invoke(any(RabbitOperations.OperationsCallback.class));
+
+        relay().pollAndPublish();
+
+        verify(namedJdbcTemplate).update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class));
+        verify(metrics).published();
+    }
+
     private TradeOutboxRelay relay() {
         return relay(1);
     }
 
     private TradeOutboxRelay relay(int publishConcurrency) {
+        return relay(publishConcurrency, false);
+    }
+
+    private TradeOutboxRelay relay(int publishConcurrency, boolean batchConfirmEnabled) {
         return new TradeOutboxRelay(
                 jdbcTemplate,
                 namedJdbcTemplate,
                 rabbitTemplate,
                 metrics,
+                objectMapper,
                 10,
                 publishConcurrency,
+                batchConfirmEnabled,
                 1000,
                 3,
                 100,
                 1000);
+    }
+
+    private void stubInvokeSendConfirm(boolean ack, String reason) {
+        doAnswer(invocation -> {
+            RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
+            RabbitOperations operations = mock(RabbitOperations.class);
+            doAnswer(sendInvocation -> {
+                CorrelationData correlationData = sendInvocation.getArgument(3);
+                correlationData.getFuture().complete(new CorrelationData.Confirm(ack, reason));
+                return null;
+            }).when(operations).send(
+                    anyString(),
+                    anyString(),
+                    any(Message.class),
+                    any(CorrelationData.class));
+            callback.doInRabbit(operations);
+            return null;
+        }).when(rabbitTemplate).invoke(any(RabbitOperations.OperationsCallback.class));
     }
 
     private void stubPendingRows(List<TestOutboxRow> firstBatch) {
@@ -163,6 +228,22 @@ class TradeOutboxRelayTest {
         when(rs.getString("routing_key")).thenReturn(row.routingKey());
         when(rs.getString("payload")).thenReturn(row.payload());
         when(rs.getInt("attempt_count")).thenReturn(row.attemptCount());
+        if (row.event() != null) {
+            when(rs.getObject("sequence", Long.class)).thenReturn(row.event().getSequence());
+            when(rs.getObject("legacy_match_id", Long.class)).thenReturn(row.event().getLegacyMatchId().longValue());
+            when(rs.getString("market_id")).thenReturn(row.event().getMarketId());
+            when(rs.getObject("buyer_id", UUID.class)).thenReturn(row.event().getBuyerId());
+            when(rs.getObject("seller_id", UUID.class)).thenReturn(row.event().getSellerId());
+            when(rs.getObject("buyer_order_id", UUID.class)).thenReturn(row.event().getBuyerOrderId());
+            when(rs.getObject("seller_order_id", UUID.class)).thenReturn(row.event().getSellerOrderId());
+            when(rs.getObject("buyer_market_sequence", Long.class)).thenReturn(row.event().getBuyerMarketSequence());
+            when(rs.getObject("seller_market_sequence", Long.class)).thenReturn(row.event().getSellerMarketSequence());
+            when(rs.getObject("origin_buyer_price", Integer.class)).thenReturn(row.event().getOriginBuyerPrice());
+            when(rs.getObject("origin_seller_price", Integer.class)).thenReturn(row.event().getOriginSellerPrice());
+            when(rs.getObject("deal_price", Integer.class)).thenReturn(row.event().getDealPrice());
+            when(rs.getObject("quantity", Integer.class)).thenReturn(row.event().getQuantity());
+            when(rs.getObject("occurred_at", LocalDateTime.class)).thenReturn(row.event().getOccurredAt());
+        }
         return rs;
     }
 
@@ -192,6 +273,35 @@ class TradeOutboxRelayTest {
                 tradeId,
                 RabbitMQConstants.TRADE_EXECUTED_KEY,
                 objectMapper.writeValueAsString(event),
+                null,
+                0);
+    }
+
+    private TestOutboxRow entryWithoutPayload(Long id, String tradeId) {
+        TradeExecutedEvent event = TradeExecutedEvent.builder()
+                .tradeId(tradeId)
+                .sequence(2L)
+                .legacyMatchId(2)
+                .marketId("ENERGY-SPOT")
+                .buyerId(UUID.fromString("00000000-0000-0000-0000-000000000101"))
+                .sellerId(UUID.fromString("00000000-0000-0000-0000-000000000102"))
+                .buyerOrderId(UUID.fromString("00000000-0000-0000-0000-000000000103"))
+                .sellerOrderId(UUID.fromString("00000000-0000-0000-0000-000000000104"))
+                .buyerMarketSequence(11L)
+                .sellerMarketSequence(12L)
+                .originBuyerPrice(110)
+                .originSellerPrice(100)
+                .dealPrice(100)
+                .quantity(2)
+                .occurredAt(LocalDateTime.of(2026, 7, 22, 9, 30))
+                .build();
+        return new TestOutboxRow(
+                id,
+                "TradeExecutedEvent",
+                tradeId,
+                RabbitMQConstants.TRADE_EXECUTED_KEY,
+                null,
+                event,
                 0);
     }
 
@@ -201,6 +311,7 @@ class TradeOutboxRelayTest {
             String aggregateId,
             String routingKey,
             String payload,
+            TradeExecutedEvent event,
             int attemptCount) {
     }
 }

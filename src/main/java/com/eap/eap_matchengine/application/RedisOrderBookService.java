@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Set;
 import java.util.List;
@@ -30,6 +31,7 @@ import org.springframework.util.StreamUtils;
 
 import jakarta.annotation.PostConstruct;
 import java.time.Duration;
+import java.time.format.DateTimeFormatter;
 
 /**
  * Redis-based implementation of an order book service for managing buy and sell orders.
@@ -161,6 +163,21 @@ public class RedisOrderBookService {
         return false;
     }
 
+    private String serializeRedisOrder(OrderConfirmedEvent event) throws JsonProcessingException {
+        return objectMapper.writeValueAsString(RedisOrderEntry.from(event));
+    }
+
+    private OrderConfirmedEvent deserializeRedisOrder(String value) throws JsonProcessingException {
+        return deserializeRedisOrder(objectMapper.readTree(value));
+    }
+
+    private OrderConfirmedEvent deserializeRedisOrder(JsonNode root) throws JsonProcessingException {
+        if (root.has("i")) {
+            return objectMapper.treeToValue(root, RedisOrderEntry.class).toEvent();
+        }
+        return objectMapper.treeToValue(root, OrderConfirmedEvent.class);
+    }
+
     /**
      * Atomically adds a new order to the appropriate order book (buy/sell).
      * Uses Lua script to ensure all three operations are atomic:
@@ -175,7 +192,7 @@ public class RedisOrderBookService {
         String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
-        String orderJson = objectMapper.writeValueAsString(event);
+        String orderJson = serializeRedisOrder(event);
         double orderScore = scoreFor(event);
 
         List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey);
@@ -339,7 +356,7 @@ public class RedisOrderBookService {
         }
 
         try {
-            OrderConfirmedEvent reservedOrder = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+            OrderConfirmedEvent reservedOrder = deserializeRedisOrder(orderJson);
             log.debug("Successfully reserved order {} for matching", reservedOrder.getOrderId());
             return reservedOrder;
         } catch (Exception e) {
@@ -410,7 +427,7 @@ public class RedisOrderBookService {
         }
 
         try {
-            OrderConfirmedEvent reservedOrder = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+            OrderConfirmedEvent reservedOrder = deserializeRedisOrder(orderJson);
             Long matchId = Long.valueOf(new String(rawResult.get(1), StandardCharsets.UTF_8));
             log.debug("Successfully reserved order {} for matching with matchId={}",
                     reservedOrder.getOrderId(), matchId);
@@ -447,7 +464,7 @@ public class RedisOrderBookService {
         Instant serializeStartedAt = Instant.now();
         String incomingOrderJson;
         try {
-            incomingOrderJson = objectMapper.writeValueAsString(incomingOrder);
+            incomingOrderJson = serializeRedisOrder(incomingOrder);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Failed to serialize incoming Redis order", e);
         } finally {
@@ -526,7 +543,7 @@ public class RedisOrderBookService {
         Instant deserializeStartedAt = Instant.now();
         try {
             String orderJson = new String(rawResult.get(1), StandardCharsets.UTF_8);
-            OrderConfirmedEvent reservedOrder = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+            OrderConfirmedEvent reservedOrder = deserializeRedisOrder(orderJson);
             Long matchId = Long.valueOf(new String(rawResult.get(2), StandardCharsets.UTF_8));
             log.debug("Successfully reserved order {} for matching with matchId={}",
                     reservedOrder.getOrderId(), matchId);
@@ -560,7 +577,7 @@ public class RedisOrderBookService {
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
         String reservationKey = reservationKey(event);
-        String orderJson = objectMapper.writeValueAsString(event);
+        String orderJson = serializeRedisOrder(event);
         double orderScore = scoreFor(event);
 
         List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey, reservationKey);
@@ -757,13 +774,23 @@ public class RedisOrderBookService {
         try {
             JsonNode root = objectMapper.readTree(value);
             if (root.has("order")) {
-                OrderConfirmedEvent order = objectMapper.treeToValue(root.get("order"), OrderConfirmedEvent.class);
+                OrderConfirmedEvent order = deserializeRedisOrder(root.get("order"));
+                long reservedAtEpochMillis = root.path("reservedAtEpochMillis").asLong(0L);
+                return ReservationSnapshot.valid(key, order, reservedAtEpochMillis);
+            }
+            if (root.has("orderId")) {
+                String orderId = root.path("orderId").asText();
+                String orderJson = redisTemplate.opsForValue().get("order:" + orderId);
+                if (orderJson == null || orderJson.isBlank()) {
+                    return ReservationSnapshot.invalid(key, "missing reserved order detail " + orderId);
+                }
+                OrderConfirmedEvent order = deserializeRedisOrder(orderJson);
                 long reservedAtEpochMillis = root.path("reservedAtEpochMillis").asLong(0L);
                 return ReservationSnapshot.valid(key, order, reservedAtEpochMillis);
             }
 
             // Backward compatibility for pre-TPS-59 reservation values that stored only order JSON.
-            OrderConfirmedEvent order = objectMapper.treeToValue(root, OrderConfirmedEvent.class);
+            OrderConfirmedEvent order = deserializeRedisOrder(root);
             return ReservationSnapshot.valid(key, order, 0L);
         } catch (Exception e) {
             return ReservationSnapshot.invalid(key, e.getMessage());
@@ -788,7 +815,7 @@ public class RedisOrderBookService {
         }
 
         try {
-            OrderConfirmedEvent order = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+            OrderConfirmedEvent order = deserializeRedisOrder(orderJson);
 
             // Use Lua script to atomically remove
             String orderbookKey = orderbookKey(order);
@@ -849,7 +876,7 @@ public class RedisOrderBookService {
                     String orderJson = redisTemplate.opsForValue().get("order:" + orderId);
                     if (orderJson != null) {
                         try {
-                            return objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+                            return deserializeRedisOrder(orderJson);
                         } catch (Exception e) {
                             log.error("Failed to deserialize order {}", orderId, e);
                         }
@@ -894,7 +921,7 @@ public class RedisOrderBookService {
                     try {
                         String orderJson = redisTemplate.opsForValue().get("order:" + orderIdStr);
                         if (orderJson != null) {
-                            return objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+                            return deserializeRedisOrder(orderJson);
                         }
                     } catch (Exception e) {
                         log.error("Failed to deserialize order {}", orderIdStr, e);
@@ -943,6 +970,42 @@ public class RedisOrderBookService {
 
     private double minBuyScore(int sellLimitPrice) {
         return (long) sellLimitPrice * SCORE_FACTOR;
+    }
+
+    private record RedisOrderEntry(
+            UUID i,
+            UUID u,
+            String m,
+            Long s,
+            Integer p,
+            Integer a,
+            String t,
+            String c) {
+
+        static RedisOrderEntry from(OrderConfirmedEvent event) {
+            return new RedisOrderEntry(
+                    event.getOrderId(),
+                    event.getUserId(),
+                    event.getMarketId(),
+                    event.getMarketSequence(),
+                    event.getPrice(),
+                    event.getAmount(),
+                    event.getOrderType(),
+                    event.getCreatedAt() == null ? null : event.getCreatedAt().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
+        }
+
+        OrderConfirmedEvent toEvent() {
+            return OrderConfirmedEvent.builder()
+                    .orderId(i)
+                    .userId(u)
+                    .marketId(m)
+                    .marketSequence(s)
+                    .price(p)
+                    .amount(a)
+                    .orderType(t)
+                    .createdAt(c == null || c.isBlank() ? null : LocalDateTime.parse(c, DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+                    .build();
+        }
     }
 
     public record ReservationSnapshot(

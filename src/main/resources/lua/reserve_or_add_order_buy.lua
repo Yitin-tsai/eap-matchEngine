@@ -58,7 +58,7 @@ end
 local match_id = redis.call('INCR', sequence_key)
 
 redis.call('ZREM', sell_orderbook_key, resting_order_id)
-local reservation_json = '{"reservedAtEpochMillis":' .. reserved_at .. ',"order":' .. resting_order_json .. '}'
+local reservation_json = '{"reservedAtEpochMillis":' .. reserved_at .. ',"orderId":"' .. resting_order_id .. '"}'
 local reserved = redis.call('SET', reservation_key, reservation_json, 'NX')
 if not reserved then
     return {'__RESERVATION_EXISTS__:' .. resting_order_id}

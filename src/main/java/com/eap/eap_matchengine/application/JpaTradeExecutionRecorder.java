@@ -2,8 +2,6 @@ package com.eap.eap_matchengine.application;
 
 import com.eap.common.constants.RabbitMQConstants;
 import com.eap.common.event.TradeExecutedEvent;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -25,7 +23,6 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
 
     private final JdbcTemplate jdbcTemplate;
     private final TradeCompletionService tradeCompletionService;
-    private final ObjectMapper objectMapper;
     private final MatchingEngineMetrics metrics;
 
     @Override
@@ -35,7 +32,8 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
         Instant[] transactionBodyFinishedAt = new Instant[1];
         registerTransactionCompletionMetrics(transactionStartedAt, transactionBodyFinishedAt);
         try {
-            String payload = serializeTimed(event);
+            Instant serializeStartedAt = Instant.now();
+            metrics.recordTradeRecordSerialize(Duration.between(serializeStartedAt, Instant.now()));
             Instant insertStartedAt = Instant.now();
             int insertedOutbox;
             try {
@@ -51,8 +49,8 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
                         RETURNING trade_id
                     )
                     INSERT INTO match_engine.trade_outbox
-                        (event_type, aggregate_type, aggregate_id, routing_key, payload)
-                    SELECT ?, ?, inserted_trade.trade_id, ?, ?
+                        (event_type, aggregate_type, aggregate_id, routing_key)
+                    SELECT ?, ?, inserted_trade.trade_id, ?
                     FROM inserted_trade
                     """,
                     event.getTradeId(),
@@ -72,8 +70,7 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
                     event.getOccurredAt(),
                     "TradeExecutedEvent",
                     "TRADE",
-                    RabbitMQConstants.TRADE_EXECUTED_KEY,
-                    payload);
+                    RabbitMQConstants.TRADE_EXECUTED_KEY);
             } finally {
                 metrics.recordTradeRecordInsert(Duration.between(insertStartedAt, Instant.now()));
             }
@@ -120,14 +117,4 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
         metrics.recordTradeRecordCommitGap(Duration.ZERO);
     }
 
-    private String serializeTimed(TradeExecutedEvent event) {
-        Instant startedAt = Instant.now();
-        try {
-            return objectMapper.writeValueAsString(event);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("Failed to serialize TradeExecutedEvent: tradeId=" + event.getTradeId(), e);
-        } finally {
-            metrics.recordTradeRecordSerialize(Duration.between(startedAt, Instant.now()));
-        }
-    }
 }

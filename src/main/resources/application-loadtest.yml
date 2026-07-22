@@ -31,6 +31,7 @@ eap:
     trade-outbox-relay:
       batch-size: 500
       publish-concurrency: 4
+      batch-confirm-enabled: ${EAP_MATCH_TRADE_OUTBOX_BATCH_CONFIRM_ENABLED:false}
       poll-interval-ms: 100
     trade-completion-view:
       hot-path-enabled: false

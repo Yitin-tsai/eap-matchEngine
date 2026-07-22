@@ -11,6 +11,10 @@ import java.time.Duration;
 public class MatchingEngineMetrics {
 
     private final Timer tryMatchDuration;
+    private final Timer tryMatchAddedToBookDuration;
+    private final Timer tryMatchFullyMatchedDuration;
+    private final Timer tryMatchMatchedWithRemainderDuration;
+    private final Timer tryMatchNoOpDuration;
     private final Timer reserveDuration;
     private final Timer reservePrepareDuration;
     private final Timer reserveCallbackPrepareDuration;
@@ -40,6 +44,14 @@ public class MatchingEngineMetrics {
     public MatchingEngineMetrics(MeterRegistry registry) {
         this.tryMatchDuration = timer(registry, "match_engine_try_match_duration",
                 "Wall-clock time spent handling one OrderConfirmed event");
+        this.tryMatchAddedToBookDuration = tryMatchOutcomeTimer(registry, "added_to_book",
+                "Wall-clock time spent handling an OrderConfirmed event that was added to the order book without a trade");
+        this.tryMatchFullyMatchedDuration = tryMatchOutcomeTimer(registry, "fully_matched",
+                "Wall-clock time spent handling an OrderConfirmed event that fully matched into one or more trades");
+        this.tryMatchMatchedWithRemainderDuration = tryMatchOutcomeTimer(registry, "matched_with_remainder",
+                "Wall-clock time spent handling an OrderConfirmed event that matched at least once and left remaining quantity");
+        this.tryMatchNoOpDuration = tryMatchOutcomeTimer(registry, "no_op",
+                "Wall-clock time spent handling an OrderConfirmed event that produced no orderbook change");
         this.reserveDuration = timer(registry, "match_engine_reserve_order_duration",
                 "Time spent reserving the best resting order from Redis");
         this.reservePrepareDuration = reservePhaseTimer(registry, "prepare",
@@ -98,6 +110,15 @@ public class MatchingEngineMetrics {
 
     void recordTryMatch(Duration duration) {
         tryMatchDuration.record(duration);
+    }
+
+    void recordTryMatchOutcome(String outcome, Duration duration) {
+        switch (outcome) {
+            case "added_to_book" -> tryMatchAddedToBookDuration.record(duration);
+            case "fully_matched" -> tryMatchFullyMatchedDuration.record(duration);
+            case "matched_with_remainder" -> tryMatchMatchedWithRemainderDuration.record(duration);
+            default -> tryMatchNoOpDuration.record(duration);
+        }
     }
 
     void recordReserve(Duration duration) {
@@ -226,6 +247,14 @@ public class MatchingEngineMetrics {
     private Timer completeReservationPhaseTimer(MeterRegistry registry, String phase, String description) {
         return Timer.builder("match_engine_complete_reservation_phase_duration")
                 .tag("phase", phase)
+                .description(description)
+                .publishPercentileHistogram()
+                .register(registry);
+    }
+
+    private Timer tryMatchOutcomeTimer(MeterRegistry registry, String outcome, String description) {
+        return Timer.builder("match_engine_try_match_outcome_duration")
+                .tag("outcome", outcome)
                 .description(description)
                 .publishPercentileHistogram()
                 .register(registry);
