@@ -143,7 +143,13 @@ public class TradeOutboxRelay {
             boolean batchSucceeded = true;
             List<PublishAttempt> attempts = new ArrayList<>(pending.size());
 
-            List<PublishResult> publishResults = publishBatch(pending);
+            Instant publishStageStartedAt = Instant.now();
+            List<PublishResult> publishResults;
+            try {
+                publishResults = publishBatch(pending);
+            } finally {
+                metrics.recordPublishStage(Duration.between(publishStageStartedAt, Instant.now()));
+            }
             for (PublishResult result : publishResults) {
                 if (result.succeeded()) {
                     attempts.add(new PublishAttempt(result.entry(), result.correlationData(), result.startedAt()));
@@ -158,6 +164,7 @@ public class TradeOutboxRelay {
             long confirmationDeadlineNanos = System.nanoTime()
                     + TimeUnit.MILLISECONDS.toNanos(confirmTimeoutMs);
             List<PublishAttempt> confirmedAttempts = new ArrayList<>(attempts.size());
+            Instant confirmStageStartedAt = Instant.now();
 
             if (batchConfirmEnabled) {
                 confirmedAttempts.addAll(attempts);
@@ -183,8 +190,13 @@ public class TradeOutboxRelay {
                     }
                 }
             }
+            Instant confirmStageCompletedAt = Instant.now();
+            if (!batchConfirmEnabled) {
+                metrics.recordConfirmWall(Duration.between(confirmStageStartedAt, confirmStageCompletedAt));
+            }
 
             if (!confirmedAttempts.isEmpty()) {
+                metrics.recordPostConfirmMarkGap(Duration.between(confirmStageCompletedAt, Instant.now()));
                 try {
                     markConfirmedAsSent(confirmedAttempts);
                 } catch (Exception e) {
@@ -259,6 +271,7 @@ public class TradeOutboxRelay {
             return;
         }
         Duration perMessageDuration = confirmDuration.dividedBy(confirmedCount);
+        metrics.recordConfirmWall(confirmDuration);
         for (int i = 0; i < confirmedCount; i++) {
             metrics.recordConfirm(perMessageDuration);
         }

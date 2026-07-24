@@ -71,6 +71,29 @@ class ReservationReconcilerTest {
     }
 
     @Test
+    void reconcileOnce_whenReservationHasFreshDurableTrade_shouldLeaveCleanupWorkerAsOwner() throws Exception {
+        OrderConfirmedEvent order = order(1);
+        TradeExecutionEntity trade = trade(order, 1);
+        when(orderBookService.scanReservations(100))
+                .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
+                        "order:reservation:" + order.getOrderId(),
+                        order,
+                        System.currentTimeMillis())));
+        when(tradeExecutionRepository
+                .findFirstByCreatedAtGreaterThanEqualAndBuyerOrderIdOrCreatedAtGreaterThanEqualAndSellerOrderIdOrderByCreatedAtDesc(
+                        any(LocalDateTime.class),
+                        eq(order.getOrderId()),
+                        any(LocalDateTime.class),
+                        eq(order.getOrderId())))
+                .thenReturn(Optional.of(trade));
+
+        reconciler(30).reconcileOnce();
+
+        verify(orderBookService, never()).completeReservedOrder(any());
+        verify(orderBookService, never()).releaseReservedOrder(any());
+    }
+
+    @Test
     void reconcileOnce_whenReservationHasPartialDurableTrade_shouldReleaseRemainingAmount() throws Exception {
         OrderConfirmedEvent order = order(3);
         TradeExecutionEntity trade = trade(order, 1);

@@ -2,7 +2,7 @@ package com.eap.eap_matchengine.application;
 
 import com.eap.common.constants.RabbitMQConstants;
 import com.eap.common.event.TradeExecutedEvent;
-import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
@@ -14,7 +14,6 @@ import java.time.Duration;
 import java.time.Instant;
 
 @Component
-@RequiredArgsConstructor
 @ConditionalOnProperty(
         name = "eap.match-engine.trade-persistence.enabled",
         havingValue = "true",
@@ -24,10 +23,28 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
     private final JdbcTemplate jdbcTemplate;
     private final TradeCompletionService tradeCompletionService;
     private final MatchingEngineMetrics metrics;
+    private final boolean outboxWriteEnabled;
+
+    public JpaTradeExecutionRecorder(
+            JdbcTemplate jdbcTemplate,
+            TradeCompletionService tradeCompletionService,
+            MatchingEngineMetrics metrics,
+            @Value("${eap.match-engine.trade-outbox.write-enabled:true}") boolean outboxWriteEnabled) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.tradeCompletionService = tradeCompletionService;
+        this.metrics = metrics;
+        this.outboxWriteEnabled = outboxWriteEnabled;
+    }
 
     @Override
     @Transactional
     public void record(TradeExecutedEvent event) {
+        record(event, null);
+    }
+
+    @Override
+    @Transactional
+    public boolean record(TradeExecutedEvent event, ReservationCleanupTask reservationCleanupTask) {
         Instant transactionStartedAt = Instant.now();
         Instant[] transactionBodyFinishedAt = new Instant[1];
         registerTransactionCompletionMetrics(transactionStartedAt, transactionBodyFinishedAt);
@@ -35,47 +52,17 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
             Instant serializeStartedAt = Instant.now();
             metrics.recordTradeRecordSerialize(Duration.between(serializeStartedAt, Instant.now()));
             Instant insertStartedAt = Instant.now();
-            int insertedOutbox;
+            int insertedTrade;
             try {
-                insertedOutbox = jdbcTemplate.update("""
-                    WITH inserted_trade AS (
-                        INSERT INTO match_engine.trade_executions
-                            (trade_id, sequence, legacy_match_id, market_id,
-                             buyer_id, seller_id, buyer_order_id, seller_order_id,
-                             buyer_market_sequence, seller_market_sequence,
-                             origin_buyer_price, origin_seller_price, deal_price, quantity, occurred_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (trade_id) DO NOTHING
-                        RETURNING trade_id
-                    )
-                    INSERT INTO match_engine.trade_outbox
-                        (event_type, aggregate_type, aggregate_id, routing_key)
-                    SELECT ?, ?, inserted_trade.trade_id, ?
-                    FROM inserted_trade
-                    """,
-                    event.getTradeId(),
-                    event.getSequence(),
-                    event.getLegacyMatchId().longValue(),
-                    event.getMarketId(),
-                    event.getBuyerId(),
-                    event.getSellerId(),
-                    event.getBuyerOrderId(),
-                    event.getSellerOrderId(),
-                    event.getBuyerMarketSequence(),
-                    event.getSellerMarketSequence(),
-                    event.getOriginBuyerPrice(),
-                    event.getOriginSellerPrice(),
-                    event.getDealPrice(),
-                    event.getQuantity(),
-                    event.getOccurredAt(),
-                    "TradeExecutedEvent",
-                    "TRADE",
-                    RabbitMQConstants.TRADE_EXECUTED_KEY);
+                insertedTrade = outboxWriteEnabled ? insertTradeAndOutbox(event) : insertTradeOnly(event);
             } finally {
                 metrics.recordTradeRecordInsert(Duration.between(insertStartedAt, Instant.now()));
             }
-            if (insertedOutbox == 0) {
+            if (insertedTrade == 0) {
                 throw new IllegalStateException("Trade already executed: tradeId=" + event.getTradeId());
+            }
+            if (reservationCleanupTask != null) {
+                insertReservationCleanupTask(reservationCleanupTask);
             }
             Instant completionMarkStartedAt = Instant.now();
             try {
@@ -88,6 +75,83 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
             metrics.recordTradeRecordTransactionBody(Duration.between(transactionStartedAt, transactionBodyFinishedAt[0]));
             recordCompletionMetricsWithoutSpringTransaction(transactionStartedAt, transactionBodyFinishedAt[0]);
         }
+        return reservationCleanupTask != null;
+    }
+
+    private int insertTradeAndOutbox(TradeExecutedEvent event) {
+        return jdbcTemplate.update("""
+            WITH inserted_trade AS (
+                INSERT INTO match_engine.trade_executions
+                    (trade_id, sequence, legacy_match_id, market_id,
+                     buyer_id, seller_id, buyer_order_id, seller_order_id,
+                     buyer_market_sequence, seller_market_sequence,
+                     origin_buyer_price, origin_seller_price, deal_price, quantity, occurred_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (trade_id) DO NOTHING
+                RETURNING trade_id
+            )
+            INSERT INTO match_engine.trade_outbox
+                (event_type, aggregate_type, aggregate_id, routing_key)
+            SELECT ?, ?, inserted_trade.trade_id, ?
+            FROM inserted_trade
+            """,
+            event.getTradeId(),
+            event.getSequence(),
+            event.getLegacyMatchId().longValue(),
+            event.getMarketId(),
+            event.getBuyerId(),
+            event.getSellerId(),
+            event.getBuyerOrderId(),
+            event.getSellerOrderId(),
+            event.getBuyerMarketSequence(),
+            event.getSellerMarketSequence(),
+            event.getOriginBuyerPrice(),
+            event.getOriginSellerPrice(),
+            event.getDealPrice(),
+            event.getQuantity(),
+            event.getOccurredAt(),
+            "TradeExecutedEvent",
+            "TRADE",
+            RabbitMQConstants.TRADE_EXECUTED_KEY);
+    }
+
+    private int insertTradeOnly(TradeExecutedEvent event) {
+        return jdbcTemplate.update("""
+            INSERT INTO match_engine.trade_executions
+                (trade_id, sequence, legacy_match_id, market_id,
+                 buyer_id, seller_id, buyer_order_id, seller_order_id,
+                 buyer_market_sequence, seller_market_sequence,
+                 origin_buyer_price, origin_seller_price, deal_price, quantity, occurred_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (trade_id) DO NOTHING
+            """,
+            event.getTradeId(),
+            event.getSequence(),
+            event.getLegacyMatchId().longValue(),
+            event.getMarketId(),
+            event.getBuyerId(),
+            event.getSellerId(),
+            event.getBuyerOrderId(),
+            event.getSellerOrderId(),
+            event.getBuyerMarketSequence(),
+            event.getSellerMarketSequence(),
+            event.getOriginBuyerPrice(),
+            event.getOriginSellerPrice(),
+            event.getDealPrice(),
+            event.getQuantity(),
+            event.getOccurredAt());
+    }
+
+    private void insertReservationCleanupTask(ReservationCleanupTask task) {
+        jdbcTemplate.update("""
+            INSERT INTO match_engine.reservation_cleanup_tasks
+                (trade_id, order_id, user_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT (trade_id) DO NOTHING
+            """,
+            task.tradeId(),
+            task.orderId(),
+            task.userId());
     }
 
     private void registerTransactionCompletionMetrics(Instant transactionStartedAt, Instant[] transactionBodyFinishedAt) {

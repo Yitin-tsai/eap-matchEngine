@@ -79,6 +79,7 @@ public class MatchingEngineService {
         int matchedAmount = Math.min(incomingOrder.getAmount(), matchOrder.getAmount());
 
         TradeExecutedEvent tradeExecutedEvent;
+        boolean reservationCleanupDeferred = false;
         try {
           Long matchId = reservedMatch.matchId();
 
@@ -90,7 +91,13 @@ public class MatchingEngineService {
               matchOrder.getPrice());
 
           tradeExecutedEvent = toTradeExecutedEvent(incomingOrder, matchOrder, isBuy, matchId, matchedAmount);
-          recordTrade(tradeExecutedEvent);
+          ReservationCleanupTask cleanupTask = matchOrderAmountBeforeMatch == matchedAmount
+              ? ReservationCleanupTask.completed(
+                  tradeExecutedEvent.getTradeId(),
+                  matchOrder.getOrderId(),
+                  matchOrder.getUserId())
+              : null;
+          reservationCleanupDeferred = recordTrade(tradeExecutedEvent, cleanupTask);
           recordedTrades++;
         } catch (RuntimeException e) {
           releaseReservedRestingOrder(matchOrder, matchOrderAmountBeforeMatch, e);
@@ -134,8 +141,13 @@ public class MatchingEngineService {
             throw new RuntimeException("Interrupted while waiting for lock", e);
           }
         } else {
-          completeReservedOrder(matchOrder);
-          log.info("Order fully matched and completed from reservation: orderId={}", matchOrder.getOrderId());
+          if (reservationCleanupDeferred) {
+            log.debug("Reserved order cleanup deferred: orderId={}, tradeId={}",
+                matchOrder.getOrderId(), tradeExecutedEvent.getTradeId());
+          } else {
+            completeReservedOrder(matchOrder);
+            log.info("Order fully matched and completed from reservation: orderId={}", matchOrder.getOrderId());
+          }
         }
       }
     } finally {
@@ -167,11 +179,12 @@ public class MatchingEngineService {
     }
   }
 
-  private void recordTrade(TradeExecutedEvent tradeExecutedEvent) {
+  private boolean recordTrade(TradeExecutedEvent tradeExecutedEvent, ReservationCleanupTask cleanupTask) {
     Instant startedAt = Instant.now();
     try {
-      tradeExecutionRecorder.record(tradeExecutedEvent);
+      boolean cleanupDeferred = tradeExecutionRecorder.record(tradeExecutedEvent, cleanupTask);
       metrics.tradeRecorded();
+      return cleanupDeferred;
     } finally {
       metrics.recordTradeRecord(Duration.between(startedAt, Instant.now()));
     }

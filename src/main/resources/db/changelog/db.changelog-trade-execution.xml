@@ -250,4 +250,60 @@
         </sql>
     </changeSet>
 
+    <changeSet id="match-trade-015" author="eap">
+        <comment>Support TradeExecuted outbox relay scans ordered by durable creation sequence</comment>
+        <sql>
+            CREATE INDEX IF NOT EXISTS idx_trade_outbox_pending_created_id
+            ON match_engine.trade_outbox(created_at, id)
+            WHERE status = 'PENDING';
+        </sql>
+    </changeSet>
+
+    <changeSet id="match-trade-016" author="eap">
+        <comment>Support checkpoint-based TradeExecuted publication from durable trade facts</comment>
+        <sql>
+            CREATE TABLE IF NOT EXISTS match_engine.trade_publish_checkpoints (
+                relay_name VARCHAR(100) PRIMARY KEY,
+                last_created_at TIMESTAMP,
+                last_trade_id VARCHAR(80) NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_trade_publish_checkpoint_attempt_non_negative
+                    CHECK (attempt_count &gt;= 0)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_trade_executions_created_trade_id
+            ON match_engine.trade_executions(created_at, trade_id);
+        </sql>
+    </changeSet>
+
+    <changeSet id="match-trade-017" author="eap">
+        <comment>Defer Redis reservation cleanup outside the MatchEngine trade hot path</comment>
+        <sql>
+            CREATE TABLE IF NOT EXISTS match_engine.reservation_cleanup_tasks (
+                id BIGSERIAL PRIMARY KEY,
+                trade_id VARCHAR(80) NOT NULL,
+                order_id UUID NOT NULL,
+                user_id UUID NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_error TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uk_reservation_cleanup_trade UNIQUE (trade_id),
+                CONSTRAINT ck_reservation_cleanup_attempt_non_negative CHECK (attempt_count &gt;= 0)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_reservation_cleanup_pending
+            ON match_engine.reservation_cleanup_tasks(next_retry_at, created_at, id)
+            WHERE status = 'PENDING';
+
+            CREATE INDEX IF NOT EXISTS idx_reservation_cleanup_processing
+            ON match_engine.reservation_cleanup_tasks(updated_at, id)
+            WHERE status = 'PROCESSING';
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

@@ -18,8 +18,11 @@ public class TradeOutboxMetrics {
     private final Counter retryScheduledTotal;
     private final Timer publishDuration;
     private final Timer selectDuration;
+    private final Timer publishStageDuration;
     private final Timer publishEnqueueDuration;
     private final Timer confirmDuration;
+    private final Timer confirmWallDuration;
+    private final Timer postConfirmMarkGapDuration;
     private final Timer markSentDuration;
     private final Timer batchDuration;
 
@@ -40,6 +43,10 @@ public class TradeOutboxMetrics {
                 registry,
                 "trade_outbox_select_duration",
                 "Time spent selecting pending TradeExecuted outbox records");
+        this.publishStageDuration = stageTimer(
+                registry,
+                "trade_outbox_publish_stage_duration",
+                "Wall-clock time spent in the TradeExecuted outbox publish stage before mark-SENT");
         this.publishEnqueueDuration = stageTimer(
                 registry,
                 "trade_outbox_publish_enqueue_duration",
@@ -48,6 +55,14 @@ public class TradeOutboxMetrics {
                 registry,
                 "trade_outbox_confirm_duration",
                 "Time spent waiting for RabbitMQ publisher confirms for TradeExecuted outbox records");
+        this.confirmWallDuration = stageTimer(
+                registry,
+                "trade_outbox_confirm_wall_duration",
+                "Batch or chunk wall-clock time spent waiting for RabbitMQ publisher confirms for TradeExecuted outbox records");
+        this.postConfirmMarkGapDuration = stageTimer(
+                registry,
+                "trade_outbox_post_confirm_mark_gap_duration",
+                "Wall-clock gap between completing TradeExecuted publisher confirms and starting mark-SENT");
         this.markSentDuration = stageTimer(
                 registry,
                 "trade_outbox_mark_sent_duration",
@@ -91,12 +106,24 @@ public class TradeOutboxMetrics {
         selectDuration.record(duration);
     }
 
+    public void recordPublishStage(Duration duration) {
+        publishStageDuration.record(duration);
+    }
+
     public void recordPublishEnqueue(Duration duration) {
         publishEnqueueDuration.record(duration);
     }
 
     public void recordConfirm(Duration duration) {
         confirmDuration.record(duration);
+    }
+
+    public void recordConfirmWall(Duration duration) {
+        confirmWallDuration.record(duration);
+    }
+
+    public void recordPostConfirmMarkGap(Duration duration) {
+        postConfirmMarkGapDuration.record(duration);
     }
 
     public void recordMarkSent(Duration duration) {

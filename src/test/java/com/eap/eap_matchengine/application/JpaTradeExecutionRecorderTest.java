@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.contains;
@@ -24,7 +25,7 @@ class JpaTradeExecutionRecorderTest {
     private final TradeCompletionService tradeCompletionService = mock(TradeCompletionService.class);
     private final MatchingEngineMetrics metrics = mock(MatchingEngineMetrics.class);
     private final JpaTradeExecutionRecorder recorder =
-            new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService, metrics);
+            new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService, metrics, true);
 
     @Test
     void record_shouldInsertTradeAndOutboxInOneStatementWithoutPreselect() {
@@ -94,6 +95,58 @@ class JpaTradeExecutionRecorderTest {
                 eq("TradeExecutedEvent"),
                 eq("TRADE"),
                 eq("trade.executed"));
+    }
+
+    @Test
+    void record_whenOutboxWriteDisabled_shouldInsertTradeFactOnly() {
+        JpaTradeExecutionRecorder checkpointRecorder =
+                new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService, metrics, false);
+        TradeExecutedEvent event = event("trade-checkpoint");
+        when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class)))
+                .thenReturn(1);
+
+        checkpointRecorder.record(event);
+
+        verify(jdbcTemplate).update(
+                contains("INSERT INTO match_engine.trade_executions"),
+                eq("trade-checkpoint"),
+                eq(1L),
+                eq(1L),
+                eq("M"),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000001")),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000002")),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000003")),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000004")),
+                eq(10L),
+                eq(20L),
+                eq(100),
+                eq(90),
+                eq(90),
+                eq(1),
+                eq(LocalDateTime.of(2026, 7, 8, 12, 0)));
+        verify(tradeCompletionService).markTradeExecuted(event);
+    }
+
+    @Test
+    void record_whenReservationCleanupTaskProvided_shouldInsertCleanupTaskInSameRecordCall() {
+        TradeExecutedEvent event = event("trade-cleanup");
+        ReservationCleanupTask cleanupTask = ReservationCleanupTask.completed(
+                "trade-cleanup",
+                UUID.fromString("00000000-0000-0000-0000-000000000004"),
+                UUID.fromString("00000000-0000-0000-0000-000000000002"));
+        when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class)))
+                .thenReturn(1);
+
+        boolean cleanupDeferred = recorder.record(event, cleanupTask);
+
+        assertThat(cleanupDeferred).isTrue();
+        verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class));
+        verify(jdbcTemplate).update(
+                contains("INSERT INTO match_engine.reservation_cleanup_tasks"),
+                eq("trade-cleanup"),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000004")),
+                eq(UUID.fromString("00000000-0000-0000-0000-000000000002")));
+        verify(tradeCompletionService).markTradeExecuted(event);
     }
 
     private TradeExecutedEvent event(String tradeId) {

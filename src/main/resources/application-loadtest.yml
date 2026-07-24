@@ -29,9 +29,17 @@ eap:
         batch-size: 50
         receive-timeout-ms: 25
     trade-outbox-relay:
-      batch-size: 500
+      enabled: ${EAP_MATCH_TRADE_OUTBOX_RELAY_ENABLED:true}
+      batch-size: ${EAP_MATCH_TRADE_OUTBOX_BATCH_SIZE:500}
       publish-concurrency: 4
       batch-confirm-enabled: ${EAP_MATCH_TRADE_OUTBOX_BATCH_CONFIRM_ENABLED:false}
+      poll-interval-ms: 100
+    trade-outbox:
+      write-enabled: ${EAP_MATCH_TRADE_OUTBOX_WRITE_ENABLED:true}
+    trade-checkpoint-relay:
+      enabled: ${EAP_MATCH_TRADE_CHECKPOINT_RELAY_ENABLED:false}
+      batch-size: ${EAP_MATCH_TRADE_CHECKPOINT_RELAY_BATCH_SIZE:500}
+      batch-confirm-enabled: ${EAP_MATCH_TRADE_CHECKPOINT_RELAY_BATCH_CONFIRM_ENABLED:false}
       poll-interval-ms: 100
     trade-completion-view:
       hot-path-enabled: false
@@ -42,6 +50,14 @@ eap:
       batch-size: 500
       poll-interval-ms: 1000
       delayed-threshold-seconds: 30
+    reservation-cleanup:
+      enabled: true
+      batch-size: ${EAP_MATCH_RESERVATION_CLEANUP_BATCH_SIZE:1000}
+      poll-interval-ms: ${EAP_MATCH_RESERVATION_CLEANUP_POLL_INTERVAL_MS:25}
+      max-attempts: 10
+      initial-backoff-ms: 100
+      max-backoff-ms: 30000
+      processing-timeout-seconds: 10
 
 logging:
   level:

@@ -30,7 +30,7 @@ class MatchingEngineServiceTest {
             matchingEngineMetrics);
 
     @Test
-    void tryMatch_whenTradePersistenceSucceeds_shouldCompleteReservedRestingOrder() throws Exception {
+    void tryMatch_whenRecorderDoesNotDeferCleanup_shouldCompleteReservedRestingOrder() throws Exception {
         OrderConfirmedEvent incomingBuy = order(
                 "BUY",
                 "00000000-0000-0000-0000-000000000021",
@@ -54,8 +54,45 @@ class MatchingEngineServiceTest {
                 trade.getTradeId().equals("TEST-MARKET-42")
                         && trade.getBuyerOrderId().equals(incomingBuy.getOrderId())
                         && trade.getSellerOrderId().equals(restingSell.getOrderId())
-                        && trade.getQuantity() == 1));
+                        && trade.getQuantity() == 1),
+                argThat(task ->
+                        task.tradeId().equals("TEST-MARKET-42")
+                                && task.orderId().equals(restingSell.getOrderId())
+                                && task.userId().equals(restingSell.getUserId())));
         verify(orderBookService).completeReservedOrder(restingSell);
+        verify(orderBookService, never()).releaseReservedOrder(any());
+        assertThat(incomingBuy.getAmount()).isZero();
+        assertThat(restingSell.getAmount()).isZero();
+    }
+
+    @Test
+    void tryMatch_whenRecorderDefersCleanup_shouldNotCompleteReservedRestingOrderSynchronously() throws Exception {
+        OrderConfirmedEvent incomingBuy = order(
+                "BUY",
+                "00000000-0000-0000-0000-000000000121",
+                "00000000-0000-0000-0000-000000000122",
+                301L,
+                1);
+        OrderConfirmedEvent restingSell = order(
+                "SELL",
+                "00000000-0000-0000-0000-000000000123",
+                "00000000-0000-0000-0000-000000000124",
+                300L,
+                1);
+
+        when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
+                .thenReturn(RedisOrderBookService.MatchOrAddResult.matched(
+                        new RedisOrderBookService.ReservedMatch(restingSell, 43L)));
+        when(tradeExecutionRecorder.record(any(TradeExecutedEvent.class), any(ReservationCleanupTask.class)))
+                .thenReturn(true);
+
+        service.tryMatch(incomingBuy);
+
+        verify(tradeExecutionRecorder).record(any(TradeExecutedEvent.class), argThat(task ->
+                task.tradeId().equals("TEST-MARKET-43")
+                        && task.orderId().equals(restingSell.getOrderId())
+                        && task.userId().equals(restingSell.getUserId())));
+        verify(orderBookService, never()).completeReservedOrder(any());
         verify(orderBookService, never()).releaseReservedOrder(any());
         assertThat(incomingBuy.getAmount()).isZero();
         assertThat(restingSell.getAmount()).isZero();
@@ -80,7 +117,7 @@ class MatchingEngineServiceTest {
                 .thenReturn(RedisOrderBookService.MatchOrAddResult.matched(
                         new RedisOrderBookService.ReservedMatch(restingSell, 42L)));
         doThrow(new IllegalStateException("db unavailable"))
-                .when(tradeExecutionRecorder).record(any(TradeExecutedEvent.class));
+                .when(tradeExecutionRecorder).record(any(TradeExecutedEvent.class), any(ReservationCleanupTask.class));
 
         assertThatThrownBy(() -> service.tryMatch(incomingBuy))
                 .isInstanceOf(IllegalStateException.class)

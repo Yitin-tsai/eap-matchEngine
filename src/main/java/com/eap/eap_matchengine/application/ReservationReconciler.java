@@ -75,6 +75,9 @@ public class ReservationReconciler {
                         reservedAt,
                         reservedOrder.getOrderId());
         if (durableTrade.isPresent()) {
+            if (!isOrphanReady(reservation)) {
+                return 0;
+            }
             return convergeDurableTradeReservation(reservation, durableTrade.get());
         }
         if (!isOrphanReady(reservation)) {
