@@ -50,6 +50,11 @@ eap:
       batch-size: 500
       poll-interval-ms: 1000
       delayed-threshold-seconds: 30
+    reservation-reconciler:
+      enabled: false
+      batch-size: 500
+      poll-interval-ms: 1000
+      orphan-threshold-seconds: 30
     reservation-cleanup:
       enabled: true
       batch-size: ${EAP_MATCH_RESERVATION_CLEANUP_BATCH_SIZE:1000}
