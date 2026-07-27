@@ -122,15 +122,20 @@ public class TradeOutboxRelay {
                                 LIMIT ?
                                 """,
                         (rs, rowNum) -> {
-                            String payload = rs.getString("payload");
-                            return new OutboxRow(
-                                    rs.getLong("id"),
-                                    rs.getString("event_type"),
-                                    rs.getString("aggregate_id"),
-                                    rs.getString("routing_key"),
-                                    payload,
-                                    payload == null || payload.isBlank() ? tradeExecutedEvent(rs) : null,
-                                    rs.getInt("attempt_count"));
+                            Instant rowMappingStartedAt = Instant.now();
+                            try {
+                                String payload = rs.getString("payload");
+                                return new OutboxRow(
+                                        rs.getLong("id"),
+                                        rs.getString("event_type"),
+                                        rs.getString("aggregate_id"),
+                                        rs.getString("routing_key"),
+                                        payload,
+                                        payload == null || payload.isBlank() ? tradeExecutedEvent(rs) : null,
+                                        rs.getInt("attempt_count"));
+                            } finally {
+                                metrics.recordRowMapping(Duration.between(rowMappingStartedAt, Instant.now()));
+                            }
                         },
                         batchSize);
             } finally {
@@ -139,6 +144,7 @@ public class TradeOutboxRelay {
             if (pending.isEmpty()) {
                 return;
             }
+            metrics.recordBatchSize(pending.size());
 
             boolean batchSucceeded = true;
             List<PublishAttempt> attempts = new ArrayList<>(pending.size());
@@ -169,9 +175,11 @@ public class TradeOutboxRelay {
             if (batchConfirmEnabled) {
                 confirmedAttempts.addAll(attempts);
             } else {
+                boolean firstConfirm = true;
                 for (PublishAttempt attempt : attempts) {
                     OutboxRow entry = attempt.entry();
                     Instant confirmStartedAt = Instant.now();
+                    Duration confirmDuration;
                     try {
                         awaitBrokerConfirmation(entry, attempt.correlationData(), confirmationDeadlineNanos);
                         confirmedAttempts.add(attempt);
@@ -186,7 +194,14 @@ public class TradeOutboxRelay {
                         recordFailure(entry, e);
                         metrics.recordPublish(Duration.between(attempt.startedAt(), Instant.now()));
                     } finally {
-                        metrics.recordConfirm(Duration.between(confirmStartedAt, Instant.now()));
+                        confirmDuration = Duration.between(confirmStartedAt, Instant.now());
+                        metrics.recordConfirm(confirmDuration);
+                        if (firstConfirm) {
+                            metrics.recordFirstConfirm(confirmDuration);
+                            firstConfirm = false;
+                        } else {
+                            metrics.recordRemainingConfirm(confirmDuration);
+                        }
                     }
                 }
             }
@@ -272,6 +287,7 @@ public class TradeOutboxRelay {
         }
         Duration perMessageDuration = confirmDuration.dividedBy(confirmedCount);
         metrics.recordConfirmWall(confirmDuration);
+        metrics.recordFirstConfirm(confirmDuration);
         for (int i = 0; i < confirmedCount; i++) {
             metrics.recordConfirm(perMessageDuration);
         }
@@ -306,14 +322,19 @@ public class TradeOutboxRelay {
     }
 
     private Message toJsonMessage(OutboxRow entry) {
-        if (!"TradeExecutedEvent".equals(entry.eventType())) {
-            throw new IllegalArgumentException("Unknown trade outbox event type: " + entry.eventType());
+        Instant startedAt = Instant.now();
+        try {
+            if (!"TradeExecutedEvent".equals(entry.eventType())) {
+                throw new IllegalArgumentException("Unknown trade outbox event type: " + entry.eventType());
+            }
+            MessageProperties properties = new MessageProperties();
+            properties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
+            properties.setContentEncoding(StandardCharsets.UTF_8.name());
+            properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+            return new Message(payload(entry).getBytes(StandardCharsets.UTF_8), properties);
+        } finally {
+            metrics.recordMessageBuild(Duration.between(startedAt, Instant.now()));
         }
-        MessageProperties properties = new MessageProperties();
-        properties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
-        properties.setContentEncoding(StandardCharsets.UTF_8.name());
-        properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
-        return new Message(payload(entry).getBytes(StandardCharsets.UTF_8), properties);
     }
 
     private String payload(OutboxRow entry) {
@@ -324,11 +345,14 @@ public class TradeOutboxRelay {
             throw new IllegalStateException("Trade outbox row cannot be published without payload or trade fact: id="
                     + entry.id() + ", aggregateId=" + entry.aggregateId());
         }
+        Instant rebuildStartedAt = Instant.now();
         try {
             return objectMapper.writeValueAsString(entry.tradeExecutedEvent());
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Failed to rebuild TradeExecutedEvent payload: id="
                     + entry.id() + ", aggregateId=" + entry.aggregateId(), e);
+        } finally {
+            metrics.recordPayloadRebuild(Duration.between(rebuildStartedAt, Instant.now()));
         }
     }
 
@@ -400,6 +424,7 @@ public class TradeOutboxRelay {
             throw new IllegalStateException(
                     "Expected to mark " + ids.size() + " trade outbox records SENT, but updated " + marked);
         }
+        metrics.recordConfirmedBatchSize(ids.size());
 
         Instant completedAt = Instant.now();
         for (PublishAttempt attempt : confirmedAttempts) {

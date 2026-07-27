@@ -22,7 +22,7 @@ public class MatchDbCeilingProbe {
     private static final String DEFAULT_JDBC_URL = "jdbc:postgresql://localhost:15434/eap_match_db";
     private static final String DEFAULT_USERNAME = "admin";
     private static final String DEFAULT_PASSWORD = "admin123";
-    private static final String TRADE_INSERT_SQL = """
+    private static final String CTE_METADATA_SQL = """
             WITH inserted_trade AS (
                 INSERT INTO match_engine.trade_executions
                     (trade_id, sequence, legacy_match_id, market_id,
@@ -34,9 +34,23 @@ public class MatchDbCeilingProbe {
                 RETURNING trade_id
             )
             INSERT INTO match_engine.trade_outbox
-                (event_type, aggregate_type, aggregate_id, routing_key, payload)
-            SELECT ?, ?, inserted_trade.trade_id, ?, ?
+                (event_type, aggregate_type, aggregate_id, routing_key)
+            SELECT ?, ?, inserted_trade.trade_id, ?
             FROM inserted_trade
+            """;
+    private static final String TRADE_ONLY_SQL = """
+            INSERT INTO match_engine.trade_executions
+                (trade_id, sequence, legacy_match_id, market_id,
+                 buyer_id, seller_id, buyer_order_id, seller_order_id,
+                 buyer_market_sequence, seller_market_sequence,
+                 origin_buyer_price, origin_seller_price, deal_price, quantity, occurred_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (trade_id) DO NOTHING
+            """;
+    private static final String OUTBOX_METADATA_SQL = """
+            INSERT INTO match_engine.trade_outbox
+                (event_type, aggregate_type, aggregate_id, routing_key)
+            VALUES (?, ?, ?, ?)
             """;
 
     public static void main(String[] args) throws Exception {
@@ -87,7 +101,15 @@ public class MatchDbCeilingProbe {
                 config.jdbcUrl(),
                 config.username(),
                 config.password());
-             PreparedStatement statement = connection.prepareStatement(TRADE_INSERT_SQL)) {
+             PreparedStatement cteStatement = config.shape() == Shape.CTE_METADATA
+                     ? connection.prepareStatement(CTE_METADATA_SQL)
+                     : null;
+             PreparedStatement tradeStatement = config.shape() != Shape.CTE_METADATA
+                     ? connection.prepareStatement(TRADE_ONLY_SQL)
+                     : null;
+             PreparedStatement outboxStatement = config.shape() == Shape.SPLIT_METADATA
+                     ? connection.prepareStatement(OUTBOX_METADATA_SQL)
+                     : null) {
             connection.setAutoCommit(config.mode() == Mode.AUTOCOMMIT);
             int uncommitted = 0;
             while (true) {
@@ -99,8 +121,8 @@ public class MatchDbCeilingProbe {
                 inFlight.acquire();
                 long rowStarted = System.nanoTime();
                 try {
-                    bindTrade(statement, config.marketId(), index + 1L);
-                    int inserted = statement.executeUpdate();
+                    long sequence = index + 1L;
+                    int inserted = executeShape(config, cteStatement, tradeStatement, outboxStatement, sequence);
                     if (inserted != 1) {
                         throw new IllegalStateException("unexpected inserted rows=" + inserted);
                     }
@@ -136,6 +158,43 @@ public class MatchDbCeilingProbe {
         }
     }
 
+    private static int executeShape(
+            Config config,
+            PreparedStatement cteStatement,
+            PreparedStatement tradeStatement,
+            PreparedStatement outboxStatement,
+            long sequence) throws SQLException {
+        return switch (config.shape()) {
+            case CTE_METADATA -> {
+                bindTradeAndOutboxCte(cteStatement, config.marketId(), sequence);
+                yield cteStatement.executeUpdate();
+            }
+            case SPLIT_METADATA -> {
+                bindTrade(tradeStatement, config.marketId(), sequence);
+                int insertedTrade = tradeStatement.executeUpdate();
+                if (insertedTrade == 1) {
+                    bindOutbox(outboxStatement, config.marketId(), sequence);
+                    outboxStatement.executeUpdate();
+                }
+                yield insertedTrade;
+            }
+            case TRADE_ONLY -> {
+                bindTrade(tradeStatement, config.marketId(), sequence);
+                yield tradeStatement.executeUpdate();
+            }
+        };
+    }
+
+    private static void bindTradeAndOutboxCte(
+            PreparedStatement statement,
+            String marketId,
+            long sequence) throws SQLException {
+        bindTrade(statement, marketId, sequence);
+        statement.setString(16, "TradeExecutedEvent");
+        statement.setString(17, "TRADE");
+        statement.setString(18, "trade.executed");
+    }
+
     private static void bindTrade(PreparedStatement statement, String marketId, long sequence) throws SQLException {
         String tradeId = marketId + "-" + sequence;
         UUID buyerId = uuid(sequence, 1);
@@ -143,7 +202,6 @@ public class MatchDbCeilingProbe {
         UUID buyerOrderId = uuid(sequence, 3);
         UUID sellerOrderId = uuid(sequence, 4);
         Timestamp occurredAt = Timestamp.valueOf(LocalDateTime.now());
-        String payload = "{\"tradeId\":\"" + tradeId + "\",\"marketId\":\"" + marketId + "\"}";
 
         statement.setString(1, tradeId);
         statement.setLong(2, sequence);
@@ -160,10 +218,13 @@ public class MatchDbCeilingProbe {
         statement.setInt(13, 100);
         statement.setInt(14, 1);
         statement.setTimestamp(15, occurredAt);
-        statement.setString(16, "TradeExecutedEvent");
-        statement.setString(17, "TRADE");
-        statement.setString(18, "trade.executed");
-        statement.setString(19, payload);
+    }
+
+    private static void bindOutbox(PreparedStatement statement, String marketId, long sequence) throws SQLException {
+        statement.setString(1, "TradeExecutedEvent");
+        statement.setString(2, "TRADE");
+        statement.setString(3, marketId + "-" + sequence);
+        statement.setString(4, "trade.executed");
     }
 
     private static UUID uuid(long sequence, long salt) {
@@ -197,6 +258,7 @@ public class MatchDbCeilingProbe {
     private static void printJson(Config config, Result result) {
         System.out.println("{");
         System.out.printf("  \"mode\": \"matchDbCeilingProbe\",%n");
+        System.out.printf("  \"shape\": \"%s\",%n", config.shape().name().toLowerCase());
         System.out.printf("  \"transactionMode\": \"%s\",%n", config.mode().name().toLowerCase());
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
         System.out.printf("  \"events\": %d,%n", config.events());
@@ -218,6 +280,12 @@ public class MatchDbCeilingProbe {
         GROUPED_TRANSACTION
     }
 
+    private enum Shape {
+        CTE_METADATA,
+        SPLIT_METADATA,
+        TRADE_ONLY
+    }
+
     private record Result(
             int completed,
             int failures,
@@ -235,10 +303,12 @@ public class MatchDbCeilingProbe {
             int events,
             int workers,
             int batchSize,
+            Shape shape,
             Mode mode) {
 
         private static Config from(String[] args) {
             Mode mode = Mode.valueOf(stringArg(args, "--mode", "transaction_per_row").toUpperCase());
+            Shape shape = Shape.valueOf(stringArg(args, "--shape", "cte_metadata").toUpperCase());
             return new Config(
                     stringArg(args, "--jdbc-url", DEFAULT_JDBC_URL),
                     stringArg(args, "--username", DEFAULT_USERNAME),
@@ -247,6 +317,7 @@ public class MatchDbCeilingProbe {
                     intArg(args, "--events", 10_000),
                     intArg(args, "--workers", 16),
                     intArg(args, "--batch-size", 100),
+                    shape,
                     mode);
         }
 

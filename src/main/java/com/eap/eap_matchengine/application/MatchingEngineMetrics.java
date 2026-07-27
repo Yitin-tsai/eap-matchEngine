@@ -74,7 +74,7 @@ public class MatchingEngineMetrics {
                 "Time spent persisting TradeExecuted and its outbox record");
         this.tradeRecordSerializeDuration = tradeRecordPhaseTimer(registry, "serialize",
                 "Time spent serializing TradeExecuted payload before persistence");
-        this.tradeRecordInsertDuration = tradeRecordPhaseTimer(registry, "insert_trade_outbox",
+        this.tradeRecordInsertDuration = tradeRecordPhaseTimer(registry, "insert_trade_execution_and_outbox",
                 "Time spent inserting TradeExecuted fact and outbox row");
         this.tradeRecordCompletionMarkDuration = tradeRecordPhaseTimer(registry, "mark_trade_executed",
                 "Time spent marking local TradeExecuted completion state");

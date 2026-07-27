@@ -19,14 +19,14 @@ public class TradeCompletionMetrics {
             TradeCompletionService tradeCompletionService,
             @Value("${eap.match-engine.trade-completion-reconciler.delayed-threshold-seconds:30}") long delayedThresholdSeconds) {
         Duration delayedThreshold = Duration.ofSeconds(delayedThresholdSeconds);
-        Gauge.builder("trade_completion_delayed", tradeCompletionService,
+        Gauge.builder("match_engine_trade_completion_delayed", tradeCompletionService,
                         service -> service.countDelayedCompletions(delayedThreshold))
                 .description("Number of incomplete trades older than the delayed completion threshold")
                 .register(registry);
-        this.delayedDetectedTotal = Counter.builder("trade_completion_delayed_detected_total")
+        this.delayedDetectedTotal = Counter.builder("match_engine_trade_completion_delayed_detected_total")
                 .description("Total delayed trade completion rows detected by reconciliation")
                 .register(registry);
-        this.repairRequeuedTotal = Counter.builder("trade_completion_repair_requeued_total")
+        this.repairRequeuedTotal = Counter.builder("match_engine_trade_completion_repair_requeued_total")
                 .description("Total TradeExecuted outbox records requeued by reconciliation")
                 .register(registry);
     }

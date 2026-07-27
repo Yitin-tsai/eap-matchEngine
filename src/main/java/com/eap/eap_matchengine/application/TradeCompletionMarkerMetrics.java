@@ -24,23 +24,23 @@ public class TradeCompletionMarkerMetrics {
         this.batchTotals = Map.of(
                 "ORDER_APPLIED", counter(
                         registry,
-                        "trade_completion_marker_batches",
+                        "match_engine_trade_completion_marker_batches",
                         "ORDER_APPLIED",
                         "Total downstream completion marker listener batches"),
                 "WALLET_SETTLED", counter(
                         registry,
-                        "trade_completion_marker_batches",
+                        "match_engine_trade_completion_marker_batches",
                         "WALLET_SETTLED",
                         "Total downstream completion marker listener batches"));
         this.eventTotals = Map.of(
                 "ORDER_APPLIED", counter(
                         registry,
-                        "trade_completion_marker_events",
+                        "match_engine_trade_completion_marker_events",
                         "ORDER_APPLIED",
                         "Total downstream completion marker events inserted"),
                 "WALLET_SETTLED", counter(
                         registry,
-                        "trade_completion_marker_events",
+                        "match_engine_trade_completion_marker_events",
                         "WALLET_SETTLED",
                         "Total downstream completion marker events inserted"));
         this.batchSizes = Map.of(
@@ -96,14 +96,14 @@ public class TradeCompletionMarkerMetrics {
     }
 
     private DistributionSummary batchSize(MeterRegistry registry, String markerType) {
-        return DistributionSummary.builder("trade_completion_marker_batch_size")
+        return DistributionSummary.builder("match_engine_trade_completion_marker_batch_size")
                 .tag("marker_type", markerType)
                 .description("Number of downstream completion marker events inserted per listener batch")
                 .register(registry);
     }
 
     private Timer insertDuration(MeterRegistry registry, String markerType) {
-        return Timer.builder("trade_completion_marker_insert_duration")
+        return Timer.builder("match_engine_trade_completion_marker_insert_duration")
                 .tag("marker_type", markerType)
                 .description("Time spent inserting downstream completion markers")
                 .publishPercentileHistogram()
@@ -111,7 +111,7 @@ public class TradeCompletionMarkerMetrics {
     }
 
     private Timer listenerDuration(MeterRegistry registry, String markerType) {
-        return Timer.builder("trade_completion_marker_listener_duration")
+        return Timer.builder("match_engine_trade_completion_marker_listener_duration")
                 .tag("marker_type", markerType)
                 .description("Wall-clock time spent in downstream completion marker listener batches")
                 .publishPercentileHistogram()

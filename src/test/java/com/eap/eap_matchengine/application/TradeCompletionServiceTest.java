@@ -146,20 +146,20 @@ class TradeCompletionServiceTest {
         meteredService.markOrderAppliedBatch(List.of(event1, event2));
 
         verify(jdbcTemplate).execute(any(ConnectionCallback.class));
-        assertThat(registry.get("trade_completion_marker_batches")
+        assertThat(registry.get("match_engine_trade_completion_marker_batches")
                 .tag("marker_type", "ORDER_APPLIED")
                 .counter()
                 .count()).isEqualTo(1.0);
-        assertThat(registry.get("trade_completion_marker_events")
+        assertThat(registry.get("match_engine_trade_completion_marker_events")
                 .tag("marker_type", "ORDER_APPLIED")
                 .counter()
                 .count()).isEqualTo(2.0);
-        assertThat(registry.get("trade_completion_marker_insert_duration")
+        assertThat(registry.get("match_engine_trade_completion_marker_insert_duration")
                 .tag("marker_type", "ORDER_APPLIED")
                 .timer()
                 .count()).isEqualTo(1);
         metrics.recordListener("ORDER_APPLIED", java.time.Duration.ofMillis(5));
-        assertThat(registry.get("trade_completion_marker_listener_duration")
+        assertThat(registry.get("match_engine_trade_completion_marker_listener_duration")
                 .tag("marker_type", "ORDER_APPLIED")
                 .timer()
                 .count()).isEqualTo(1);

@@ -52,6 +52,10 @@ class TradeOutboxRelayTest {
         verify(namedJdbcTemplate).update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class));
         verify(metrics).published();
         verify(metrics).recordPublish(any(Duration.class));
+        verify(metrics).recordBatchSize(1);
+        verify(metrics).recordConfirmedBatchSize(1);
+        verify(metrics).recordMessageBuild(any(Duration.class));
+        verify(metrics).recordRowMapping(any(Duration.class));
     }
 
     @Test
@@ -155,6 +159,8 @@ class TradeOutboxRelayTest {
 
         verify(namedJdbcTemplate).update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class));
         verify(metrics).published();
+        verify(metrics).recordPayloadRebuild(any(Duration.class));
+        verify(metrics).recordMessageBuild(any(Duration.class));
     }
 
     private TradeOutboxRelay relay() {
