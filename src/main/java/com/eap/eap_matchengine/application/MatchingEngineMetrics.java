@@ -15,6 +15,7 @@ public class MatchingEngineMetrics {
     private final Timer tryMatchFullyMatchedDuration;
     private final Timer tryMatchMatchedWithRemainderDuration;
     private final Timer tryMatchNoOpDuration;
+    private final Timer orderConfirmedListenerDuration;
     private final Timer reserveDuration;
     private final Timer reservePrepareDuration;
     private final Timer reserveCallbackPrepareDuration;
@@ -52,6 +53,8 @@ public class MatchingEngineMetrics {
                 "Wall-clock time spent handling an OrderConfirmed event that matched at least once and left remaining quantity");
         this.tryMatchNoOpDuration = tryMatchOutcomeTimer(registry, "no_op",
                 "Wall-clock time spent handling an OrderConfirmed event that produced no orderbook change");
+        this.orderConfirmedListenerDuration = timer(registry, "match_engine_order_confirmed_listener_duration",
+                "Wall-clock time spent inside the MatchEngine OrderConfirmed Rabbit listener");
         this.reserveDuration = timer(registry, "match_engine_reserve_order_duration",
                 "Time spent reserving the best resting order from Redis");
         this.reservePrepareDuration = reservePhaseTimer(registry, "prepare",
@@ -119,6 +122,10 @@ public class MatchingEngineMetrics {
             case "matched_with_remainder" -> tryMatchMatchedWithRemainderDuration.record(duration);
             default -> tryMatchNoOpDuration.record(duration);
         }
+    }
+
+    void recordOrderConfirmedListener(Duration duration) {
+        orderConfirmedListenerDuration.record(duration);
     }
 
     void recordReserve(Duration duration) {
