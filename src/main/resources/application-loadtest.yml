@@ -15,8 +15,19 @@ spring:
         concurrency: 8
         max-concurrency: 32
         prefetch: 50
+  data:
+    redis:
+      lettuce:
+        pool:
+          enabled: ${EAP_REDIS_LETTUCE_POOL_ENABLED:false}
+          max-active: ${EAP_REDIS_LETTUCE_POOL_MAX_ACTIVE:64}
+          max-idle: ${EAP_REDIS_LETTUCE_POOL_MAX_IDLE:64}
+          min-idle: ${EAP_REDIS_LETTUCE_POOL_MIN_IDLE:16}
+          max-wait: ${EAP_REDIS_LETTUCE_POOL_MAX_WAIT:500ms}
 
 eap:
+  redis:
+    share-native-connection: ${EAP_REDIS_SHARE_NATIVE_CONNECTION:true}
   match-engine:
     listeners:
       order-confirmed:
