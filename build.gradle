@@ -59,6 +59,21 @@ tasks.named("generateContractTests") {
 
 tasks.named('test') {
     useJUnitPlatform()
+    systemProperty 'eap.integration.crash-recovery',
+            System.getProperty('eap.integration.crash-recovery', 'false')
+}
+
+tasks.register('crashRecoveryIntegrationTest', Test) {
+    group = 'verification'
+    description = 'Run PostgreSQL/Redis MatchEngine crash-window recovery integration tests.'
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    systemProperty 'eap.integration.crash-recovery', 'true'
+    // Docker Engine 29 rejects the legacy API version used during docker-java discovery.
+    systemProperty 'api.version', System.getProperty('api.version', '1.40')
+    include '**/*CrashRecoveryPostgresRedisIT.class'
+    shouldRunAfter tasks.named('test')
 }
 
 tasks.register('matchEngineCoreLoadTest', JavaExec) {

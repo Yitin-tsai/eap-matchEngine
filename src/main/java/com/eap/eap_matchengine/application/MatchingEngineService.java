@@ -51,6 +51,18 @@ public class MatchingEngineService {
    * @param incomingOrder The new order to be matched
    */
   public void tryMatch(OrderConfirmedEvent incomingOrder) {
+    tryMatch(incomingOrder, null);
+  }
+
+  GuardedMatchResult tryMatchGuarded(
+      OrderConfirmedEvent incomingOrder,
+      IncomingOrderProcessingStore.Claim processingClaim) {
+    return tryMatch(incomingOrder, processingClaim);
+  }
+
+  private GuardedMatchResult tryMatch(
+      OrderConfirmedEvent incomingOrder,
+      IncomingOrderProcessingStore.Claim processingClaim) {
     Instant tryMatchStartedAt = Instant.now();
     boolean addedToBook = false;
     int recordedTrades = 0;
@@ -60,7 +72,17 @@ public class MatchingEngineService {
       while (incomingOrder.getAmount() > 0) {
         // Reserve the resting order before writing the durable trade fact. If no match exists,
         // Redis adds the incoming order in the same Lua call to avoid a second no-match round trip.
-        RedisOrderBookService.MatchOrAddResult matchAttempt = reserveBestMatchOrAddOrder(incomingOrder);
+        RedisOrderBookService.MatchOrAddResult matchAttempt =
+            reserveBestMatchOrAddOrder(incomingOrder, processingClaim);
+
+        if (matchAttempt.incomingOrderAdmission()
+            == RedisOrderBookService.IncomingOrderAdmission.DUPLICATE) {
+          return GuardedMatchResult.DUPLICATE;
+        }
+        if (matchAttempt.incomingOrderAdmission()
+            == RedisOrderBookService.IncomingOrderAdmission.IN_PROGRESS) {
+          return GuardedMatchResult.IN_PROGRESS;
+        }
 
         if (matchAttempt.orderAdded()) {
           addedToBook = true;
@@ -150,6 +172,7 @@ public class MatchingEngineService {
           }
         }
       }
+      return GuardedMatchResult.PROCESSED;
     } finally {
       Duration duration = Duration.between(tryMatchStartedAt, Instant.now());
       metrics.recordTryMatch(duration);
@@ -170,13 +193,23 @@ public class MatchingEngineService {
     return "no_op";
   }
 
-  private RedisOrderBookService.MatchOrAddResult reserveBestMatchOrAddOrder(OrderConfirmedEvent incomingOrder) {
+  private RedisOrderBookService.MatchOrAddResult reserveBestMatchOrAddOrder(
+      OrderConfirmedEvent incomingOrder,
+      IncomingOrderProcessingStore.Claim processingClaim) {
     Instant startedAt = Instant.now();
     try {
-      return orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingOrder);
+      return processingClaim == null
+          ? orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingOrder)
+          : orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingOrder, processingClaim);
     } finally {
       metrics.recordReserve(Duration.between(startedAt, Instant.now()));
     }
+  }
+
+  enum GuardedMatchResult {
+    PROCESSED,
+    DUPLICATE,
+    IN_PROGRESS
   }
 
   private boolean recordTrade(TradeExecutedEvent tradeExecutedEvent, ReservationCleanupTask cleanupTask) {

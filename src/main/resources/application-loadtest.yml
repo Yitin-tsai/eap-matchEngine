@@ -4,17 +4,17 @@ spring:
     username: admin
     password: admin123
     hikari:
-      maximum-pool-size: 35
-      minimum-idle: 10
+      maximum-pool-size: ${EAP_MATCH_DB_POOL_SIZE:35}
+      minimum-idle: ${EAP_MATCH_DB_POOL_MIN_IDLE:10}
   rabbitmq:
     cache:
       channel:
         size: 128
     listener:
       simple:
-        concurrency: 8
-        max-concurrency: 32
-        prefetch: 50
+        concurrency: ${EAP_MATCH_RABBIT_CONCURRENCY:8}
+        max-concurrency: ${EAP_MATCH_RABBIT_MAX_CONCURRENCY:32}
+        prefetch: ${EAP_MATCH_RABBIT_PREFETCH:50}
   data:
     redis:
       lettuce:
@@ -31,20 +31,20 @@ eap:
   match-engine:
     listeners:
       order-confirmed:
-        concurrency: 12
+        concurrency: ${EAP_MATCH_ORDER_CONFIRMED_CONCURRENCY:12}
       order-trade-applied:
-        concurrency: 12
+        concurrency: ${EAP_MATCH_ORDER_TRADE_APPLIED_CONCURRENCY:12}
       wallet-trade-settled:
-        concurrency: 6
+        concurrency: ${EAP_MATCH_WALLET_TRADE_SETTLED_CONCURRENCY:6}
       completion-marker:
-        batch-size: 50
-        receive-timeout-ms: 25
+        batch-size: ${EAP_MATCH_COMPLETION_MARKER_BATCH_SIZE:50}
+        receive-timeout-ms: ${EAP_MATCH_COMPLETION_MARKER_RECEIVE_TIMEOUT_MS:25}
     trade-outbox-relay:
       enabled: ${EAP_MATCH_TRADE_OUTBOX_RELAY_ENABLED:true}
       batch-size: ${EAP_MATCH_TRADE_OUTBOX_BATCH_SIZE:500}
-      publish-concurrency: 4
+      publish-concurrency: ${EAP_MATCH_TRADE_OUTBOX_PUBLISH_CONCURRENCY:4}
       batch-confirm-enabled: ${EAP_MATCH_TRADE_OUTBOX_BATCH_CONFIRM_ENABLED:false}
-      poll-interval-ms: 100
+      poll-interval-ms: ${EAP_MATCH_TRADE_OUTBOX_POLL_INTERVAL_MS:100}
     trade-outbox:
       write-enabled: ${EAP_MATCH_TRADE_OUTBOX_WRITE_ENABLED:true}
     trade-checkpoint-relay:
@@ -53,27 +53,28 @@ eap:
       batch-confirm-enabled: ${EAP_MATCH_TRADE_CHECKPOINT_RELAY_BATCH_CONFIRM_ENABLED:false}
       poll-interval-ms: 100
     trade-completion-view:
-      hot-path-enabled: false
+      hot-path-enabled: ${EAP_MATCH_TRADE_COMPLETION_HOT_PATH_ENABLED:false}
     orderbook:
       user-open-order-index-enabled: ${EAP_MATCH_USER_OPEN_ORDER_INDEX_ENABLED:true}
     trade-completion-reconciler:
-      enabled: false
-      batch-size: 500
-      poll-interval-ms: 1000
+      enabled: ${EAP_MATCH_TRADE_COMPLETION_RECONCILER_ENABLED:false}
+      batch-size: ${EAP_MATCH_TRADE_COMPLETION_RECONCILER_BATCH_SIZE:500}
+      poll-interval-ms: ${EAP_MATCH_TRADE_COMPLETION_RECONCILER_POLL_INTERVAL_MS:1000}
       delayed-threshold-seconds: 30
     reservation-reconciler:
-      enabled: false
-      batch-size: 500
-      poll-interval-ms: 1000
+      enabled: ${EAP_MATCH_RESERVATION_RECONCILER_ENABLED:false}
+      batch-size: ${EAP_MATCH_RESERVATION_RECONCILER_BATCH_SIZE:500}
+      poll-interval-ms: ${EAP_MATCH_RESERVATION_RECONCILER_POLL_INTERVAL_MS:1000}
       orphan-threshold-seconds: 30
     reservation-cleanup:
       enabled: true
       batch-size: ${EAP_MATCH_RESERVATION_CLEANUP_BATCH_SIZE:1000}
       poll-interval-ms: ${EAP_MATCH_RESERVATION_CLEANUP_POLL_INTERVAL_MS:25}
       max-attempts: 10
-      initial-backoff-ms: 100
-      max-backoff-ms: 30000
-      processing-timeout-seconds: 10
+      initial-backoff-ms: ${EAP_MATCH_RESERVATION_CLEANUP_INITIAL_BACKOFF_MS:100}
+      max-backoff-ms: ${EAP_MATCH_RESERVATION_CLEANUP_MAX_BACKOFF_MS:30000}
+      processing-timeout-seconds: ${EAP_MATCH_RESERVATION_CLEANUP_PROCESSING_TIMEOUT_SECONDS:10}
+      lease-renewal-chunk-size: ${EAP_MATCH_RESERVATION_CLEANUP_LEASE_CHUNK_SIZE:50}
 
 logging:
   level:

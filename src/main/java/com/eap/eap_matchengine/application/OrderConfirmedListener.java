@@ -17,7 +17,7 @@ import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONF
 @Slf4j
 public class OrderConfirmedListener {
 
-    private final MatchingEngineService matchingEngineService;
+    private final OrderConfirmedProcessor orderConfirmedProcessor;
     private final MatchingEngineMetrics metrics;
 
     /**
@@ -34,7 +34,7 @@ public class OrderConfirmedListener {
                     event.getOrderId(), event.getUserId(), event.getOrderType(),
                     event.getPrice(), event.getAmount());
 
-            matchingEngineService.tryMatch(event);
+            orderConfirmedProcessor.process(event);
         } finally {
             metrics.recordOrderConfirmedListener(Duration.between(startedAt, Instant.now()));
         }

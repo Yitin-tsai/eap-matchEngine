@@ -102,6 +102,44 @@ class RedisOrderBookServiceTest {
     }
 
     @Test
+    void reserveBestMatchOrAddOrderWithSequenceLua_whenGuardFindsCompletedOrder_shouldReturnDuplicate() {
+        doReturn(List.of("__DUPLICATE__".getBytes(StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+        IncomingOrderProcessingStore.Claim claim = new IncomingOrderProcessingStore.Claim(
+                "match:incoming-order:states:00",
+                incomingBuyOrder().getOrderId().toString(),
+                "token",
+                "match:incoming-order:completed:TEST:0",
+                100L);
+
+        RedisOrderBookService.MatchOrAddResult result =
+                service.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuyOrder(), claim);
+
+        assertThat(result.incomingOrderAdmission())
+                .isEqualTo(RedisOrderBookService.IncomingOrderAdmission.DUPLICATE);
+        assertThat(result.reservedMatch()).isNull();
+    }
+
+    @Test
+    void reserveBestMatchOrAddOrderWithSequenceLua_whenAnotherAttemptOwnsOrder_shouldReturnInProgress() {
+        doReturn(List.of("__IN_PROGRESS__".getBytes(StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+        IncomingOrderProcessingStore.Claim claim = new IncomingOrderProcessingStore.Claim(
+                "match:incoming-order:states:00",
+                incomingBuyOrder().getOrderId().toString(),
+                "token",
+                "match:incoming-order:completed:TEST:0",
+                100L);
+
+        RedisOrderBookService.MatchOrAddResult result =
+                service.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuyOrder(), claim);
+
+        assertThat(result.incomingOrderAdmission())
+                .isEqualTo(RedisOrderBookService.IncomingOrderAdmission.IN_PROGRESS);
+        assertThat(result.reservedMatch()).isNull();
+    }
+
+    @Test
     void reserveBestMatchOrAddOrderWithSequenceLua_whenUserIndexDisabled_shouldPassDisabledFlagToLua() {
         RedisConnection connection = mock(RedisConnection.class);
         RedisOrderBookService serviceWithoutUserIndex =

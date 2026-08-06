@@ -3,6 +3,7 @@ package com.eap.eap_matchengine;
 import org.junit.jupiter.api.Test;
 import org.redisson.api.RedissonClient;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 /**
@@ -14,6 +15,9 @@ class EapMatchengineApplicationTests {
 
 	@MockitoBean
 	private RedissonClient redissonClient;
+
+	@MockitoBean
+	private RedisTemplate<String, String> redisTemplate;
 
 	@Test
 	void contextLoads() {

@@ -446,6 +446,12 @@ public class RedisOrderBookService {
      * observed null, and then ran add_order.lua.
      */
     public MatchOrAddResult reserveBestMatchOrAddOrderWithSequenceLua(OrderConfirmedEvent incomingOrder) {
+        return reserveBestMatchOrAddOrderWithSequenceLua(incomingOrder, null);
+    }
+
+    MatchOrAddResult reserveBestMatchOrAddOrderWithSequenceLua(
+            OrderConfirmedEvent incomingOrder,
+            IncomingOrderProcessingStore.Claim processingClaim) {
         Instant prepareStartedAt = Instant.now();
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
         String oppositeOrderbookKey = isBuy
@@ -471,19 +477,26 @@ public class RedisOrderBookService {
             recordReserveSerializeIncoming(Duration.between(serializeStartedAt, Instant.now()));
         }
 
-        List<String> keys = List.of(
-                oppositeOrderbookKey,
-                ownOrderbookKey,
-                incomingOrderIdKey,
-                incomingUserOrdersKey,
-                MATCH_ID_KEY);
-        List<String> args = List.of(
-                String.valueOf(priceBoundary),
-                String.valueOf(Instant.now().toEpochMilli()),
-                incomingOrder.getOrderId().toString(),
-                String.valueOf(scoreFor(incomingOrder)),
-                incomingOrderJson,
-                userOpenOrderIndexEnabledArg());
+        List<String> keys = new ArrayList<>(7);
+        keys.add(oppositeOrderbookKey);
+        keys.add(ownOrderbookKey);
+        keys.add(incomingOrderIdKey);
+        keys.add(incomingUserOrdersKey);
+        keys.add(MATCH_ID_KEY);
+        List<String> args = new ArrayList<>(9);
+        args.add(String.valueOf(priceBoundary));
+        args.add(String.valueOf(Instant.now().toEpochMilli()));
+        args.add(incomingOrder.getOrderId().toString());
+        args.add(String.valueOf(scoreFor(incomingOrder)));
+        args.add(incomingOrderJson);
+        args.add(userOpenOrderIndexEnabledArg());
+        if (processingClaim != null) {
+            keys.add(processingClaim.stateHashKey());
+            keys.add(processingClaim.completedBitmapKey());
+            args.add(processingClaim.orderIdField());
+            args.add(processingClaim.token());
+            args.add(String.valueOf(processingClaim.completedBitOffset()));
+        }
 
         @SuppressWarnings("unchecked")
         List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
@@ -520,6 +533,12 @@ public class RedisOrderBookService {
         if ("__ADDED__".equals(status)) {
             log.debug("No matching order found; added incoming order {} to orderbook", incomingOrder.getOrderId());
             return MatchOrAddResult.added();
+        }
+        if ("__DUPLICATE__".equals(status)) {
+            return MatchOrAddResult.duplicate();
+        }
+        if ("__IN_PROGRESS__".equals(status)) {
+            return MatchOrAddResult.inProgress();
         }
         if (status.startsWith(MISSING_ORDER_DETAIL_PREFIX)) {
             String missingOrderId = status.substring(MISSING_ORDER_DETAIL_PREFIX.length());
@@ -559,13 +578,30 @@ public class RedisOrderBookService {
     public record ReservedMatch(OrderConfirmedEvent order, Long matchId) {
     }
 
-    public record MatchOrAddResult(boolean orderAdded, ReservedMatch reservedMatch) {
+    public enum IncomingOrderAdmission {
+        CLAIMED,
+        DUPLICATE,
+        IN_PROGRESS
+    }
+
+    public record MatchOrAddResult(
+            boolean orderAdded,
+            ReservedMatch reservedMatch,
+            IncomingOrderAdmission incomingOrderAdmission) {
         public static MatchOrAddResult added() {
-            return new MatchOrAddResult(true, null);
+            return new MatchOrAddResult(true, null, IncomingOrderAdmission.CLAIMED);
         }
 
         public static MatchOrAddResult matched(ReservedMatch reservedMatch) {
-            return new MatchOrAddResult(false, reservedMatch);
+            return new MatchOrAddResult(false, reservedMatch, IncomingOrderAdmission.CLAIMED);
+        }
+
+        public static MatchOrAddResult duplicate() {
+            return new MatchOrAddResult(false, null, IncomingOrderAdmission.DUPLICATE);
+        }
+
+        public static MatchOrAddResult inProgress() {
+            return new MatchOrAddResult(false, null, IncomingOrderAdmission.IN_PROGRESS);
         }
     }
 

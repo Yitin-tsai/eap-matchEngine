@@ -10,6 +10,8 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -29,6 +31,7 @@ public class ReservationCleanupWorker {
     private final long initialBackoffMs;
     private final long maxBackoffMs;
     private final long processingTimeoutSeconds;
+    private final int leaseRenewalChunkSize;
 
     public ReservationCleanupWorker(
             JdbcTemplate jdbcTemplate,
@@ -38,7 +41,8 @@ public class ReservationCleanupWorker {
             @Value("${eap.match-engine.reservation-cleanup.max-attempts:10}") int maxAttempts,
             @Value("${eap.match-engine.reservation-cleanup.initial-backoff-ms:1000}") long initialBackoffMs,
             @Value("${eap.match-engine.reservation-cleanup.max-backoff-ms:300000}") long maxBackoffMs,
-            @Value("${eap.match-engine.reservation-cleanup.processing-timeout-seconds:30}") long processingTimeoutSeconds) {
+            @Value("${eap.match-engine.reservation-cleanup.processing-timeout-seconds:30}") long processingTimeoutSeconds,
+            @Value("${eap.match-engine.reservation-cleanup.lease-renewal-chunk-size:50}") int leaseRenewalChunkSize) {
         this.jdbcTemplate = jdbcTemplate;
         this.orderBookService = orderBookService;
         this.metrics = metrics;
@@ -47,6 +51,7 @@ public class ReservationCleanupWorker {
         this.initialBackoffMs = initialBackoffMs;
         this.maxBackoffMs = maxBackoffMs;
         this.processingTimeoutSeconds = processingTimeoutSeconds;
+        this.leaseRenewalChunkSize = Math.max(1, leaseRenewalChunkSize);
     }
 
     @Scheduled(fixedDelayString = "${eap.match-engine.reservation-cleanup.poll-interval-ms:100}")
@@ -61,20 +66,47 @@ public class ReservationCleanupWorker {
             return 0;
         }
 
-        for (CleanupRow task : tasks) {
-            Instant redisStartedAt = Instant.now();
-            try {
-                orderBookService.completeReservedOrder(toOrder(task));
-                markCompleted(task.id());
-                metrics.completed(1);
-            } catch (Exception e) {
-                recordFailure(task, e);
-            } finally {
-                metrics.recordRedisCleanup(Duration.between(redisStartedAt, Instant.now()));
+        int completedCount = 0;
+        for (int start = 0; start < tasks.size(); start += leaseRenewalChunkSize) {
+            int end = Math.min(start + leaseRenewalChunkSize, tasks.size());
+            List<CleanupRow> chunk = tasks.subList(start, end);
+            renewLeases(chunk.stream().map(CleanupRow::id).toList());
+
+            List<Long> completedTaskIds = new ArrayList<>(chunk.size());
+            for (CleanupRow task : chunk) {
+                Instant redisStartedAt = Instant.now();
+                try {
+                    orderBookService.completeReservedOrder(toOrder(task));
+                    completedTaskIds.add(task.id());
+                } catch (Exception e) {
+                    recordFailure(task, e);
+                } finally {
+                    metrics.recordRedisCleanup(Duration.between(redisStartedAt, Instant.now()));
+                }
             }
+            markCompleted(completedTaskIds);
+            completedCount += completedTaskIds.size();
         }
+        metrics.completed(completedCount);
         metrics.recordBatch(Duration.between(batchStartedAt, Instant.now()));
         return tasks.size();
+    }
+
+    void renewLeases(List<Long> ids) {
+        if (ids.isEmpty()) {
+            return;
+        }
+        String placeholders = String.join(", ", Collections.nCopies(ids.size(), "?"));
+        int updated = jdbcTemplate.update("""
+                UPDATE match_engine.reservation_cleanup_tasks
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE id IN (%s)
+                  AND status = 'PROCESSING'
+                """.formatted(placeholders), ids.toArray());
+        if (updated != ids.size()) {
+            throw new IllegalStateException("Expected to renew " + ids.size()
+                    + " reservation cleanup leases, but updated " + updated);
+        }
     }
 
     private List<CleanupRow> claimTasks() {
@@ -113,17 +145,25 @@ public class ReservationCleanupWorker {
         }
     }
 
-    private void markCompleted(long id) {
+    void markCompleted(List<Long> ids) {
+        if (ids.isEmpty()) {
+            return;
+        }
         Instant startedAt = Instant.now();
         try {
-            jdbcTemplate.update("""
+            String placeholders = String.join(", ", Collections.nCopies(ids.size(), "?"));
+            int updated = jdbcTemplate.update("""
                     UPDATE match_engine.reservation_cleanup_tasks
                     SET status = 'COMPLETED',
                         last_error = NULL,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id IN (%s)
                       AND status = 'PROCESSING'
-                    """, id);
+                    """.formatted(placeholders), ids.toArray());
+            if (updated != ids.size()) {
+                throw new IllegalStateException("Expected to complete " + ids.size()
+                        + " reservation cleanup tasks, but updated " + updated);
+            }
         } finally {
             metrics.recordMarkCompleted(Duration.between(startedAt, Instant.now()));
         }
@@ -181,7 +221,7 @@ public class ReservationCleanupWorker {
                 .build();
     }
 
-    private record CleanupRow(
+    record CleanupRow(
             long id,
             String tradeId,
             UUID orderId,

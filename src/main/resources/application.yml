@@ -99,6 +99,7 @@ eap:
       initial-backoff-ms: 1000
       max-backoff-ms: 300000
       processing-timeout-seconds: 30
+      lease-renewal-chunk-size: 50
 
 management:
   endpoints:
