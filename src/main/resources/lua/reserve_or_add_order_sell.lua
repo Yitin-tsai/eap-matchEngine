@@ -19,6 +19,7 @@
 -- ARGV[7]: incoming order state Hash field (guarded processing only)
 -- ARGV[8]: this processing attempt's token (guarded processing only)
 -- ARGV[9]: completed bitmap bit offset (guarded processing only)
+-- ARGV[10]: market ID used to correlate the reservation with its durable trade
 --
 -- Returns:
 --   {'__MATCH__', resting order JSON, match ID}
@@ -90,7 +91,11 @@ end
 local match_id = redis.call('INCR', sequence_key)
 
 redis.call('ZREM', buy_orderbook_key, resting_order_id)
-local reservation_json = '{"reservedAtEpochMillis":' .. reserved_at .. ',"orderId":"' .. resting_order_id .. '"}'
+local reservation_json = cjson.encode({
+    reservedAtEpochMillis = reserved_at,
+    orderId = resting_order_id,
+    tradeId = ARGV[10] .. '-' .. tostring(match_id)
+})
 local reserved = redis.call('SET', reservation_key, reservation_json, 'NX')
 if not reserved then
     return {'__RESERVATION_EXISTS__:' .. resting_order_id}

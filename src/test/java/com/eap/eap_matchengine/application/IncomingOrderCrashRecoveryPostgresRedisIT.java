@@ -36,8 +36,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
                 "spring.liquibase.enabled=true",
                 "eap.match-engine.trade-outbox-relay.enabled=false",
                 "eap.match-engine.trade-checkpoint-relay.enabled=false",
-                "eap.match-engine.trade-completion-view.hot-path-enabled=false",
-                "eap.match-engine.trade-completion-reconciler.enabled=false",
                 "eap.match-engine.reservation-reconciler.enabled=false",
                 "eap.match-engine.reservation-cleanup.enabled=false"
         })
@@ -95,8 +93,6 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                 TRUNCATE TABLE
                     match_engine.reservation_cleanup_tasks,
                     match_engine.trade_outbox,
-                    match_engine.trade_completion_markers,
-                    match_engine.trade_completion_view,
                     match_engine.trade_executions
                 RESTART IDENTITY CASCADE
                 """);
@@ -122,6 +118,33 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         assertThat(visibleAmount(resting)).isEqualTo(1);
         assertThat(processingStore.state(INCOMING_ORDER_ID)).isNull();
         assertThat(processingStore.isCompleted(incoming)).isTrue();
+    }
+
+    @Test
+    void staleCleanup_shouldNotDeleteNewerReservationForSameOrder() throws Exception {
+        OrderConfirmedEvent resting = order("BUY", 611, 1L, 1);
+        OrderConfirmedEvent firstIncoming = order("SELL", 612, 2L, 1);
+        OrderConfirmedEvent secondIncoming = order("SELL", 613, 3L, 1);
+        orderBookService.addOrder(resting);
+
+        RedisOrderBookService.ReservedMatch firstReservation =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(firstIncoming).reservedMatch();
+        String firstTradeId = MARKET_ID + "-" + firstReservation.matchId();
+        orderBookService.releaseReservedOrder(resting, firstTradeId);
+
+        RedisOrderBookService.ReservedMatch secondReservation =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(secondIncoming).reservedMatch();
+        String secondTradeId = MARKET_ID + "-" + secondReservation.matchId();
+        assertThat(secondTradeId).isNotEqualTo(firstTradeId);
+        assertThat(orderBookService.scanReservations(10).get(0).tradeId()).isEqualTo(secondTradeId);
+
+        orderBookService.completeReservedOrder(resting, firstTradeId);
+
+        assertThat(orderBookService.countActiveReservations()).isEqualTo(1);
+        assertThat(orderBookService.scanReservations(10).get(0).tradeId()).isEqualTo(secondTradeId);
+
+        orderBookService.completeReservedOrder(resting, secondTradeId);
+        assertThat(orderBookService.countActiveReservations()).isZero();
     }
 
     @Test

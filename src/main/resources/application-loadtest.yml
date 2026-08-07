@@ -32,13 +32,6 @@ eap:
     listeners:
       order-confirmed:
         concurrency: ${EAP_MATCH_ORDER_CONFIRMED_CONCURRENCY:12}
-      order-trade-applied:
-        concurrency: ${EAP_MATCH_ORDER_TRADE_APPLIED_CONCURRENCY:12}
-      wallet-trade-settled:
-        concurrency: ${EAP_MATCH_WALLET_TRADE_SETTLED_CONCURRENCY:6}
-      completion-marker:
-        batch-size: ${EAP_MATCH_COMPLETION_MARKER_BATCH_SIZE:50}
-        receive-timeout-ms: ${EAP_MATCH_COMPLETION_MARKER_RECEIVE_TIMEOUT_MS:25}
     trade-outbox-relay:
       enabled: ${EAP_MATCH_TRADE_OUTBOX_RELAY_ENABLED:true}
       batch-size: ${EAP_MATCH_TRADE_OUTBOX_BATCH_SIZE:500}
@@ -52,17 +45,10 @@ eap:
       batch-size: ${EAP_MATCH_TRADE_CHECKPOINT_RELAY_BATCH_SIZE:500}
       batch-confirm-enabled: ${EAP_MATCH_TRADE_CHECKPOINT_RELAY_BATCH_CONFIRM_ENABLED:false}
       poll-interval-ms: 100
-    trade-completion-view:
-      hot-path-enabled: ${EAP_MATCH_TRADE_COMPLETION_HOT_PATH_ENABLED:false}
     orderbook:
       user-open-order-index-enabled: ${EAP_MATCH_USER_OPEN_ORDER_INDEX_ENABLED:true}
-    trade-completion-reconciler:
-      enabled: ${EAP_MATCH_TRADE_COMPLETION_RECONCILER_ENABLED:false}
-      batch-size: ${EAP_MATCH_TRADE_COMPLETION_RECONCILER_BATCH_SIZE:500}
-      poll-interval-ms: ${EAP_MATCH_TRADE_COMPLETION_RECONCILER_POLL_INTERVAL_MS:1000}
-      delayed-threshold-seconds: 30
     reservation-reconciler:
-      enabled: ${EAP_MATCH_RESERVATION_RECONCILER_ENABLED:false}
+      enabled: ${EAP_MATCH_RESERVATION_RECONCILER_ENABLED:true}
       batch-size: ${EAP_MATCH_RESERVATION_RECONCILER_BATCH_SIZE:500}
       poll-interval-ms: ${EAP_MATCH_RESERVATION_RECONCILER_POLL_INTERVAL_MS:1000}
       orphan-threshold-seconds: 30

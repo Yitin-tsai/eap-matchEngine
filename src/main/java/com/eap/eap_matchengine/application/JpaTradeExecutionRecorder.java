@@ -21,17 +21,14 @@ import java.time.Instant;
 public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
 
     private final JdbcTemplate jdbcTemplate;
-    private final TradeCompletionService tradeCompletionService;
     private final MatchingEngineMetrics metrics;
     private final boolean outboxWriteEnabled;
 
     public JpaTradeExecutionRecorder(
             JdbcTemplate jdbcTemplate,
-            TradeCompletionService tradeCompletionService,
             MatchingEngineMetrics metrics,
             @Value("${eap.match-engine.trade-outbox.write-enabled:true}") boolean outboxWriteEnabled) {
         this.jdbcTemplate = jdbcTemplate;
-        this.tradeCompletionService = tradeCompletionService;
         this.metrics = metrics;
         this.outboxWriteEnabled = outboxWriteEnabled;
     }
@@ -63,12 +60,6 @@ public class JpaTradeExecutionRecorder implements TradeExecutionRecorder {
             }
             if (reservationCleanupTask != null) {
                 insertReservationCleanupTask(reservationCleanupTask);
-            }
-            Instant completionMarkStartedAt = Instant.now();
-            try {
-                tradeCompletionService.markTradeExecuted(event);
-            } finally {
-                metrics.recordTradeRecordCompletionMark(Duration.between(completionMarkStartedAt, Instant.now()));
             }
         } finally {
             transactionBodyFinishedAt[0] = Instant.now();

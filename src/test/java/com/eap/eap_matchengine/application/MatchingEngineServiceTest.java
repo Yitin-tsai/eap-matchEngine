@@ -10,7 +10,9 @@ import org.redisson.api.RedissonClient;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -59,8 +61,8 @@ class MatchingEngineServiceTest {
                         task.tradeId().equals("TEST-MARKET-42")
                                 && task.orderId().equals(restingSell.getOrderId())
                                 && task.userId().equals(restingSell.getUserId())));
-        verify(orderBookService).completeReservedOrder(restingSell);
-        verify(orderBookService, never()).releaseReservedOrder(any());
+        verify(orderBookService).completeReservedOrder(restingSell, "TEST-MARKET-42");
+        verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
         assertThat(incomingBuy.getAmount()).isZero();
         assertThat(restingSell.getAmount()).isZero();
     }
@@ -92,8 +94,8 @@ class MatchingEngineServiceTest {
                 task.tradeId().equals("TEST-MARKET-43")
                         && task.orderId().equals(restingSell.getOrderId())
                         && task.userId().equals(restingSell.getUserId())));
-        verify(orderBookService, never()).completeReservedOrder(any());
-        verify(orderBookService, never()).releaseReservedOrder(any());
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
+        verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
         assertThat(incomingBuy.getAmount()).isZero();
         assertThat(restingSell.getAmount()).isZero();
     }
@@ -123,11 +125,11 @@ class MatchingEngineServiceTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("db unavailable");
 
-        verify(orderBookService).releaseReservedOrder(argThat(order ->
+        verify(orderBookService).releaseReservedOrder(argThat((OrderConfirmedEvent order) ->
                 order.getOrderId().equals(restingSell.getOrderId())
                         && order.getAmount() == 1
-                        && order.getOrderType().equals("SELL")));
-        verify(orderBookService, never()).completeReservedOrder(any());
+                        && order.getOrderType().equals("SELL")), eq("TEST-MARKET-42"));
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
         assertThat(incomingBuy.getAmount()).isEqualTo(1);
         assertThat(restingSell.getAmount()).isEqualTo(1);
     }
@@ -149,8 +151,8 @@ class MatchingEngineServiceTest {
                 .hasMessageContaining("redis reservation unavailable");
 
         verify(tradeExecutionRecorder, never()).record(any());
-        verify(orderBookService, never()).completeReservedOrder(any());
-        verify(orderBookService, never()).releaseReservedOrder(any());
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
+        verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
         assertThat(incomingBuy.getAmount()).isEqualTo(1);
     }
 
@@ -170,8 +172,8 @@ class MatchingEngineServiceTest {
 
         verify(tradeExecutionRecorder, never()).record(any());
         verify(orderBookService, never()).addOrder(any());
-        verify(orderBookService, never()).completeReservedOrder(any());
-        verify(orderBookService, never()).releaseReservedOrder(any());
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
+        verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
         verify(matchingEngineMetrics).orderAdded();
         assertThat(incomingSell.getAmount()).isEqualTo(1);
     }
@@ -197,8 +199,8 @@ class MatchingEngineServiceTest {
 
         assertThat(result).isEqualTo(MatchingEngineService.GuardedMatchResult.DUPLICATE);
         verify(tradeExecutionRecorder, never()).record(any());
-        verify(orderBookService, never()).completeReservedOrder(any());
-        verify(orderBookService, never()).releaseReservedOrder(any());
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
+        verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
         assertThat(incomingBuy.getAmount()).isEqualTo(1);
     }
 

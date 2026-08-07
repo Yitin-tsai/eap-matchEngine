@@ -1,80 +1,55 @@
-# eap-matchEngine — LLM Context
+# eap-matchEngine - LLM Context
 
-> Port 8082 | Context Path: /match-engine
-> OpenAPI spec: `docs/api/match-engine.json`
+> Port 8082 | Context path `/match-engine`
 
-## API Endpoints
+## Ownership
 
-| Endpoint | Description | Involves |
-|----------|-------------|----------|
-| GET /v1/order/orderbook | 從 Redis 讀取訂單簿 | matchEngine (Redis ZSet) |
-| GET /v1/order/market/summary | 最佳買賣價 | matchEngine (Redis) |
-| GET /v1/order/query/{userId} | 查詢用戶在 Redis 中的活躍訂單 | matchEngine (Redis Set) |
-| DELETE /v1/order/cancel | 從 Redis 訂單簿取消訂單 | matchEngine (Redis Lua script) |
+- Redis order book and price-time matching decision.
+- Durable append-only `trade_executions` fact.
+- Trade transactional outbox.
+- Deferred Redis reservation-cleanup tasks and crash reconciliation.
+- TDA bid collection, auction schedules, clearing-price calculation, and results.
 
-## Redis Data Model
+MatchEngine does not own Wallet settlement, Order projection, or downstream completion state.
 
-| Key Pattern | Type | Purpose |
-|-------------|------|---------|
-| orderbook:buy | ZSet (score=price ASC) | Buy order book, sorted by price |
-| orderbook:sell | ZSet (score=price ASC) | Sell order book, sorted by price |
-| order:{orderId} | String (GET/SET) | JSON-serialized OrderConfirmedEvent (fields: orderId, userId, price, amount, orderType, createdAt). Read with `GET`, not `HGETALL`. |
-| user:{userId}:orders | Set | Set of orderId strings for a user |
-| match:id:sequence | String (INCR) | Auto-increment match ID generator |
-| match:processed:{matchId} | String (SETNX, TTL 24h) | Idempotency check for match processing |
-| lock:order:{orderId} | Redisson Lock | Distributed lock for partial-fill re-add |
+## Current Flow
 
-## Lua Scripts (atomic operations)
-
-Location: `src/main/resources/lua/`
-
-| Script | Purpose |
-|--------|---------|
-| add_order.lua | Add order to ZSet + Hash + user Set atomically |
-| get_and_remove_match_order_buy.lua | Pop best sell order matching buy price |
-| get_and_remove_match_order_sell.lua | Pop best buy order matching sell price |
-| remove_order.lua | Remove order from ZSet + Hash + user Set atomically |
-
-Pricing: Maker Price — dealPrice = resting order's price (passive side determines price).
-
-## Matching & Partial Fill 流程
-
-`OrderConfirmedListener` 收到 confirmed 事件後呼叫 `MatchingEngineService.tryMatch()`：
-
-```
-tryMatch(incomingOrder) — while loop:
-  1. Lua script 原子取出最佳對手方訂單（ZREM + GET + DEL from ZSet/String）
-  2. matchQty = Math.min(incoming.amount, match.amount)
-  3. 產生 matchId / sequence（Redis INCR）
-  4. persist TradeExecuted + trade_outbox in PostgreSQL
-  5. TradeOutboxRelay publishes TradeExecutedEvent → trade.exchange / trade.executed
-  6. 對手方剩餘數量 > 0（partial fill of resting order）：
-     → Redisson lock (lock:order:{orderId}, tryLock 5s, autoRelease 10s)
-     → addOrder() 重新加回訂單簿（ZSet + String + user Set）
-     → ⚠️ 風險：lock 取得失敗時，剩餘數量會從訂單簿遺失（無補償機制）
-  7. 對手方完全成交：removeOrder() 清理 user:{userId}:orders
-  8. incoming 仍有剩餘 → 繼續 loop 尋找下一個對手方
-  9. loop 結束後，incoming 仍有剩餘 → addOrder() 加入訂單簿等待
+```text
+OrderConfirmedEvent
+  -> Redis Lua reserve/match
+  -> DB transaction:
+       trade_executions
+       trade_outbox
+       optional reservation_cleanup_tasks
+  -> TradeOutboxRelay publishes TradeExecutedEvent
+  -> ReservationCleanupWorker finalizes Redis cleanup
 ```
 
-**重點**：legacy `order.matched` bus 已退役。Order / Wallet 都消費 `TradeExecutedEvent`，再各自發布 `OrderTradeAppliedEvent` / `WalletTradeSettledEvent` completion markers。
+Order and Wallet consume `TradeExecutedEvent` directly. The legacy `OrderMatchedEvent`, per-service completion callbacks, marker queues, and `trade_completion_view` are retired.
 
-## RabbitMQ Listeners
+## TDA Flow
 
-| Queue | Listener Class | Handles |
-|-------|---------------|---------|
-| matchEngine.orderConfirmed.queue | OrderConfirmedListener | Try match → persist TradeExecuted or add to order book |
-| matchEngine.orderTradeApplied.queue | TradeCompletionListener | Record ORDER_APPLIED marker |
-| matchEngine.walletTradeSettled.queue | TradeCompletionListener | Record WALLET_SETTLED marker |
+```text
+scheduled create -> direct AuctionCreatedEvent publish
+AuctionBidConfirmedEvent -> collect Wallet-approved bid in Redis
+scheduled clear -> direct AuctionClearedEvent publish to Order and Wallet
+```
 
-Note: MatchEngine publishes `TradeExecutedEvent` through `trade_outbox`; it no longer publishes `OrderMatchedEvent`.
+Auction lifecycle publication currently bypasses the CDA trade outbox. TDA is implemented but has no equivalent published CDA capacity/recovery evidence.
 
-## Key Files
+## Recovery
 
-| What | Path |
-|------|------|
-| Controllers | src/main/java/com/eap/eap_matchengine/controller/ |
-| Matching Service | src/main/java/com/eap/eap_matchengine/application/ |
-| Listeners | src/main/java/com/eap/eap_matchengine/application/ |
-| Lua Scripts | src/main/resources/lua/ |
-| Redis Config | src/main/java/com/eap/eap_matchengine/configuration/ |
+- `trade_id` makes trade recording idempotent.
+- Outbox retry/backoff handles RabbitMQ publication failures.
+- Cleanup tasks use persistent status/leases/retries.
+- ReservationReconciler compares stale Redis reservations with durable trades and releases or completes them.
+
+## Known Risk
+
+The current Spring `taskScheduler` has one worker shared by cleanup, trade outbox polling, reconciliation, and auction jobs. A 2026-08-07 deep run observed a 9.380s cleanup batch and common downstream lag. Scheduler isolation is pending validation.
+
+## Key Paths
+
+- Matching and relays: `src/main/java/com/eap/eap_matchengine/application/`
+- Lua scripts: `src/main/resources/lua/`
+- Liquibase: `src/main/resources/db/changelog/`

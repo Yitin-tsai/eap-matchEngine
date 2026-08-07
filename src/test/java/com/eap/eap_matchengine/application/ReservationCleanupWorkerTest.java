@@ -62,7 +62,8 @@ class ReservationCleanupWorkerTest {
         int claimed = worker.cleanupOnce();
 
         org.assertj.core.api.Assertions.assertThat(claimed).isEqualTo(2);
-        verify(orderBookService, times(2)).completeReservedOrder(any());
+        verify(orderBookService).completeReservedOrder(any(), eq("ENERGY-SPOT-1"));
+        verify(orderBookService).completeReservedOrder(any(), eq("ENERGY-SPOT-2"));
         verify(jdbcTemplate, times(2)).update(anyString(), any(Object[].class));
         verify(metrics).completed(2);
     }
@@ -122,7 +123,7 @@ class ReservationCleanupWorkerTest {
                 .thenReturn(List.of(task));
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
         doThrow(new IllegalStateException("redis unavailable"))
-                .when(orderBookService).completeReservedOrder(any());
+                .when(orderBookService).completeReservedOrder(any(), eq("ENERGY-SPOT-11"));
 
         int claimed = worker.cleanupOnce();
 

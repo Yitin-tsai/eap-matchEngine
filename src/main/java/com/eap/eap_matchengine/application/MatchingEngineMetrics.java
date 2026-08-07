@@ -28,7 +28,6 @@ public class MatchingEngineMetrics {
     private final Timer tradeRecordDuration;
     private final Timer tradeRecordSerializeDuration;
     private final Timer tradeRecordInsertDuration;
-    private final Timer tradeRecordCompletionMarkDuration;
     private final Timer tradeRecordTransactionBodyDuration;
     private final Timer tradeRecordTransactionTotalDuration;
     private final Timer tradeRecordCommitGapDuration;
@@ -79,8 +78,6 @@ public class MatchingEngineMetrics {
                 "Time spent serializing TradeExecuted payload before persistence");
         this.tradeRecordInsertDuration = tradeRecordPhaseTimer(registry, "insert_trade_execution_and_outbox",
                 "Time spent inserting TradeExecuted fact and outbox row");
-        this.tradeRecordCompletionMarkDuration = tradeRecordPhaseTimer(registry, "mark_trade_executed",
-                "Time spent marking local TradeExecuted completion state");
         this.tradeRecordTransactionBodyDuration = tradeRecordPhaseTimer(registry, "transaction_body",
                 "Time spent inside the TradeExecuted transactional method before commit");
         this.tradeRecordTransactionTotalDuration = tradeRecordPhaseTimer(registry, "transaction_total",
@@ -174,10 +171,6 @@ public class MatchingEngineMetrics {
 
     void recordTradeRecordInsert(Duration duration) {
         tradeRecordInsertDuration.record(duration);
-    }
-
-    void recordTradeRecordCompletionMark(Duration duration) {
-        tradeRecordCompletionMarkDuration.record(duration);
     }
 
     void recordTradeRecordTransactionBody(Duration duration) {

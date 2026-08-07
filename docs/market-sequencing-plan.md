@@ -5,6 +5,8 @@
 
 > 實作狀態：2026-06-03 已完成 Phase 1、Phase 2，並先以 Redis ZSET composite score 完成 price + sequence 的 MVP 排序。完整 price-level FIFO queue 保留為下一階段強化。
 
+> 2026-08-07 補充：現行成交事件是 `TradeExecutedEvent`，包含買賣雙方 `marketSequence`；`OrderSubmittedEvent` 與 `OrderConfirmedEvent` 也已帶有 `marketId`/`marketSequence`。舊 `OrderMatchedEvent` 已退役。下方「背景限制」與分階段修改描述是 2026-06 的演進紀錄；完整 price-level FIFO、跨節點分片與 Super Stream 仍是未來方向。現行 CDA 容量測試以單一市場、單一撮合權威與 Redis Lua 原子操作為邊界，不能代表 TDA。
+
 ## 背景
 
 目前 EAP 已具備：
@@ -16,7 +18,7 @@
 - Audit Trail / Event Replay
 - Timed Double Auction
 
-但目前仍有幾個限制：
+當時版本仍有幾個限制（現行 event schema 與 audit 寫入已完成其中一部分）：
 
 - `OrderSubmittedEvent` / `OrderConfirmedEvent` 沒有 `marketId` 與 `marketSequence`
 - Redis order book 目前主要以 `price` 排序，同價位 FIFO 不嚴格
@@ -122,8 +124,8 @@ private Long sellerMarketSequence;
 1. 決定 marketId
 2. Redis INCR seq:{marketId}
 3. 建立 OrderSubmittedEvent(orderId, userId, marketId, marketSequence, price, amount, side)
-4. publish OrderSubmittedEvent
-5. audit 記錄 order submitted payload
+4. 原子寫入 `OrderSubmissionRequestedV1` 與 `OrderSubmittedEvent` integration outbox
+5. 非同步 relay 發布 `OrderSubmittedEvent`
 6. 回傳 orderId + marketId + marketSequence
 ```
 

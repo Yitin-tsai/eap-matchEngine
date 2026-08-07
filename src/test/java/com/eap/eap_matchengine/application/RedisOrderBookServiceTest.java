@@ -146,8 +146,10 @@ class RedisOrderBookServiceTest {
                 new RedisOrderBookService(redisTemplate, objectMapper, null, false);
         doAnswer(invocation -> {
             Object[] arguments = invocation.getArguments();
-            byte[] lastArgument = (byte[]) arguments[arguments.length - 1];
-            assertThat(new String(lastArgument, StandardCharsets.UTF_8)).isEqualTo("0");
+            byte[] userIndexArgument = (byte[]) arguments[arguments.length - 5];
+            byte[] marketIdArgument = (byte[]) arguments[arguments.length - 1];
+            assertThat(new String(userIndexArgument, StandardCharsets.UTF_8)).isEqualTo("0");
+            assertThat(new String(marketIdArgument, StandardCharsets.UTF_8)).isEqualTo("TEST-MARKET");
             return List.of("__ADDED__".getBytes(StandardCharsets.UTF_8));
         }).when(connection).evalSha(nullable(String.class), eq(ReturnType.MULTI), eq(5), any(byte[][].class));
         doAnswer(invocation -> {
@@ -224,7 +226,7 @@ class RedisOrderBookServiceTest {
     void releaseReservedOrder_whenReservationDoesNotExist_shouldFailWithoutResurrectingOrder() {
         doReturn(0L).when(redisTemplate).execute(any(RedisCallback.class));
 
-        assertThatThrownBy(() -> service.releaseReservedOrder(incomingBuyOrder()))
+        assertThatThrownBy(() -> service.releaseReservedOrder(incomingBuyOrder(), "TEST-MARKET-42"))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("Failed to release reserved order");
 
@@ -237,7 +239,7 @@ class RedisOrderBookServiceTest {
         RedisOrderBookService serviceWithMetrics = new RedisOrderBookService(redisTemplate, objectMapper, metrics);
         doReturn(1L).when(redisTemplate).execute(any(RedisCallback.class));
 
-        serviceWithMetrics.completeReservedOrder(incomingBuyOrder());
+        serviceWithMetrics.completeReservedOrder(incomingBuyOrder(), "TEST-MARKET-42");
 
         verify(metrics).recordCompleteReservationPrepare(any(Duration.class));
         verify(metrics).recordCompleteReservationResult(any(Duration.class));
@@ -270,7 +272,8 @@ class RedisOrderBookServiceTest {
         doReturn(List.of("order:reservation:" + orderId))
                 .when(redisTemplate).execute(any(RedisCallback.class));
         doReturn(valueOperations).when(redisTemplate).opsForValue();
-        doReturn("{\"reservedAtEpochMillis\":1783934580000,\"orderId\":\"" + orderId + "\"}")
+        doReturn("{\"reservedAtEpochMillis\":1783934580000,\"orderId\":\"" + orderId
+                + "\",\"tradeId\":\"TEST-MARKET-43\"}")
                 .when(valueOperations).get("order:reservation:" + orderId);
         doReturn(compactRedisOrderJson(restingSell))
                 .when(valueOperations).get("order:" + orderId);
@@ -280,6 +283,7 @@ class RedisOrderBookServiceTest {
         assertThat(snapshots).hasSize(1);
         assertThat(snapshots.get(0).valid()).isTrue();
         assertThat(snapshots.get(0).reservedAtEpochMillis()).isEqualTo(1783934580000L);
+        assertThat(snapshots.get(0).tradeId()).isEqualTo("TEST-MARKET-43");
         assertThat(snapshots.get(0).order().getOrderId()).isEqualTo(orderId);
         assertThat(snapshots.get(0).order().getAmount()).isEqualTo(4);
     }

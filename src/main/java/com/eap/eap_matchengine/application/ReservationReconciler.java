@@ -16,6 +16,8 @@ import java.time.ZoneId;
 import java.util.List;
 import java.util.Optional;
 
+import static com.eap.eap_matchengine.configuration.config.MatchEngineSchedulerConfig.RESERVATION_MAINTENANCE_SCHEDULER;
+
 @Component
 @Slf4j
 @ConditionalOnProperty(
@@ -43,7 +45,9 @@ public class ReservationReconciler {
         this.batchSize = batchSize;
     }
 
-    @Scheduled(fixedDelayString = "${eap.match-engine.reservation-reconciler.poll-interval-ms:5000}")
+    @Scheduled(
+            fixedDelayString = "${eap.match-engine.reservation-reconciler.poll-interval-ms:5000}",
+            scheduler = RESERVATION_MAINTENANCE_SCHEDULER)
     public void reconcile() {
         reconcileOnce();
     }
@@ -66,25 +70,18 @@ public class ReservationReconciler {
     }
 
     private int reconcileReservation(RedisOrderBookService.ReservationSnapshot reservation) {
-        OrderConfirmedEvent reservedOrder = reservation.order();
-        LocalDateTime reservedAt = reservedAtLowerBound(reservation);
-        Optional<TradeExecutionEntity> durableTrade = tradeExecutionRepository
-                .findFirstByCreatedAtGreaterThanEqualAndBuyerOrderIdOrCreatedAtGreaterThanEqualAndSellerOrderIdOrderByCreatedAtDesc(
-                        reservedAt,
-                        reservedOrder.getOrderId(),
-                        reservedAt,
-                        reservedOrder.getOrderId());
-        if (durableTrade.isPresent()) {
-            if (!isOrphanReady(reservation)) {
-                return 0;
-            }
-            return convergeDurableTradeReservation(reservation, durableTrade.get());
-        }
         if (!isOrphanReady(reservation)) {
             return 0;
         }
+        OrderConfirmedEvent reservedOrder = reservation.order();
+        Optional<TradeExecutionEntity> durableTrade = reservation.tradeId() == null
+                ? findLegacyDurableTrade(reservedOrder, reservedAtLowerBound(reservation))
+                : tradeExecutionRepository.findByTradeId(reservation.tradeId());
+        if (durableTrade.isPresent()) {
+            return convergeDurableTradeReservation(reservation, durableTrade.get());
+        }
         try {
-            orderBookService.releaseReservedOrder(reservedOrder);
+            orderBookService.releaseReservedOrder(reservedOrder, reservation.tradeId());
             metrics.released();
             log.warn("Released orphan MatchEngine reservation without durable trade: orderId={}, key={}, amount={}",
                     reservedOrder.getOrderId(), reservation.key(), reservedOrder.getAmount());
@@ -105,12 +102,12 @@ public class ReservationReconciler {
         try {
             if (remainingAmount > 0) {
                 reservedOrder.setAmount(remainingAmount);
-                orderBookService.releaseReservedOrder(reservedOrder);
+                orderBookService.releaseReservedOrder(reservedOrder, reservation.tradeId());
                 metrics.released();
                 log.warn("Released remaining partial MatchEngine reservation after durable trade: tradeId={}, orderId={}, remainingAmount={}",
                         trade.getTradeId(), reservedOrder.getOrderId(), remainingAmount);
             } else {
-                orderBookService.completeReservedOrder(reservedOrder);
+                orderBookService.completeReservedOrder(reservedOrder, reservation.tradeId());
                 metrics.completed();
                 log.warn("Completed MatchEngine reservation after durable trade: tradeId={}, orderId={}",
                         trade.getTradeId(), reservedOrder.getOrderId());
@@ -131,6 +128,17 @@ public class ReservationReconciler {
         }
         Instant reservedAt = Instant.ofEpochMilli(reservedAtEpochMillis);
         return reservedAt.plus(orphanThreshold).isBefore(Instant.now());
+    }
+
+    private Optional<TradeExecutionEntity> findLegacyDurableTrade(
+            OrderConfirmedEvent reservedOrder,
+            LocalDateTime reservedAt) {
+        return tradeExecutionRepository
+                .findFirstByCreatedAtGreaterThanEqualAndBuyerOrderIdOrCreatedAtGreaterThanEqualAndSellerOrderIdOrderByCreatedAtDesc(
+                        reservedAt,
+                        reservedOrder.getOrderId(),
+                        reservedAt,
+                        reservedOrder.getOrderId());
     }
 
     private LocalDateTime reservedAtLowerBound(RedisOrderBookService.ReservationSnapshot reservation) {

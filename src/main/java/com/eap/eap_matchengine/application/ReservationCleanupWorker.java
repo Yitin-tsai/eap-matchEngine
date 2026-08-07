@@ -16,6 +16,8 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import static com.eap.eap_matchengine.configuration.config.MatchEngineSchedulerConfig.RESERVATION_MAINTENANCE_SCHEDULER;
+
 @Component
 @ConditionalOnProperty(
         name = "eap.match-engine.reservation-cleanup.enabled",
@@ -54,7 +56,9 @@ public class ReservationCleanupWorker {
         this.leaseRenewalChunkSize = Math.max(1, leaseRenewalChunkSize);
     }
 
-    @Scheduled(fixedDelayString = "${eap.match-engine.reservation-cleanup.poll-interval-ms:100}")
+    @Scheduled(
+            fixedDelayString = "${eap.match-engine.reservation-cleanup.poll-interval-ms:100}",
+            scheduler = RESERVATION_MAINTENANCE_SCHEDULER)
     public void cleanup() {
         cleanupOnce();
     }
@@ -76,7 +80,7 @@ public class ReservationCleanupWorker {
             for (CleanupRow task : chunk) {
                 Instant redisStartedAt = Instant.now();
                 try {
-                    orderBookService.completeReservedOrder(toOrder(task));
+                    orderBookService.completeReservedOrder(toOrder(task), task.tradeId());
                     completedTaskIds.add(task.id());
                 } catch (Exception e) {
                     recordFailure(task, e);

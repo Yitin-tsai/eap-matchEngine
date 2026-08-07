@@ -30,6 +30,8 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import static com.eap.eap_matchengine.configuration.config.MatchEngineSchedulerConfig.TRADE_OUTBOX_SCHEDULER;
+
 @Component
 @Slf4j
 @ConditionalOnProperty(
@@ -64,7 +66,9 @@ public class TradeExecutionCheckpointRelay {
         this.confirmTimeoutMs = confirmTimeoutMs;
     }
 
-    @Scheduled(fixedDelayString = "${eap.match-engine.trade-checkpoint-relay.poll-interval-ms:100}")
+    @Scheduled(
+            fixedDelayString = "${eap.match-engine.trade-checkpoint-relay.poll-interval-ms:100}",
+            scheduler = TRADE_OUTBOX_SCHEDULER)
     public void pollAndPublish() {
         boolean continueDraining;
         do {

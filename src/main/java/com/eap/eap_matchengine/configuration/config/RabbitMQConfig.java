@@ -23,7 +23,6 @@ import static com.eap.common.constants.RabbitMQConstants.*;
  *
  * This module publishes:
  * - TradeExecuted events through the transactional trade outbox
- * - completion markers are consumed from trade.exchange
  * - auction.created events (new auction opened)
  * - auction.cleared events (auction clearing results)
  *
@@ -57,20 +56,6 @@ public class RabbitMQConfig {
         return new TopicExchange(TRADE_EXCHANGE);
     }
 
-    @Bean
-    public Queue matchEngineOrderTradeAppliedQueue() {
-        return QueueBuilder.durable(MATCH_ENGINE_ORDER_TRADE_APPLIED_QUEUE)
-                .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
-                .build();
-    }
-
-    @Bean
-    public Queue matchEngineWalletTradeSettledQueue() {
-        return QueueBuilder.durable(MATCH_ENGINE_WALLET_TRADE_SETTLED_QUEUE)
-                .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
-                .build();
-    }
-
     /**
      * Bind matchEngine queue to order.confirmed routing key
      */
@@ -81,24 +66,6 @@ public class RabbitMQConfig {
         return BindingBuilder.bind(matchEngineOrderConfirmedQueue)
                 .to(orderExchange)
                 .with(ORDER_CONFIRMED_KEY);
-    }
-
-    @Bean
-    public Binding matchEngineOrderTradeAppliedBinding(
-            @Qualifier("matchEngineOrderTradeAppliedQueue") Queue matchEngineOrderTradeAppliedQueue,
-            @Qualifier("tradeExchange") TopicExchange tradeExchange) {
-        return BindingBuilder.bind(matchEngineOrderTradeAppliedQueue)
-                .to(tradeExchange)
-                .with(TRADE_ORDER_APPLIED_KEY);
-    }
-
-    @Bean
-    public Binding matchEngineWalletTradeSettledBinding(
-            @Qualifier("matchEngineWalletTradeSettledQueue") Queue matchEngineWalletTradeSettledQueue,
-            @Qualifier("tradeExchange") TopicExchange tradeExchange) {
-        return BindingBuilder.bind(matchEngineWalletTradeSettledQueue)
-                .to(tradeExchange)
-                .with(TRADE_WALLET_SETTLED_KEY);
     }
 
     // ==================== Auction (Timed Double Auction) ====================

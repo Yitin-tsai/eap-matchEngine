@@ -11,13 +11,17 @@ import java.util.Optional;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class ReservationReconcilerTest {
+
+    private static final String TRADE_ID = "TEST-MARKET-1";
 
     private final RedisOrderBookService orderBookService = mock(RedisOrderBookService.class);
     private final TradeExecutionRepository tradeExecutionRepository = mock(TradeExecutionRepository.class);
@@ -30,19 +34,14 @@ class ReservationReconcilerTest {
                 .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
                         "order:reservation:" + order.getOrderId(),
                         order,
-                        1L)));
-        when(tradeExecutionRepository
-                .findFirstByCreatedAtGreaterThanEqualAndBuyerOrderIdOrCreatedAtGreaterThanEqualAndSellerOrderIdOrderByCreatedAtDesc(
-                        any(LocalDateTime.class),
-                        eq(order.getOrderId()),
-                        any(LocalDateTime.class),
-                        eq(order.getOrderId())))
-                .thenReturn(Optional.empty());
+                        1L,
+                        TRADE_ID)));
+        when(tradeExecutionRepository.findByTradeId(TRADE_ID)).thenReturn(Optional.empty());
 
         reconciler(0).reconcileOnce();
 
-        verify(orderBookService).releaseReservedOrder(order);
-        verify(orderBookService, never()).completeReservedOrder(any());
+        verify(orderBookService).releaseReservedOrder(order, TRADE_ID);
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
         verify(metrics).released();
     }
 
@@ -54,43 +53,31 @@ class ReservationReconcilerTest {
                 .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
                         "order:reservation:" + order.getOrderId(),
                         order,
-                        1L)));
-        when(tradeExecutionRepository
-                .findFirstByCreatedAtGreaterThanEqualAndBuyerOrderIdOrCreatedAtGreaterThanEqualAndSellerOrderIdOrderByCreatedAtDesc(
-                        any(LocalDateTime.class),
-                        eq(order.getOrderId()),
-                        any(LocalDateTime.class),
-                        eq(order.getOrderId())))
-                .thenReturn(Optional.of(trade));
+                        1L,
+                        TRADE_ID)));
+        when(tradeExecutionRepository.findByTradeId(TRADE_ID)).thenReturn(Optional.of(trade));
 
         reconciler(30).reconcileOnce();
 
-        verify(orderBookService).completeReservedOrder(order);
-        verify(orderBookService, never()).releaseReservedOrder(any());
+        verify(orderBookService).completeReservedOrder(order, TRADE_ID);
+        verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
         verify(metrics).completed();
     }
 
     @Test
     void reconcileOnce_whenReservationHasFreshDurableTrade_shouldLeaveCleanupWorkerAsOwner() throws Exception {
         OrderConfirmedEvent order = order(1);
-        TradeExecutionEntity trade = trade(order, 1);
         when(orderBookService.scanReservations(100))
                 .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
                         "order:reservation:" + order.getOrderId(),
                         order,
-                        System.currentTimeMillis())));
-        when(tradeExecutionRepository
-                .findFirstByCreatedAtGreaterThanEqualAndBuyerOrderIdOrCreatedAtGreaterThanEqualAndSellerOrderIdOrderByCreatedAtDesc(
-                        any(LocalDateTime.class),
-                        eq(order.getOrderId()),
-                        any(LocalDateTime.class),
-                        eq(order.getOrderId())))
-                .thenReturn(Optional.of(trade));
-
+                        System.currentTimeMillis(),
+                        TRADE_ID)));
         reconciler(30).reconcileOnce();
 
-        verify(orderBookService, never()).completeReservedOrder(any());
-        verify(orderBookService, never()).releaseReservedOrder(any());
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
+        verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
+        verifyNoInteractions(tradeExecutionRepository);
     }
 
     @Test
@@ -101,20 +88,15 @@ class ReservationReconcilerTest {
                 .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
                         "order:reservation:" + order.getOrderId(),
                         order,
-                        1L)));
-        when(tradeExecutionRepository
-                .findFirstByCreatedAtGreaterThanEqualAndBuyerOrderIdOrCreatedAtGreaterThanEqualAndSellerOrderIdOrderByCreatedAtDesc(
-                        any(LocalDateTime.class),
-                        eq(order.getOrderId()),
-                        any(LocalDateTime.class),
-                        eq(order.getOrderId())))
-                .thenReturn(Optional.of(trade));
+                        1L,
+                        TRADE_ID)));
+        when(tradeExecutionRepository.findByTradeId(TRADE_ID)).thenReturn(Optional.of(trade));
 
         reconciler(30).reconcileOnce();
 
         verify(orderBookService).releaseReservedOrder(org.mockito.ArgumentMatchers.argThat(released ->
-                released.getOrderId().equals(order.getOrderId()) && released.getAmount() == 2));
-        verify(orderBookService, never()).completeReservedOrder(any());
+                released.getOrderId().equals(order.getOrderId()) && released.getAmount() == 2), eq(TRADE_ID));
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
         verify(metrics).released();
     }
 
@@ -128,8 +110,8 @@ class ReservationReconcilerTest {
         reconciler(30).reconcileOnce();
 
         verify(metrics).invalid();
-        verify(orderBookService, never()).releaseReservedOrder(any());
-        verify(orderBookService, never()).completeReservedOrder(any());
+        verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
     }
 
     private ReservationReconciler reconciler(long orphanThresholdSeconds) {

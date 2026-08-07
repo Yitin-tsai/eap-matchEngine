@@ -10,10 +10,8 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.UUID;
 
 public class OutboxRelayCeilingProbe {
@@ -29,7 +27,7 @@ public class OutboxRelayCeilingProbe {
 
     public static void main(String[] args) throws Exception {
         Config config = Config.from(args);
-        ServiceSpec spec = ServiceSpec.forName(config.service(), config.jdbcUrl());
+        ServiceSpec spec = ServiceSpec.match(config.jdbcUrl());
         if (config.seedRows()) {
             seedRows(config, spec);
         }
@@ -144,8 +142,8 @@ public class OutboxRelayCeilingProbe {
                         db.rollback();
                         failures += rows.size();
                         if (failures <= 100) {
-                            System.err.printf("relay probe batch failed: service=%s, size=%d, error=%s%n",
-                                    config.service(), rows.size(), e.getMessage());
+                            System.err.printf("Match outbox relay probe batch failed: size=%d, error=%s%n",
+                                    rows.size(), e.getMessage());
                         }
                     } finally {
                         timers.batchNanos += System.nanoTime() - batchStarted;
@@ -175,7 +173,7 @@ public class OutboxRelayCeilingProbe {
     private static void printJson(Config config, Result result) {
         System.out.println("{");
         System.out.printf("  \"mode\": \"outboxRelayCeilingProbe\",%n");
-        System.out.printf("  \"service\": \"%s\",%n", config.service());
+        System.out.println("  \"service\": \"match\",");
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
         System.out.printf("  \"events\": %d,%n", config.events());
         System.out.printf("  \"batchSize\": %d,%n", config.batchSize());
@@ -215,7 +213,6 @@ public class OutboxRelayCeilingProbe {
     }
 
     private record Config(
-            String service,
             String jdbcUrl,
             String username,
             String password,
@@ -233,7 +230,6 @@ public class OutboxRelayCeilingProbe {
 
         private static Config from(String[] args) {
             return new Config(
-                    stringArg(args, "--service", "match"),
                     stringArg(args, "--jdbc-url", ""),
                     stringArg(args, "--username", DEFAULT_USERNAME),
                     stringArg(args, "--password", DEFAULT_PASSWORD),
@@ -273,7 +269,6 @@ public class OutboxRelayCeilingProbe {
     }
 
     private record ServiceSpec(
-            String name,
             String jdbcUrl,
             String seedSql,
             String selectSql,
@@ -281,19 +276,8 @@ public class OutboxRelayCeilingProbe {
             String markSentSuffix,
             String selectPatternTemplate) {
 
-        private static ServiceSpec forName(String rawName, String jdbcUrlOverride) {
-            String name = rawName.toLowerCase(Locale.ROOT);
-            return switch (name) {
-                case "match" -> match(jdbcUrlOverride);
-                case "order" -> order(jdbcUrlOverride);
-                case "wallet", "wallet-settlement" -> walletSettlement(jdbcUrlOverride);
-                default -> throw new IllegalArgumentException("Unsupported service: " + rawName);
-            };
-        }
-
         private static ServiceSpec match(String jdbcUrlOverride) {
             return new ServiceSpec(
-                    "match",
                     defaultJdbc(jdbcUrlOverride, "jdbc:postgresql://localhost:15434/eap_match_db"),
                     """
                     INSERT INTO match_engine.trade_outbox
@@ -323,84 +307,6 @@ public class OutboxRelayCeilingProbe {
                     "%s-%%");
         }
 
-        private static ServiceSpec order(String jdbcUrlOverride) {
-            return new ServiceSpec(
-                    "order",
-                    defaultJdbc(jdbcUrlOverride, "jdbc:postgresql://localhost:15432/eap_order_db"),
-                    """
-                    INSERT INTO order_service.order_event_outbox
-                        (event_id, aggregate_id, exchange_name, routing_key, message_type, payload,
-                         status, attempt_count, next_retry_at, created_at, updated_at)
-                    VALUES (?, ?, 'trade.exchange', 'trade.order.applied',
-                            'com.eap.common.event.OrderTradeAppliedEvent', ?,
-                            'PENDING', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """,
-                    """
-                    SELECT id::text AS relay_id, payload
-                    FROM order_service.order_event_outbox
-                    WHERE status = 'PENDING'
-                      AND payload LIKE ?
-                      AND next_retry_at <= CURRENT_TIMESTAMP
-                    ORDER BY created_at, id
-                    LIMIT ?
-                    """,
-                    """
-                    UPDATE order_service.order_event_outbox
-                    SET status = 'SENT',
-                        published_at = CURRENT_TIMESTAMP,
-                        updated_at = CURRENT_TIMESTAMP,
-                        last_error = NULL,
-                        next_retry_at = NULL
-                    WHERE id IN (
-                    """,
-                    ") AND status = 'PENDING'",
-                    "%%%s%%");
-        }
-
-        private static ServiceSpec walletSettlement(String jdbcUrlOverride) {
-            return new ServiceSpec(
-                    "wallet-settlement",
-                    defaultJdbc(jdbcUrlOverride, "jdbc:postgresql://localhost:15433/eap_wallet_db"),
-                    """
-                    INSERT INTO wallet_service.trade_settlements
-                        (trade_id, legacy_match_id, settled_at,
-                         buyer_id, seller_id, buyer_order_id, seller_order_id,
-                         deal_price, quantity, buyer_locked_currency, buyer_refund_currency,
-                         seller_received_currency, event_status, attempt_count,
-                         next_retry_at, updated_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP,
-                            ?, ?, ?, ?,
-                            100, 1, 100, 0,
-                            100, 'PENDING', 0,
-                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    ON CONFLICT (trade_id) DO UPDATE
-                    SET event_status = 'PENDING',
-                        next_retry_at = CURRENT_TIMESTAMP,
-                        last_error = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    """
-                    SELECT trade_id AS relay_id,
-                           ('{"tradeId":"' || trade_id || '","eventType":"WalletTradeSettledEvent"}') AS payload
-                    FROM wallet_service.trade_settlements
-                    WHERE event_status = 'PENDING'
-                      AND trade_id LIKE ?
-                      AND next_retry_at <= CURRENT_TIMESTAMP
-                    ORDER BY settled_at, trade_id
-                    LIMIT ?
-                    """,
-                    """
-                    UPDATE wallet_service.trade_settlements
-                    SET event_status = 'SENT',
-                        next_retry_at = NULL,
-                        last_error = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE trade_id IN (
-                    """,
-                    ") AND event_status = 'PENDING'",
-                    "%s-%%");
-        }
-
         private static String defaultJdbc(String override, String defaultValue) {
             return override == null || override.isBlank() ? defaultValue : override;
         }
@@ -408,26 +314,8 @@ public class OutboxRelayCeilingProbe {
         private void bindSeed(PreparedStatement statement, String marketId, int sequence) throws SQLException {
             String id = marketId + "-" + sequence;
             String payload = "{\"id\":\"" + id + "\",\"marketId\":\"" + marketId + "\"}";
-            switch (name) {
-                case "match" -> {
-                    statement.setString(1, id);
-                    statement.setString(2, payload);
-                }
-                case "order" -> {
-                    statement.setObject(1, uuid(sequence, 10));
-                    statement.setObject(2, uuid(sequence, 11));
-                    statement.setString(3, payload);
-                }
-                case "wallet-settlement" -> {
-                    statement.setString(1, id);
-                    statement.setInt(2, sequence);
-                    statement.setObject(3, uuid(sequence, 1));
-                    statement.setObject(4, uuid(sequence, 2));
-                    statement.setObject(5, uuid(sequence, 3));
-                    statement.setObject(6, uuid(sequence, 4));
-                }
-                default -> throw new IllegalStateException("Unsupported service: " + name);
-            }
+            statement.setString(1, id);
+            statement.setString(2, payload);
         }
 
         private String selectPattern(String marketId) {
@@ -449,16 +337,8 @@ public class OutboxRelayCeilingProbe {
         private void bindMarkSent(PreparedStatement statement, List<RelayRow> rows) throws SQLException {
             for (int i = 0; i < rows.size(); i++) {
                 String id = rows.get(i).id();
-                if ("wallet-settlement".equals(name)) {
-                    statement.setString(i + 1, id);
-                } else {
-                    statement.setLong(i + 1, Long.parseLong(id));
-                }
+                statement.setLong(i + 1, Long.parseLong(id));
             }
-        }
-
-        private static UUID uuid(long sequence, long salt) {
-            return new UUID(sequence, salt);
         }
     }
 }

@@ -306,4 +306,10 @@
         </sql>
     </changeSet>
 
+    <changeSet id="match-trade-018" author="eap">
+        <comment>Remove obsolete downstream completion feedback state</comment>
+        <dropTable tableName="trade_completion_markers" schemaName="match_engine"/>
+        <dropTable tableName="trade_completion_view" schemaName="match_engine"/>
+    </changeSet>
+
 </databaseChangeLog>

@@ -86,11 +86,6 @@ eap:
       poll-interval-ms: 100
       batch-confirm-enabled: false
       confirm-timeout-ms: 5000
-    trade-completion-reconciler:
-      enabled: true
-      batch-size: 100
-      poll-interval-ms: 5000
-      delayed-threshold-seconds: 30
     reservation-cleanup:
       enabled: true
       batch-size: 500

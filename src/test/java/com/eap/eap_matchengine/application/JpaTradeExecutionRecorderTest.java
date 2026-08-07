@@ -14,18 +14,15 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 class JpaTradeExecutionRecorderTest {
 
     private final JdbcTemplate jdbcTemplate = mock(JdbcTemplate.class);
-    private final TradeCompletionService tradeCompletionService = mock(TradeCompletionService.class);
     private final MatchingEngineMetrics metrics = mock(MatchingEngineMetrics.class);
     private final JpaTradeExecutionRecorder recorder =
-            new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService, metrics, true);
+            new JpaTradeExecutionRecorder(jdbcTemplate, metrics, true);
 
     @Test
     void record_shouldInsertTradeAndOutboxInOneStatementWithoutPreselect() {
@@ -36,14 +33,11 @@ class JpaTradeExecutionRecorderTest {
         recorder.record(event);
 
         verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class));
-        verify(tradeCompletionService).markTradeExecuted(event);
         verify(metrics).recordTradeRecordSerialize(any(Duration.class));
         verify(metrics).recordTradeRecordInsert(any(Duration.class));
-        verify(metrics).recordTradeRecordCompletionMark(any(Duration.class));
         verify(metrics).recordTradeRecordTransactionBody(any(Duration.class));
         verify(metrics).recordTradeRecordTransactionTotal(any(Duration.class));
         verify(metrics).recordTradeRecordCommitGap(any(Duration.class));
-        verifyNoMoreInteractions(tradeCompletionService);
     }
 
     @Test
@@ -58,10 +52,8 @@ class JpaTradeExecutionRecorderTest {
                 .hasMessageContaining("trade-duplicate");
 
         verify(jdbcTemplate).update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class));
-        verify(tradeCompletionService, never()).markTradeExecuted(any());
         verify(metrics).recordTradeRecordSerialize(any(Duration.class));
         verify(metrics).recordTradeRecordInsert(any(Duration.class));
-        verify(metrics, never()).recordTradeRecordCompletionMark(any(Duration.class));
         verify(metrics).recordTradeRecordTransactionBody(any(Duration.class));
         verify(metrics).recordTradeRecordTransactionTotal(any(Duration.class));
         verify(metrics).recordTradeRecordCommitGap(any(Duration.class));
@@ -100,7 +92,7 @@ class JpaTradeExecutionRecorderTest {
     @Test
     void record_whenOutboxWriteDisabled_shouldInsertTradeFactOnly() {
         JpaTradeExecutionRecorder checkpointRecorder =
-                new JpaTradeExecutionRecorder(jdbcTemplate, tradeCompletionService, metrics, false);
+                new JpaTradeExecutionRecorder(jdbcTemplate, metrics, false);
         TradeExecutedEvent event = event("trade-checkpoint");
         when(jdbcTemplate.update(contains("INSERT INTO match_engine.trade_executions"), any(Object[].class)))
                 .thenReturn(1);
@@ -124,7 +116,6 @@ class JpaTradeExecutionRecorderTest {
                 eq(90),
                 eq(1),
                 eq(LocalDateTime.of(2026, 7, 8, 12, 0)));
-        verify(tradeCompletionService).markTradeExecuted(event);
     }
 
     @Test
@@ -146,7 +137,6 @@ class JpaTradeExecutionRecorderTest {
                 eq("trade-cleanup"),
                 eq(UUID.fromString("00000000-0000-0000-0000-000000000004")),
                 eq(UUID.fromString("00000000-0000-0000-0000-000000000002")));
-        verify(tradeCompletionService).markTradeExecuted(event);
     }
 
     private TradeExecutedEvent event(String tradeId) {

@@ -102,9 +102,8 @@ public class MatchingEngineService {
 
         TradeExecutedEvent tradeExecutedEvent;
         boolean reservationCleanupDeferred = false;
+        Long matchId = reservedMatch.matchId();
         try {
-          Long matchId = reservedMatch.matchId();
-
           log.info("Match ID: {}, Buyer: {}, Seller: {}, Amount: {}, Price: {}",
               matchId,
               isBuy ? incomingOrder.getUserId() : matchOrder.getUserId(),
@@ -122,7 +121,11 @@ public class MatchingEngineService {
           reservationCleanupDeferred = recordTrade(tradeExecutedEvent, cleanupTask);
           recordedTrades++;
         } catch (RuntimeException e) {
-          releaseReservedRestingOrder(matchOrder, matchOrderAmountBeforeMatch, e);
+          releaseReservedRestingOrder(
+              matchOrder,
+              matchOrderAmountBeforeMatch,
+              tradeId(incomingOrder, matchId),
+              e);
           throw e;
         }
         log.debug("Persisted TradeExecutedEvent for tradeId={}", tradeExecutedEvent.getTradeId());
@@ -144,7 +147,7 @@ public class MatchingEngineService {
 
             if (locked) {
               try {
-                releaseReservedOrder(matchOrder);
+                releaseReservedOrder(matchOrder, tradeExecutedEvent.getTradeId());
                 log.info("Partial match: released remaining reserved order atomically: orderId={}, remainingAmount={}",
                     matchOrder.getOrderId(), matchOrder.getAmount());
               } catch (JsonProcessingException e) {
@@ -167,7 +170,7 @@ public class MatchingEngineService {
             log.debug("Reserved order cleanup deferred: orderId={}, tradeId={}",
                 matchOrder.getOrderId(), tradeExecutedEvent.getTradeId());
           } else {
-            completeReservedOrder(matchOrder);
+            completeReservedOrder(matchOrder, tradeExecutedEvent.getTradeId());
             log.info("Order fully matched and completed from reservation: orderId={}", matchOrder.getOrderId());
           }
         }
@@ -223,20 +226,21 @@ public class MatchingEngineService {
     }
   }
 
-  private void completeReservedOrder(OrderConfirmedEvent matchOrder) {
+  private void completeReservedOrder(OrderConfirmedEvent matchOrder, String tradeId) {
     Instant startedAt = Instant.now();
     try {
-      orderBookService.completeReservedOrder(matchOrder);
+      orderBookService.completeReservedOrder(matchOrder, tradeId);
       metrics.reservationCompleted();
     } finally {
       metrics.recordCompleteReservation(Duration.between(startedAt, Instant.now()));
     }
   }
 
-  private void releaseReservedOrder(OrderConfirmedEvent matchOrder) throws JsonProcessingException {
+  private void releaseReservedOrder(OrderConfirmedEvent matchOrder, String tradeId)
+      throws JsonProcessingException {
     Instant startedAt = Instant.now();
     try {
-      orderBookService.releaseReservedOrder(matchOrder);
+      orderBookService.releaseReservedOrder(matchOrder, tradeId);
       metrics.reservationReleased();
     } finally {
       metrics.recordReleaseReservation(Duration.between(startedAt, Instant.now()));
@@ -246,10 +250,11 @@ public class MatchingEngineService {
   private void releaseReservedRestingOrder(
       OrderConfirmedEvent matchOrder,
       int originalAmount,
+      String tradeId,
       RuntimeException cause) {
     matchOrder.setAmount(originalAmount);
     try {
-      releaseReservedOrder(matchOrder);
+      releaseReservedOrder(matchOrder, tradeId);
       log.warn("Released reserved resting order after trade persistence failure: orderId={}, amount={}",
           matchOrder.getOrderId(), originalAmount, cause);
     } catch (JsonProcessingException compensationFailure) {
@@ -257,6 +262,11 @@ public class MatchingEngineService {
       log.error("Failed to release reserved resting order after trade persistence failure: orderId={}",
           matchOrder.getOrderId(), compensationFailure);
     }
+  }
+
+  private String tradeId(OrderConfirmedEvent incomingOrder, Long matchId) {
+    return (incomingOrder.getMarketId() == null ? "UNKNOWN" : incomingOrder.getMarketId())
+        + "-" + matchId;
   }
 
   private TradeExecutedEvent toTradeExecutedEvent(

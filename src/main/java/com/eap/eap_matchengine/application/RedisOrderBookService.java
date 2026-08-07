@@ -483,7 +483,7 @@ public class RedisOrderBookService {
         keys.add(incomingOrderIdKey);
         keys.add(incomingUserOrdersKey);
         keys.add(MATCH_ID_KEY);
-        List<String> args = new ArrayList<>(9);
+        List<String> args = new ArrayList<>(10);
         args.add(String.valueOf(priceBoundary));
         args.add(String.valueOf(Instant.now().toEpochMilli()));
         args.add(incomingOrder.getOrderId().toString());
@@ -496,7 +496,12 @@ public class RedisOrderBookService {
             args.add(processingClaim.orderIdField());
             args.add(processingClaim.token());
             args.add(String.valueOf(processingClaim.completedBitOffset()));
+        } else {
+            args.add("");
+            args.add("");
+            args.add("");
         }
+        args.add(marketId(incomingOrder));
 
         @SuppressWarnings("unchecked")
         List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
@@ -608,7 +613,8 @@ public class RedisOrderBookService {
     /**
      * Releases a reserved order back to the visible orderbook.
      */
-    public void releaseReservedOrder(OrderConfirmedEvent event) throws JsonProcessingException {
+    public void releaseReservedOrder(OrderConfirmedEvent event, String expectedTradeId)
+            throws JsonProcessingException {
         String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
@@ -621,7 +627,8 @@ public class RedisOrderBookService {
                 event.getOrderId().toString(),
                 String.valueOf(orderScore),
                 orderJson,
-                userOpenOrderIndexEnabledArg()
+                userOpenOrderIndexEnabledArg(),
+                expectedTradeId == null ? "" : expectedTradeId
         );
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -645,7 +652,8 @@ public class RedisOrderBookService {
         if (result != null && result == 1L) {
             log.debug("Successfully released reserved order {} back to orderbook", event.getOrderId());
         } else {
-            log.error("Failed to release reserved order {} back to orderbook, result={}", event.getOrderId(), result);
+            log.error("Failed to release reserved order {} back to orderbook for trade {}, result={}",
+                    event.getOrderId(), expectedTradeId, result);
             throw new RuntimeException("Failed to release reserved order to Redis");
         }
     }
@@ -653,14 +661,17 @@ public class RedisOrderBookService {
     /**
      * Completes a reserved order after its corresponding TradeExecuted fact is durable.
      */
-    public void completeReservedOrder(OrderConfirmedEvent event) {
+    public void completeReservedOrder(OrderConfirmedEvent event, String expectedTradeId) {
         Instant prepareStartedAt = Instant.now();
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
         String reservationKey = reservationKey(event);
 
         List<String> keys = List.of(orderIdKey, userOrdersKey, reservationKey);
-        List<String> args = List.of(event.getOrderId().toString(), userOpenOrderIndexEnabledArg());
+        List<String> args = List.of(
+                event.getOrderId().toString(),
+                userOpenOrderIndexEnabledArg(),
+                expectedTradeId == null ? "" : expectedTradeId);
         recordCompleteReservationPrepare(Duration.between(prepareStartedAt, Instant.now()));
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -691,8 +702,8 @@ public class RedisOrderBookService {
         if (result != null && result == 1L) {
             log.debug("Successfully completed reserved order {}", event.getOrderId());
         } else {
-            log.warn("Reserved order {} had no matching Redis reservation to complete, result={}",
-                    event.getOrderId(), result);
+            log.warn("Reserved order {} had no matching Redis reservation for trade {} to complete, result={}",
+                    event.getOrderId(), expectedTradeId, result);
         }
         recordCompleteReservationResult(Duration.between(resultStartedAt, Instant.now()));
     }
@@ -812,7 +823,8 @@ public class RedisOrderBookService {
             if (root.has("order")) {
                 OrderConfirmedEvent order = deserializeRedisOrder(root.get("order"));
                 long reservedAtEpochMillis = root.path("reservedAtEpochMillis").asLong(0L);
-                return ReservationSnapshot.valid(key, order, reservedAtEpochMillis);
+                String tradeId = root.path("tradeId").asText(null);
+                return ReservationSnapshot.valid(key, order, reservedAtEpochMillis, tradeId);
             }
             if (root.has("orderId")) {
                 String orderId = root.path("orderId").asText();
@@ -822,7 +834,8 @@ public class RedisOrderBookService {
                 }
                 OrderConfirmedEvent order = deserializeRedisOrder(orderJson);
                 long reservedAtEpochMillis = root.path("reservedAtEpochMillis").asLong(0L);
-                return ReservationSnapshot.valid(key, order, reservedAtEpochMillis);
+                String tradeId = root.path("tradeId").asText(null);
+                return ReservationSnapshot.valid(key, order, reservedAtEpochMillis, tradeId);
             }
 
             // Backward compatibility for pre-TPS-59 reservation values that stored only order JSON.
@@ -1048,15 +1061,24 @@ public class RedisOrderBookService {
             String key,
             OrderConfirmedEvent order,
             long reservedAtEpochMillis,
+            String tradeId,
             boolean valid,
             String invalidReason) {
 
         static ReservationSnapshot valid(String key, OrderConfirmedEvent order, long reservedAtEpochMillis) {
-            return new ReservationSnapshot(key, order, reservedAtEpochMillis, true, null);
+            return valid(key, order, reservedAtEpochMillis, null);
+        }
+
+        static ReservationSnapshot valid(
+                String key,
+                OrderConfirmedEvent order,
+                long reservedAtEpochMillis,
+                String tradeId) {
+            return new ReservationSnapshot(key, order, reservedAtEpochMillis, tradeId, true, null);
         }
 
         static ReservationSnapshot invalid(String key, String invalidReason) {
-            return new ReservationSnapshot(key, null, 0L, false, invalidReason);
+            return new ReservationSnapshot(key, null, 0L, null, false, invalidReason);
         }
     }
 }
