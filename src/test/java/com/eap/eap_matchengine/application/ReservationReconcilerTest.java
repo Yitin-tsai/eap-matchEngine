@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -25,6 +26,7 @@ class ReservationReconcilerTest {
 
     private final RedisOrderBookService orderBookService = mock(RedisOrderBookService.class);
     private final TradeExecutionRepository tradeExecutionRepository = mock(TradeExecutionRepository.class);
+    private final ReservationCleanupTaskStore cleanupTaskStore = mock(ReservationCleanupTaskStore.class);
     private final ReservationReconcilerMetrics metrics = mock(ReservationReconcilerMetrics.class);
 
     @Test
@@ -78,6 +80,26 @@ class ReservationReconcilerTest {
         verify(orderBookService, never()).completeReservedOrder(any(), anyString());
         verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
         verifyNoInteractions(tradeExecutionRepository);
+        verifyNoInteractions(cleanupTaskStore);
+    }
+
+    @Test
+    void reconcileOnce_whenActiveCleanupTaskOwnsReservation_shouldDeferRecovery() throws Exception {
+        OrderConfirmedEvent order = order(1);
+        when(orderBookService.scanReservations(100))
+                .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
+                        "order:reservation:" + order.getOrderId(),
+                        order,
+                        1L,
+                        TRADE_ID)));
+        when(cleanupTaskStore.findActiveTradeIds(Set.of(TRADE_ID))).thenReturn(Set.of(TRADE_ID));
+
+        reconciler(30).reconcileOnce();
+
+        verify(metrics).deferredToCleanup();
+        verifyNoInteractions(tradeExecutionRepository);
+        verify(orderBookService, never()).completeReservedOrder(any(), anyString());
+        verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
     }
 
     @Test
@@ -118,6 +140,7 @@ class ReservationReconcilerTest {
         return new ReservationReconciler(
                 orderBookService,
                 tradeExecutionRepository,
+                cleanupTaskStore,
                 metrics,
                 orphanThresholdSeconds,
                 100);

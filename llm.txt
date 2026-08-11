@@ -42,11 +42,11 @@ Auction lifecycle publication currently bypasses the CDA trade outbox. TDA is im
 - `trade_id` makes trade recording idempotent.
 - Outbox retry/backoff handles RabbitMQ publication failures.
 - Cleanup tasks use persistent status/leases/retries.
-- ReservationReconciler compares stale Redis reservations with durable trades and releases or completes them.
+- ReservationReconciler defers reservations with active cleanup tasks to ReservationCleanupWorker. It compares only unowned stale reservations with durable trades and releases or completes them.
 
 ## Known Risk
 
-The current Spring `taskScheduler` has one worker shared by cleanup, trade outbox polling, reconciliation, and auction jobs. A 2026-08-07 deep run observed a 9.380s cleanup batch and common downstream lag. Scheduler isolation is pending validation.
+Trade outbox polling and reservation maintenance have isolated schedulers. The remaining sustained bottleneck is the same-host `OrderConfirmed` intake path under combined Redis, trade transaction, outbox, and database pressure; use long-run backlog and correctness gates rather than short-window TPS.
 
 ## Key Paths
 

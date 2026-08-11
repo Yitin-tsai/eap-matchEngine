@@ -48,12 +48,12 @@ Order and Wallet consume `TradeExecutedEvent` directly and preserve their own du
 - `trade_executions`, `trade_outbox`, and the cleanup task share one database transaction.
 - `trade_id` makes repeated trade recording idempotent.
 - Trade outbox publication uses publisher confirms and persisted retry state.
-- Deferred cleanup has persisted tasks, leases, retry/backoff, and orphan reconciliation.
+- Deferred cleanup has persisted tasks, leases, retry/backoff, and orphan reconciliation. The reconciler defers to active cleanup tasks and only takes over stale reservations without a normal-path owner.
 - The TDA scheduler's direct event publication remains a documented reliability gap.
 
 ## Current Performance Risk
 
-The current Spring `taskScheduler` has one worker. `ReservationCleanupWorker`, `TradeOutboxRelay`, reconciliation, and auction schedules share it. A 2026-08-07 deep diagnostic observed a `9.380s` cleanup batch and matching Order/Wallet delivery lag; scheduler isolation is the next controlled experiment, not an adopted fix.
+Trade outbox polling and reservation maintenance now use isolated schedulers; the focused same-seed A/B passed its correctness gate and removed the earlier scheduler-serialization tail. The remaining sustained risk is same-host saturation in the `OrderConfirmed` intake path, where Redis reservation and the durable trade transaction share CPU and database pressure with the rest of the lifecycle. Short-window results must not be promoted over the long-run backlog gate.
 
 ## Run
 

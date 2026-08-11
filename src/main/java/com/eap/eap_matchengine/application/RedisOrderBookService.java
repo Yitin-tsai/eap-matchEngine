@@ -701,8 +701,11 @@ public class RedisOrderBookService {
         Instant resultStartedAt = Instant.now();
         if (result != null && result == 1L) {
             log.debug("Successfully completed reserved order {}", event.getOrderId());
+        } else if (result != null && result == 0L) {
+            log.debug("Reserved order {} was already completed for trade {}",
+                    event.getOrderId(), expectedTradeId);
         } else {
-            log.warn("Reserved order {} had no matching Redis reservation for trade {} to complete, result={}",
+            log.warn("Reserved order {} could not be completed for trade {}, result={}",
                     event.getOrderId(), expectedTradeId, result);
         }
         recordCompleteReservationResult(Duration.between(resultStartedAt, Instant.now()));

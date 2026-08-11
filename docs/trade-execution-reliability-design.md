@@ -60,7 +60,7 @@ Relay 可使用有限的 publisher executor 並行發布，但 executor 只有�
 - 批次標記完成；
 - 失敗使用持久化 retry/backoff，達上限後保留失敗狀態。
 
-`ReservationReconciler` 另外掃描 Redis 中超過門檻的 reservation：存在 durable trade 時完成或釋放剩餘量；不存在 durable trade 時釋放 orphan reservation。它是當機修復機制，不是下游 Order/Wallet completion reconciler。
+`ReservationReconciler` 另外掃描 Redis 中超過門檻的 reservation。若同一 `trade_id` 仍有 `PENDING` 或 `PROCESSING` cleanup task，reconciler 會保留 normal-path ownership 給 `ReservationCleanupWorker`，避免兩條恢復路徑重複執行 Redis cleanup。沒有 active cleanup task 時，存在 durable trade 就完成或釋放剩餘量；不存在 durable trade 就釋放 orphan reservation。它是當機修復機制，不是下游 Order/Wallet completion reconciler。
 
 ## 下游冪等與 ACK
 
@@ -106,9 +106,9 @@ Deep diagnostics 會對單機造成 observer effect，因此只能用來歸因�
 
 ## 已知排程風險
 
-截至 2026-08-07，MatchEngine 的 Spring `taskScheduler` 實測只有 1 條執行緒，trade outbox、reservation cleanup、reservation reconciliation 與 auction schedules 共用。deep mixed HTTP 診斷觀察到 reservation cleanup batch 最大 `9.380s`，同時 Match-to-Order 與 Match-to-Wallet p95 約 `7.38s`。
+2026-08-07 的 deep mixed HTTP 診斷觀察到單一 Spring scheduler 上的 reservation cleanup batch 最大 `9.380s`，同時 Match-to-Order 與 Match-to-Wallet p95 約 `7.38s`。後續同 seed A/B 將 trade outbox 與 reservation maintenance 分到獨立 scheduler，800 orders/s 階段的最大 backlog 從 `4090` 降至 `246`，兩個下游 p95 都降到約 `0.2s`，並通過完整正確性關卡，因此已採用 scheduler isolation。
 
-這支持「長 cleanup invocation 阻塞 outbox poll」的假設，但 scheduler isolation 尚未實作或採用。修正必須以同 seed A/B、完整正確性關卡、backlog 與 durable lag 證明，而不能只增加執行緒後看局部 TPS。
+隔離 scheduler 並未證明 800 orders/s 的 sustained capacity。現行長時間風險是同機飽和時 `OrderConfirmed` intake 的 Redis reserve 與 durable trade transaction 成本；reconciler/cleanup ownership 也必須避免在正常 backlog 下重複競爭。容量結論仍以相同 workload、backlog slope、完整收斂與 queue drain 為準。
 
 ## 已退役設計
 

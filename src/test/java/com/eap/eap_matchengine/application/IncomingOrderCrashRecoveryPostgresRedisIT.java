@@ -79,6 +79,8 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     @Autowired
     private ReservationReconcilerMetrics reconcilerMetrics;
     @Autowired
+    private ReservationCleanupTaskStore cleanupTaskStore;
+    @Autowired
     private RedissonClient redissonClient;
     @Autowired
     private RedisTemplate<String, String> redisTemplate;
@@ -168,6 +170,9 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         assertThat(orderBookService.countActiveReservations()).isEqualTo(1);
         assertThat(processingStore.state(INCOMING_ORDER_ID).status())
                 .isEqualTo(IncomingOrderProcessingStore.Status.PROCESSING);
+
+        assertThat(reservationReconciler().reconcileOnce()).isZero();
+        assertThat(orderBookService.countActiveReservations()).isEqualTo(1);
 
         cleanupWorker().cleanupOnce();
         assertThat(orderBookService.countActiveReservations()).isZero();
@@ -357,6 +362,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         return new ReservationReconciler(
                 orderBookService,
                 tradeExecutionRepository,
+                cleanupTaskStore,
                 reconcilerMetrics,
                 0,
                 100);

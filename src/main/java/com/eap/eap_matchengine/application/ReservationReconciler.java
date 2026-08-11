@@ -13,8 +13,11 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 import static com.eap.eap_matchengine.configuration.config.MatchEngineSchedulerConfig.RESERVATION_MAINTENANCE_SCHEDULER;
 
@@ -28,6 +31,7 @@ public class ReservationReconciler {
 
     private final RedisOrderBookService orderBookService;
     private final TradeExecutionRepository tradeExecutionRepository;
+    private final ReservationCleanupTaskStore cleanupTaskStore;
     private final ReservationReconcilerMetrics metrics;
     private final Duration orphanThreshold;
     private final int batchSize;
@@ -35,11 +39,13 @@ public class ReservationReconciler {
     public ReservationReconciler(
             RedisOrderBookService orderBookService,
             TradeExecutionRepository tradeExecutionRepository,
+            ReservationCleanupTaskStore cleanupTaskStore,
             ReservationReconcilerMetrics metrics,
             @Value("${eap.match-engine.reservation-reconciler.orphan-threshold-seconds:30}") long orphanThresholdSeconds,
             @Value("${eap.match-engine.reservation-reconciler.batch-size:100}") int batchSize) {
         this.orderBookService = orderBookService;
         this.tradeExecutionRepository = tradeExecutionRepository;
+        this.cleanupTaskStore = cleanupTaskStore;
         this.metrics = metrics;
         this.orphanThreshold = Duration.ofSeconds(orphanThresholdSeconds);
         this.batchSize = batchSize;
@@ -55,7 +61,8 @@ public class ReservationReconciler {
     int reconcileOnce() {
         List<RedisOrderBookService.ReservationSnapshot> reservations =
                 orderBookService.scanReservations(batchSize);
-        int actions = 0;
+        List<RedisOrderBookService.ReservationSnapshot> readyReservations = new ArrayList<>();
+        Set<String> readyTradeIds = new HashSet<>();
         for (RedisOrderBookService.ReservationSnapshot reservation : reservations) {
             metrics.scanned();
             if (!reservation.valid()) {
@@ -64,15 +71,31 @@ public class ReservationReconciler {
                         reservation.key(), reservation.invalidReason());
                 continue;
             }
+            if (!isOrphanReady(reservation)) {
+                continue;
+            }
+            readyReservations.add(reservation);
+            if (reservation.tradeId() != null) {
+                readyTradeIds.add(reservation.tradeId());
+            }
+        }
+        if (readyReservations.isEmpty()) {
+            return 0;
+        }
+
+        Set<String> activeCleanupTradeIds = cleanupTaskStore.findActiveTradeIds(readyTradeIds);
+        int actions = 0;
+        for (RedisOrderBookService.ReservationSnapshot reservation : readyReservations) {
+            if (activeCleanupTradeIds.contains(reservation.tradeId())) {
+                metrics.deferredToCleanup();
+                continue;
+            }
             actions += reconcileReservation(reservation);
         }
         return actions;
     }
 
     private int reconcileReservation(RedisOrderBookService.ReservationSnapshot reservation) {
-        if (!isOrphanReady(reservation)) {
-            return 0;
-        }
         OrderConfirmedEvent reservedOrder = reservation.order();
         Optional<TradeExecutionEntity> durableTrade = reservation.tradeId() == null
                 ? findLegacyDurableTrade(reservedOrder, reservedAtLowerBound(reservation))

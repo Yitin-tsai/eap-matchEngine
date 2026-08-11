@@ -11,6 +11,7 @@ public class ReservationReconcilerMetrics {
     private final Counter scannedTotal;
     private final Counter completedTotal;
     private final Counter releasedTotal;
+    private final Counter deferredToCleanupTotal;
     private final Counter invalidTotal;
     private final Counter failureTotal;
 
@@ -26,6 +27,9 @@ public class ReservationReconcilerMetrics {
                 .register(registry);
         this.releasedTotal = Counter.builder("match_engine_reservation_reconciler_released_total")
                 .description("Total Redis order reservations released by MatchEngine reconciliation")
+                .register(registry);
+        this.deferredToCleanupTotal = Counter.builder("match_engine_reservation_reconciler_deferred_to_cleanup_total")
+                .description("Total reservations left to an active durable cleanup task")
                 .register(registry);
         this.invalidTotal = Counter.builder("match_engine_reservation_reconciler_invalid_total")
                 .description("Total invalid Redis order reservations found by MatchEngine reconciliation")
@@ -45,6 +49,10 @@ public class ReservationReconcilerMetrics {
 
     public void released() {
         releasedTotal.increment();
+    }
+
+    public void deferredToCleanup() {
+        deferredToCleanupTotal.increment();
     }
 
     public void invalid() {
