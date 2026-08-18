@@ -90,6 +90,27 @@ tasks.register('matchDbCeilingProbe', JavaExec) {
     mainClass = 'com.eap.eap_matchengine.loadtest.MatchDbCeilingProbe'
 }
 
+tasks.register('reservationCleanupLoadProbe', JavaExec) {
+    group = 'verification'
+    description = 'Compare reservation cleanup batches using only MatchEngine PostgreSQL and Redis.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_matchengine.application.ReservationCleanupLoadProbe'
+}
+
+tasks.register('matchProcessorLoadProbe', JavaExec) {
+    group = 'verification'
+    description = 'Measure the combined MatchEngine processor path using only MatchEngine PostgreSQL and Redis.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_matchengine.application.MatchProcessorLoadProbe'
+}
+
+tasks.register('rabbitMatchIntakeProbe', JavaExec) {
+    group = 'verification'
+    description = 'Measure the RabbitMQ listener-to-MatchEngine boundary without Order or Wallet services.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_matchengine.application.RabbitMatchIntakeProbe'
+}
+
 tasks.register('outboxRelayCeilingProbe', JavaExec) {
     group = 'verification'
     description = 'Measure isolated Match/Order/Wallet outbox relay select, RabbitMQ confirm, and mark-SENT ceiling.'
