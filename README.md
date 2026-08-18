@@ -53,7 +53,7 @@ Order and Wallet consume `TradeExecutedEvent` directly and preserve their own du
 
 ## Current Performance Risk
 
-Trade outbox polling and reservation maintenance now use isolated schedulers; the focused same-seed A/B passed its correctness gate and removed the earlier scheduler-serialization tail. The remaining sustained risk is same-host saturation in the `OrderConfirmed` intake path, where Redis reservation and the durable trade transaction share CPU and database pressure with the rest of the lifecycle. Short-window results must not be promoted over the long-run backlog gate.
+Trade outbox polling and reservation maintenance now use isolated schedulers; the focused same-seed A/B passed its correctness gate and removed the earlier scheduler-serialization tail. Later isolated probes showed that the real RabbitMQ listener, Redis matching, durable trade write, cleanup, trade relay, and downstream fanout each clear the current full-chain rate when measured without the rest of the lifecycle. The remaining risk is integrated same-host contention across HTTP admission, reservation, matching, relays, settlement, databases, broker, JVMs, monitoring, and the load generator. These probes reject a standalone MatchEngine ceiling; they do not establish production capacity or justify increasing concurrency by itself.
 
 ## Run
 
@@ -67,5 +67,7 @@ Default port: `8082`; context path: `/match-engine`.
 
 - [Trade execution reliability design](docs/trade-execution-reliability-design.md)
 - [Market sequencing plan](docs/market-sequencing-plan.md)
-- [2026-08-07 mixed HTTP diagnostic](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/benchmarks/2026-08-07-canonical-mixed-http-diagnostic.md)
+- [2026-08-14 canonical mixed short-window boundary](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/benchmarks/2026-08-14-canonical-mixed-short-window-boundary.md)
+- [2026-08-14 RabbitMQ-to-Match isolated diagnostic](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/benchmarks/2026-08-14-rabbit-match-intake-isolated.md)
+- [2026-08-07 scheduler-isolation diagnostic](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/benchmarks/2026-08-07-canonical-mixed-http-diagnostic.md)
 - [EAP system architecture](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/architecture.md)
