@@ -102,6 +102,25 @@ class RedisOrderBookServiceTest {
     }
 
     @Test
+    void reserveBestMatchOrAddOrderWithSequenceLua_whenGuardedAddCompletes_shouldReturnCompletedAdmission() {
+        doReturn(List.of("__ADDED_COMPLETED__".getBytes(StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+        IncomingOrderProcessingStore.Claim claim = new IncomingOrderProcessingStore.Claim(
+                "match:incoming-order:states:00",
+                incomingBuyOrder().getOrderId().toString(),
+                "token",
+                "match:incoming-order:completed:TEST:0",
+                100L);
+
+        RedisOrderBookService.MatchOrAddResult result =
+                service.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuyOrder(), claim);
+
+        assertThat(result.orderAdded()).isTrue();
+        assertThat(result.incomingOrderAdmission())
+                .isEqualTo(RedisOrderBookService.IncomingOrderAdmission.COMPLETED);
+    }
+
+    @Test
     void reserveBestMatchOrAddOrderWithSequenceLua_whenGuardFindsCompletedOrder_shouldReturnDuplicate() {
         doReturn(List.of("__DUPLICATE__".getBytes(StandardCharsets.UTF_8)))
                 .when(redisTemplate).execute(any(RedisCallback.class));

@@ -123,6 +123,30 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     }
 
     @Test
+    void noMatchAdd_shouldAtomicallyCompleteGuardWithoutSeparateMarkerWrite() {
+        OrderConfirmedEvent incoming = order("BUY", 501, 1L, 3);
+        IncomingOrderProcessingStore markerFailingStore =
+                new FailOnceCompletedStore(redisTemplate);
+        OrderConfirmedProcessor processor = new OrderConfirmedProcessor(
+                matchingEngine(durableRecorder),
+                markerFailingStore,
+                tradeExecutionRepository,
+                redissonClient,
+                1);
+
+        processor.process(incoming);
+
+        assertThat(visibleAmount(incoming)).isEqualTo(3);
+        assertThat(processingStore.isCompleted(incoming)).isTrue();
+        assertThat(processingStore.state(INCOMING_ORDER_ID)).isNull();
+        assertThat(tradeCount()).isZero();
+
+        processor.process(incoming);
+        assertThat(visibleAmount(incoming)).isEqualTo(3);
+        assertThat(tradeCount()).isZero();
+    }
+
+    @Test
     void staleCleanup_shouldNotDeleteNewerReservationForSameOrder() throws Exception {
         OrderConfirmedEvent resting = order("BUY", 611, 1L, 1);
         OrderConfirmedEvent firstIncoming = order("SELL", 612, 2L, 1);

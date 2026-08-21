@@ -51,6 +51,9 @@ public class OrderConfirmedProcessor {
                 processingStore.newClaim(source);
         MatchingEngineService.GuardedMatchResult result =
                 matchingEngineService.tryMatchGuarded(orderToProcess, claim);
+        if (result == MatchingEngineService.GuardedMatchResult.PROCESSED_AND_COMPLETED) {
+            return true;
+        }
         if (result == MatchingEngineService.GuardedMatchResult.PROCESSED) {
             processingStore.markCompleted(source);
             return true;
@@ -110,6 +113,9 @@ public class OrderConfirmedProcessor {
                         matchingEngineService.tryMatchGuarded(recovered, recoveryClaim);
                 if (result == MatchingEngineService.GuardedMatchResult.IN_PROGRESS) {
                     return false;
+                }
+                if (result == MatchingEngineService.GuardedMatchResult.PROCESSED_AND_COMPLETED) {
+                    return true;
                 }
             }
             processingStore.markCompleted(source);

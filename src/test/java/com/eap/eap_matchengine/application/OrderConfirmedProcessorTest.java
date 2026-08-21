@@ -76,6 +76,19 @@ class OrderConfirmedProcessorTest {
     }
 
     @Test
+    void processOrderAddedAndCompletedByLua_shouldNotWriteCompletedMarkerAgain() {
+        when(matchingEngineService.tryMatchGuarded(any(), any()))
+                .thenReturn(MatchingEngineService.GuardedMatchResult.PROCESSED_AND_COMPLETED);
+
+        processor.process(order("SELL", 5));
+
+        verify(processingStore).newClaim(any());
+        verify(matchingEngineService).tryMatchGuarded(any(), any());
+        verify(processingStore, never()).markCompleted(any(OrderConfirmedEvent.class));
+        verifyNoInteractions(tradeExecutionRepository);
+    }
+
+    @Test
     void processCompletedRedelivery_shouldNotMatchAgain() {
         when(matchingEngineService.tryMatchGuarded(any(), any()))
                 .thenReturn(MatchingEngineService.GuardedMatchResult.DUPLICATE);
@@ -171,6 +184,23 @@ class OrderConfirmedProcessorTest {
         verify(matchingEngineService, times(2)).tryMatchGuarded(captor.capture(), any());
         assertThat(captor.getAllValues().get(1).getAmount()).isEqualTo(2);
         verify(processingStore).markCompleted(any(OrderConfirmedEvent.class));
+        verify(lock).unlock();
+    }
+
+    @Test
+    void processInterruptedOrder_whenLuaAddsRemainderAndCompletes_shouldNotWriteMarkerAgain() {
+        when(matchingEngineService.tryMatchGuarded(any(), any()))
+                .thenReturn(
+                        MatchingEngineService.GuardedMatchResult.IN_PROGRESS,
+                        MatchingEngineService.GuardedMatchResult.PROCESSED_AND_COMPLETED);
+        when(processingStore.state(any(OrderConfirmedEvent.class)))
+                .thenReturn(IncomingOrderProcessingStore.State.processing("existing", 0L));
+        when(tradeExecutionRepository.sumQuantityByBuyerOrderId(ORDER_ID)).thenReturn(3L);
+
+        processor.process(order("BUY", 5));
+
+        verify(matchingEngineService, times(2)).tryMatchGuarded(any(), any());
+        verify(processingStore, never()).markCompleted(any(OrderConfirmedEvent.class));
         verify(lock).unlock();
     }
 

@@ -89,7 +89,10 @@ public class MatchingEngineService {
           metrics.orderAdded();
           log.info("No matching order found, added to order book: orderId={}, amount={}",
               incomingOrder.getOrderId(), incomingOrder.getAmount());
-          break;
+          return matchAttempt.incomingOrderAdmission()
+              == RedisOrderBookService.IncomingOrderAdmission.COMPLETED
+              ? GuardedMatchResult.PROCESSED_AND_COMPLETED
+              : GuardedMatchResult.PROCESSED;
         }
 
         RedisOrderBookService.ReservedMatch reservedMatch = matchAttempt.reservedMatch();
@@ -211,6 +214,7 @@ public class MatchingEngineService {
 
   enum GuardedMatchResult {
     PROCESSED,
+    PROCESSED_AND_COMPLETED,
     DUPLICATE,
     IN_PROGRESS
   }

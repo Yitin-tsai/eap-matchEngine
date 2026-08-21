@@ -24,6 +24,7 @@
 -- Returns:
 --   {'__MATCH__', resting order JSON, match ID}
 --   {'__ADDED__'}
+--   {'__ADDED_COMPLETED__'} when guarded processing completes with the add
 --   {'__MISSING_ORDER_DETAIL__:<orderId>'}
 --   {'__RESERVATION_EXISTS__:<orderId>'}
 --   {'__DUPLICATE__'}
@@ -74,6 +75,11 @@ if #orders == 0 then
     redis.call('SET', incoming_order_id_key, incoming_order_json)
     if user_order_index_enabled then
         redis.call('SADD', incoming_user_orders_key, incoming_order_id)
+    end
+    if incoming_state_hash_key then
+        redis.call('SETBIT', completed_bitmap_key, ARGV[9], 1)
+        redis.call('HDEL', incoming_state_hash_key, ARGV[7])
+        return {'__ADDED_COMPLETED__'}
     end
     return {'__ADDED__'}
 end

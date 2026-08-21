@@ -539,6 +539,10 @@ public class RedisOrderBookService {
             log.debug("No matching order found; added incoming order {} to orderbook", incomingOrder.getOrderId());
             return MatchOrAddResult.added();
         }
+        if ("__ADDED_COMPLETED__".equals(status)) {
+            log.debug("No matching order found; added and completed incoming order {}", incomingOrder.getOrderId());
+            return MatchOrAddResult.addedAndCompleted();
+        }
         if ("__DUPLICATE__".equals(status)) {
             return MatchOrAddResult.duplicate();
         }
@@ -585,6 +589,7 @@ public class RedisOrderBookService {
 
     public enum IncomingOrderAdmission {
         CLAIMED,
+        COMPLETED,
         DUPLICATE,
         IN_PROGRESS
     }
@@ -595,6 +600,10 @@ public class RedisOrderBookService {
             IncomingOrderAdmission incomingOrderAdmission) {
         public static MatchOrAddResult added() {
             return new MatchOrAddResult(true, null, IncomingOrderAdmission.CLAIMED);
+        }
+
+        public static MatchOrAddResult addedAndCompleted() {
+            return new MatchOrAddResult(true, null, IncomingOrderAdmission.COMPLETED);
         }
 
         public static MatchOrAddResult matched(ReservedMatch reservedMatch) {

@@ -179,6 +179,30 @@ class MatchingEngineServiceTest {
     }
 
     @Test
+    void tryMatchGuarded_whenNoMatchCompletesInLua_shouldReturnCompletedResult() {
+        OrderConfirmedEvent incomingSell = order(
+                "SELL",
+                "00000000-0000-0000-0000-000000000033",
+                "00000000-0000-0000-0000-000000000034",
+                402L,
+                1);
+        IncomingOrderProcessingStore.Claim claim = new IncomingOrderProcessingStore.Claim(
+                "state-hash",
+                incomingSell.getOrderId().toString(),
+                "token",
+                "completed-bitmap",
+                401L);
+        when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingSell, claim))
+                .thenReturn(RedisOrderBookService.MatchOrAddResult.addedAndCompleted());
+
+        MatchingEngineService.GuardedMatchResult result = service.tryMatchGuarded(incomingSell, claim);
+
+        assertThat(result).isEqualTo(MatchingEngineService.GuardedMatchResult.PROCESSED_AND_COMPLETED);
+        verify(tradeExecutionRecorder, never()).record(any());
+        verify(matchingEngineMetrics).orderAdded();
+    }
+
+    @Test
     void tryMatchGuarded_whenLuaDetectsDuplicate_shouldNotTouchOrderBookOrRecordTrade() throws Exception {
         OrderConfirmedEvent incomingBuy = order(
                 "BUY",
