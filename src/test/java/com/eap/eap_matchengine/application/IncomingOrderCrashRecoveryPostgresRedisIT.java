@@ -1,6 +1,8 @@
 package com.eap.eap_matchengine.application;
 
 import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderCancellationRequestedEvent;
+import com.eap.common.event.OrderCancellationResultEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -88,11 +90,18 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     private RedisConnectionFactory redisConnectionFactory;
     @Autowired
     private JdbcTemplate jdbc;
+    @Autowired
+    private OrderCancellationCoordinator cancellationCoordinator;
+    @Autowired
+    private OrderCancellationDecisionStore cancellationDecisions;
+    @Autowired
+    private OrderConfirmedProcessor orderConfirmedProcessor;
 
     @BeforeEach
     void resetState() {
         jdbc.execute("""
                 TRUNCATE TABLE
+                    match_engine.order_cancellations,
                     match_engine.reservation_cleanup_tasks,
                     match_engine.trade_outbox,
                     match_engine.trade_executions
@@ -101,6 +110,147 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         try (var connection = redisConnectionFactory.getConnection()) {
             connection.serverCommands().flushDb();
         }
+    }
+
+    @Test
+    void cancellationLua_shouldReturnExactRemovedOrderAndRemainIdempotent() throws Exception {
+        OrderConfirmedEvent open = order("BUY", 501, 1L, 7);
+        UUID cancellationId = UUID.randomUUID();
+        orderBookService.addOrder(open);
+
+        RedisOrderBookService.CancellationArbitration first =
+                orderBookService.arbitrateCancellation(open, cancellationId);
+        RedisOrderBookService.CancellationArbitration retry =
+                orderBookService.arbitrateCancellation(open, cancellationId);
+
+        assertThat(first.outcome()).isEqualTo(RedisOrderBookService.CancellationOutcome.CANCELLED);
+        assertThat(first.cancelledOrder().getAmount()).isEqualTo(7);
+        assertThat(retry.outcome())
+                .isEqualTo(RedisOrderBookService.CancellationOutcome.ALREADY_CANCELLED_BY_REQUEST);
+        assertThat(retry.cancelledOrder().getAmount()).isEqualTo(7);
+        assertThat(orderBookService.findOpenOrder(open.getOrderId())).isNull();
+    }
+
+    @Test
+    void cancellationLua_shouldLoseWhenMatchingAlreadyReservedTheOrder() throws Exception {
+        OrderConfirmedEvent resting = order("SELL", 501, 1L, 7);
+        OrderConfirmedEvent incoming = order("BUY", 502, 2L, 1);
+        orderBookService.addOrder(resting);
+        RedisOrderBookService.ReservedMatch reserved =
+                orderBookService.reserveBestMatchOrderWithSequenceLua(incoming);
+
+        RedisOrderBookService.CancellationArbitration result =
+                orderBookService.arbitrateCancellation(resting, UUID.randomUUID());
+
+        assertThat(reserved.order().getOrderId()).isEqualTo(resting.getOrderId());
+        assertThat(result.outcome()).isEqualTo(RedisOrderBookService.CancellationOutcome.NOT_OPEN);
+        assertThat(processingStore.isReserved(resting.getOrderId())).isTrue();
+        assertThat(orderBookService.findOpenOrder(resting.getOrderId())).isNotNull();
+    }
+
+    @Test
+    void cancellationBeforeOrderConfirmed_shouldPersistDecisionAndPreventAdmission() {
+        OrderConfirmedEvent order = order("BUY", 501, 1L, 7);
+        UUID cancellationId = UUID.randomUUID();
+        cancellationCoordinator.request(cancellationRequest(order, cancellationId));
+
+        orderConfirmedProcessor.process(order);
+
+        OrderCancellationDecisionStore.Decision decision = cancellationDecisions.find(cancellationId);
+        assertThat(decision.status()).isEqualTo(OrderCancellationResultEvent.CANCELLED);
+        assertThat(decision.cancelledAmount()).isEqualTo(7);
+        assertThat(orderBookService.findOpenOrder(order.getOrderId())).isNull();
+        assertThat(processingStore.isCompleted(order)).isTrue();
+        assertThat(tradeCount()).isZero();
+        assertThat(jdbc.queryForObject("""
+                SELECT count(*)
+                FROM match_engine.trade_outbox
+                WHERE event_type = 'OrderCancellationResultEvent'
+                  AND aggregate_id = ?
+                """, Long.class, cancellationId.toString())).isEqualTo(1L);
+    }
+
+    @Test
+    void pendingDecisionWithoutRedisIntent_whenMatchingWins_shouldConvergeAsAlreadyMatched() throws Exception {
+        OrderConfirmedEvent resting = order("SELL", 502, 1L, 7);
+        OrderConfirmedEvent incoming = order("BUY", 501, 2L, 7);
+        UUID cancellationId = UUID.randomUUID();
+        orderBookService.addOrder(resting);
+
+        cancellationDecisions.begin(cancellationRequest(incoming, cancellationId), null);
+        orderConfirmedProcessor.process(incoming);
+        cancellationCoordinator.reconcilePending();
+
+        assertThat(tradeCount()).isEqualTo(1);
+        assertThat(cancellationDecisions.find(cancellationId).status())
+                .isEqualTo(OrderCancellationResultEvent.ALREADY_MATCHED);
+        assertThat(jdbc.queryForObject("""
+                SELECT count(*)
+                FROM match_engine.trade_outbox
+                WHERE event_type = 'OrderCancellationResultEvent'
+                  AND aggregate_id = ?
+                """, Long.class, cancellationId.toString())).isEqualTo(1L);
+    }
+
+    @Test
+    void crashAfterRedisCancellationBeforeDecisionCommit_shouldRecoverFromMarker() throws Exception {
+        OrderConfirmedEvent order = order("BUY", 501, 1L, 7);
+        UUID cancellationId = UUID.randomUUID();
+        OrderCancellationRequestedEvent request = cancellationRequest(order, cancellationId);
+        orderBookService.addOrder(order);
+        cancellationDecisions.begin(request, order);
+
+        RedisOrderBookService.CancellationArbitration redisResult =
+                orderBookService.arbitrateCancellation(order, cancellationId);
+
+        assertThat(redisResult.outcome()).isEqualTo(RedisOrderBookService.CancellationOutcome.CANCELLED);
+        assertThat(cancellationDecisions.find(cancellationId).status()).isEqualTo("PENDING");
+        assertThat(orderBookService.findOpenOrder(order.getOrderId())).isNull();
+
+        cancellationCoordinator.reconcilePending();
+
+        assertThat(cancellationDecisions.find(cancellationId).status())
+                .isEqualTo(OrderCancellationResultEvent.CANCELLED);
+        assertThat(jdbc.queryForObject("""
+                SELECT count(*)
+                FROM match_engine.trade_outbox
+                WHERE event_type = 'OrderCancellationResultEvent'
+                  AND aggregate_id = ?
+                """, Long.class, cancellationId.toString())).isEqualTo(1L);
+    }
+
+    @Test
+    void crashAfterPreAdmissionDecisionBeforeCompletedMarker_shouldHealOnRedelivery() {
+        OrderConfirmedEvent order = order("BUY", 501, 1L, 7);
+        UUID cancellationId = UUID.randomUUID();
+        cancellationCoordinator.request(cancellationRequest(order, cancellationId));
+        IncomingOrderProcessingStore markerFailingStore =
+                new FailOnceCompletedStore(redisTemplate);
+        OrderConfirmedProcessor crashingProcessor = new OrderConfirmedProcessor(
+                matchingEngine(durableRecorder),
+                markerFailingStore,
+                tradeExecutionRepository,
+                cancellationCoordinator,
+                redissonClient,
+                1);
+
+        assertThatThrownBy(() -> crashingProcessor.process(order))
+                .isInstanceOf(SimulatedCrash.class);
+
+        assertThat(cancellationDecisions.find(cancellationId).status())
+                .isEqualTo(OrderCancellationResultEvent.CANCELLED);
+        assertThat(markerFailingStore.isCompleted(order)).isFalse();
+
+        crashingProcessor.process(order);
+
+        assertThat(markerFailingStore.isCompleted(order)).isTrue();
+        assertThat(tradeCount()).isZero();
+        assertThat(jdbc.queryForObject("""
+                SELECT count(*)
+                FROM match_engine.trade_outbox
+                WHERE event_type = 'OrderCancellationResultEvent'
+                  AND aggregate_id = ?
+                """, Long.class, cancellationId.toString())).isEqualTo(1L);
     }
 
     @Test
@@ -131,6 +281,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                 matchingEngine(durableRecorder),
                 markerFailingStore,
                 tradeExecutionRepository,
+                cancellationCoordinator,
                 redissonClient,
                 1);
 
@@ -289,6 +440,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                 matchingEngine(durableRecorder),
                 markerFailingStore,
                 tradeExecutionRepository,
+                cancellationCoordinator,
                 redissonClient,
                 1);
 
@@ -335,6 +487,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                 matchingEngineService,
                 processingStore,
                 tradeExecutionRepository,
+                cancellationCoordinator,
                 redissonClient,
                 1);
     }
@@ -453,6 +606,18 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                 .amount(amount)
                 .orderType(side)
                 .createdAt(LocalDateTime.of(2026, 8, 6, 12, 0).plusSeconds(sequence))
+                .build();
+    }
+
+    private OrderCancellationRequestedEvent cancellationRequest(
+            OrderConfirmedEvent order,
+            UUID cancellationId) {
+        return OrderCancellationRequestedEvent.builder()
+                .cancellationId(cancellationId)
+                .orderId(order.getOrderId())
+                .userId(order.getUserId())
+                .originalAmount(order.getAmount())
+                .requestedAt(LocalDateTime.now())
                 .build();
     }
 

@@ -1,10 +1,8 @@
 package com.eap.eap_matchengine.controller;
 
-import com.eap.common.event.OrderCancelEvent;
 import com.eap.common.event.OrderConfirmedEvent;
 import com.eap.common.dto.OrderBookResponseDto;
 import com.eap.common.dto.MarketSummaryDto;
-import com.eap.eap_matchengine.application.OrderCancelService;
 import com.eap.eap_matchengine.application.OrderQueryService;
 import com.eap.eap_matchengine.application.RedisMarketDataService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -18,18 +16,10 @@ import java.util.List;
 @RequestMapping("v1/order")
 public class OrderController {
     @Autowired
-    OrderCancelService orderCancelService;
-
-    @Autowired
     OrderQueryService orderQueryService;
     
     @Autowired
     RedisMarketDataService redisMarketDataService;
-
-    @DeleteMapping("cancel")
-    public boolean cancelOrder(@RequestBody OrderCancelEvent event) {
-    return  orderCancelService.execute(event);
-    }
 
     @GetMapping("query/{userId}")
     public ResponseEntity<List<OrderConfirmedEvent>> queryOrder(@PathVariable UUID userId) {

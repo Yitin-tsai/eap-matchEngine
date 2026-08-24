@@ -83,6 +83,10 @@ public class MatchingEngineService {
             == RedisOrderBookService.IncomingOrderAdmission.IN_PROGRESS) {
           return GuardedMatchResult.IN_PROGRESS;
         }
+        if (matchAttempt.incomingOrderAdmission()
+            == RedisOrderBookService.IncomingOrderAdmission.CANCELLATION_PENDING) {
+          return GuardedMatchResult.CANCELLATION_PENDING;
+        }
 
         if (matchAttempt.orderAdded()) {
           addedToBook = true;
@@ -216,7 +220,8 @@ public class MatchingEngineService {
     PROCESSED,
     PROCESSED_AND_COMPLETED,
     DUPLICATE,
-    IN_PROGRESS
+    IN_PROGRESS,
+    CANCELLATION_PENDING
   }
 
   private boolean recordTrade(TradeExecutedEvent tradeExecutedEvent, ReservationCleanupTask cleanupTask) {

@@ -21,6 +21,7 @@ public class OrderConfirmedProcessor {
     private final MatchingEngineService matchingEngineService;
     private final IncomingOrderProcessingStore processingStore;
     private final TradeExecutionRepository tradeExecutionRepository;
+    private final OrderCancellationCoordinator cancellationCoordinator;
     private final RedissonClient redissonClient;
     private final Duration staleProcessingThreshold;
 
@@ -28,12 +29,14 @@ public class OrderConfirmedProcessor {
             MatchingEngineService matchingEngineService,
             IncomingOrderProcessingStore processingStore,
             TradeExecutionRepository tradeExecutionRepository,
+            OrderCancellationCoordinator cancellationCoordinator,
             RedissonClient redissonClient,
             @Value("${eap.match-engine.incoming-order-recovery.stale-processing-seconds:30}")
             long staleProcessingSeconds) {
         this.matchingEngineService = matchingEngineService;
         this.processingStore = processingStore;
         this.tradeExecutionRepository = tradeExecutionRepository;
+        this.cancellationCoordinator = cancellationCoordinator;
         this.redissonClient = redissonClient;
         this.staleProcessingThreshold = Duration.ofSeconds(Math.max(1, staleProcessingSeconds));
     }
@@ -51,18 +54,7 @@ public class OrderConfirmedProcessor {
                 processingStore.newClaim(source);
         MatchingEngineService.GuardedMatchResult result =
                 matchingEngineService.tryMatchGuarded(orderToProcess, claim);
-        if (result == MatchingEngineService.GuardedMatchResult.PROCESSED_AND_COMPLETED) {
-            return true;
-        }
-        if (result == MatchingEngineService.GuardedMatchResult.PROCESSED) {
-            processingStore.markCompleted(source);
-            return true;
-        }
-        if (result == MatchingEngineService.GuardedMatchResult.DUPLICATE) {
-            log.debug("Ignoring completed OrderConfirmed redelivery: orderId={}", source.getOrderId());
-            return true;
-        }
-        return false;
+        return finishGuardedAttempt(source, orderToProcess, result);
     }
 
     private void awaitCompletionOrRecover(OrderConfirmedEvent source) {
@@ -114,7 +106,7 @@ public class OrderConfirmedProcessor {
                 if (result == MatchingEngineService.GuardedMatchResult.IN_PROGRESS) {
                     return false;
                 }
-                if (result == MatchingEngineService.GuardedMatchResult.PROCESSED_AND_COMPLETED) {
+                if (finishGuardedAttempt(source, recovered, result)) {
                     return true;
                 }
             }
@@ -123,6 +115,29 @@ public class OrderConfirmedProcessor {
         } finally {
             lock.unlock();
         }
+    }
+
+    private boolean finishGuardedAttempt(
+            OrderConfirmedEvent source,
+            OrderConfirmedEvent processedOrder,
+            MatchingEngineService.GuardedMatchResult result) {
+        return switch (result) {
+            case PROCESSED_AND_COMPLETED -> true;
+            case PROCESSED -> {
+                processingStore.markCompleted(source);
+                yield true;
+            }
+            case CANCELLATION_PENDING -> {
+                cancellationCoordinator.resolveAdmissionBlockedByCancellationIntent(processedOrder);
+                processingStore.markCompleted(source);
+                yield true;
+            }
+            case DUPLICATE -> {
+                log.debug("Ignoring completed OrderConfirmed redelivery: orderId={}", source.getOrderId());
+                yield true;
+            }
+            case IN_PROGRESS -> false;
+        };
     }
 
     private boolean isCompleted(IncomingOrderProcessingStore.State state) {

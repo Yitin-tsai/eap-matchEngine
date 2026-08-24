@@ -19,6 +19,7 @@ import static com.eap.common.constants.RabbitMQConstants.*;
  *
  * This module consumes:
  * - order.confirmed events (wallet-validated orders for CDA matching)
+ * - order.cancellation.requested events (durable CDA cancellation commands)
  * - auction.bid.confirmed events (wallet-confirmed auction bids for Redis collection)
  *
  * This module publishes:
@@ -39,6 +40,13 @@ public class RabbitMQConfig {
     @Bean
     public Queue matchEngineOrderConfirmedQueue() {
         return QueueBuilder.durable(MATCH_ENGINE_ORDER_CONFIRMED_QUEUE)
+                .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+                .build();
+    }
+
+    @Bean
+    public Queue matchEngineOrderCancellationRequestedQueue() {
+        return QueueBuilder.durable(MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE)
                 .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
                 .build();
     }
@@ -66,6 +74,15 @@ public class RabbitMQConfig {
         return BindingBuilder.bind(matchEngineOrderConfirmedQueue)
                 .to(orderExchange)
                 .with(ORDER_CONFIRMED_KEY);
+    }
+
+    @Bean
+    public Binding matchEngineOrderCancellationRequestedBinding(
+            @Qualifier("matchEngineOrderCancellationRequestedQueue") Queue queue,
+            @Qualifier("orderExchange") TopicExchange orderExchange) {
+        return BindingBuilder.bind(queue)
+                .to(orderExchange)
+                .with(ORDER_CANCELLATION_REQUESTED_KEY);
     }
 
     // ==================== Auction (Timed Double Auction) ====================

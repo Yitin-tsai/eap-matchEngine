@@ -5,7 +5,7 @@
 
 > 實作狀態：2026-06-03 已完成 Phase 1、Phase 2，並先以 Redis ZSET composite score 完成 price + sequence 的 MVP 排序。完整 price-level FIFO queue 保留為下一階段強化。
 
-> 2026-08-07 補充：現行成交事件是 `TradeExecutedEvent`，包含買賣雙方 `marketSequence`；`OrderSubmittedEvent` 與 `OrderConfirmedEvent` 也已帶有 `marketId`/`marketSequence`。舊 `OrderMatchedEvent` 已退役。下方「背景限制」與分階段修改描述是 2026-06 的演進紀錄；完整 price-level FIFO、跨節點分片與 Super Stream 仍是未來方向。現行 CDA 容量測試以單一市場、單一撮合權威與 Redis Lua 原子操作為邊界，不能代表 TDA。
+> 2026-08-21 補充：現行成交事件是 `TradeExecutedEvent`，包含買賣雙方 `marketSequence`；`OrderSubmittedEvent` 與 `OrderConfirmedEvent` 也已帶有 `marketId`/`marketSequence`。舊 `OrderMatchedEvent` 與讀取 legacy `audit_events` 的 `OrderReplayService` 均已退役。下方「背景限制」與分階段 checklist 是 2026-06 的演進紀錄；完整 price-level FIFO、跨節點分片與 Super Stream 仍是未來方向。現行 CDA 容量測試以單一市場、單一撮合權威與 Redis Lua 原子操作為邊界，不能代表 TDA。
 
 ## 背景
 

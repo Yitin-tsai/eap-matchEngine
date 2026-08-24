@@ -42,6 +42,8 @@ class OrderConfirmedProcessorTest {
     @Mock
     private TradeExecutionRepository tradeExecutionRepository;
     @Mock
+    private OrderCancellationCoordinator cancellationCoordinator;
+    @Mock
     private RedissonClient redissonClient;
     @Mock
     private RLock lock;
@@ -53,7 +55,8 @@ class OrderConfirmedProcessorTest {
         lenient().when(redissonClient.getLock("lock:incoming-order:" + ORDER_ID)).thenReturn(lock);
         lenient().when(processingStore.newClaim(any())).thenReturn(CLAIM);
         processor = new OrderConfirmedProcessor(
-                matchingEngineService, processingStore, tradeExecutionRepository, redissonClient, 1);
+                matchingEngineService, processingStore, tradeExecutionRepository,
+                cancellationCoordinator, redissonClient, 1);
     }
 
     @Test
@@ -73,6 +76,7 @@ class OrderConfirmedProcessorTest {
         assertThat(captor.getValue().getAmount()).isEqualTo(5);
         assertThat(source.getAmount()).isEqualTo(5);
         verifyNoInteractions(tradeExecutionRepository);
+        verifyNoInteractions(cancellationCoordinator);
     }
 
     @Test
@@ -86,6 +90,24 @@ class OrderConfirmedProcessorTest {
         verify(matchingEngineService).tryMatchGuarded(any(), any());
         verify(processingStore, never()).markCompleted(any(OrderConfirmedEvent.class));
         verifyNoInteractions(tradeExecutionRepository);
+    }
+
+    @Test
+    void processCancellationAfterPartialIncomingMatch_shouldCancelOnlyRemainder() {
+        OrderConfirmedEvent source = order("BUY", 5);
+        when(matchingEngineService.tryMatchGuarded(any(), any())).thenAnswer(invocation -> {
+            OrderConfirmedEvent workingOrder = invocation.getArgument(0);
+            workingOrder.setAmount(2);
+            return MatchingEngineService.GuardedMatchResult.CANCELLATION_PENDING;
+        });
+
+        processor.process(source);
+
+        ArgumentCaptor<OrderConfirmedEvent> cancelled = ArgumentCaptor.forClass(OrderConfirmedEvent.class);
+        verify(cancellationCoordinator).resolveAdmissionBlockedByCancellationIntent(cancelled.capture());
+        assertThat(cancelled.getValue().getAmount()).isEqualTo(2);
+        assertThat(source.getAmount()).isEqualTo(5);
+        verify(processingStore).markCompleted(source);
     }
 
     @Test
@@ -184,6 +206,26 @@ class OrderConfirmedProcessorTest {
         verify(matchingEngineService, times(2)).tryMatchGuarded(captor.capture(), any());
         assertThat(captor.getAllValues().get(1).getAmount()).isEqualTo(2);
         verify(processingStore).markCompleted(any(OrderConfirmedEvent.class));
+        verify(lock).unlock();
+    }
+
+    @Test
+    void processInterruptedOrder_whenCancellationWinsRecovery_shouldCancelRecoveredRemainder() {
+        when(matchingEngineService.tryMatchGuarded(any(), any()))
+                .thenReturn(
+                        MatchingEngineService.GuardedMatchResult.IN_PROGRESS,
+                        MatchingEngineService.GuardedMatchResult.CANCELLATION_PENDING);
+        when(processingStore.state(any(OrderConfirmedEvent.class)))
+                .thenReturn(IncomingOrderProcessingStore.State.processing("existing", 0L));
+        when(tradeExecutionRepository.sumQuantityByBuyerOrderId(ORDER_ID)).thenReturn(3L);
+
+        OrderConfirmedEvent source = order("BUY", 5);
+        processor.process(source);
+
+        ArgumentCaptor<OrderConfirmedEvent> cancelled = ArgumentCaptor.forClass(OrderConfirmedEvent.class);
+        verify(cancellationCoordinator).resolveAdmissionBlockedByCancellationIntent(cancelled.capture());
+        assertThat(cancelled.getValue().getAmount()).isEqualTo(2);
+        verify(processingStore).markCompleted(source);
         verify(lock).unlock();
     }
 

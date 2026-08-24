@@ -16,6 +16,15 @@ OrderConfirmedEvent
 
 If no trade is found, the confirmed order remains in the Redis order book. A reservation reconciler repairs stale Redis reservations after crashes by comparing them with durable trade facts.
 
+Cancellation is an asynchronous MatchEngine-owned decision. PostgreSQL keeps its
+recoverable decision state, while Redis owns the atomic arbitration boundary. An intent
+blocks an order that has not been admitted; for a resting order, cancellation Lua and
+matching Lua compete to remove the same ZSET member. Normal order admission does not
+query the cancellation table. Pending decisions are reconciled after admission becomes
+a durable trade or a visible remainder, then published through the Match outbox. The
+decision stores the immutable original amount separately from the exact unmatched amount
+removed by Redis, and reconciliation uses leased claims with retry backoff.
+
 TDA follows a separate scheduled flow:
 
 ```text
@@ -37,6 +46,7 @@ scheduled clearing
 | Redis order book and price-time decision | Wallet validation or settlement |
 | Matching sequence and `TradeExecuted` fact | Order lifecycle projection |
 | Trade outbox and retry state | Order/Wallet completion callbacks or a completion view |
+| Durable cancellation arbitration and exact removed remainder | Order cancellation request acceptance or Wallet asset release |
 | Deferred Redis reservation cleanup and reconciliation | AI or API aggregation |
 | TDA bid collection, scheduling and clearing result | TDA Wallet settlement or Order result view |
 
@@ -49,6 +59,8 @@ Order and Wallet consume `TradeExecutedEvent` directly and preserve their own du
 - `trade_id` makes repeated trade recording idempotent.
 - Trade outbox publication uses publisher confirms and persisted retry state.
 - Deferred cleanup has persisted tasks, leases, retry/backoff, and orphan reconciliation. The reconciler defers to active cleanup tasks and only takes over stale reservations without a normal-path owner.
+- Cancellation intent, order admission, and visible-order removal share Redis atomic boundaries; the durable result is published through the existing outbox relay.
+- A future Redis-generation readiness gate must pause admission and cancellation consumers before rebuilding volatile matching state. Automatic full-book rebuild is not implemented in the current scope.
 - The TDA scheduler's direct event publication remains a documented reliability gap.
 
 ## Current Performance Risk

@@ -263,7 +263,7 @@ public class TradeOutboxRelay {
                     for (PublishResult result : results) {
                         if (result.correlationData().getReturned() != null) {
                             throw new AmqpException(
-                                    "Unroutable TradeExecutedEvent: id=" + result.entry().id());
+                                    "Unroutable Match outbox event: id=" + result.entry().id());
                         }
                     }
                 }
@@ -313,7 +313,7 @@ public class TradeOutboxRelay {
         try {
             CorrelationData correlationData = new CorrelationData(Long.toString(entry.id()));
             operations.send(
-                    RabbitMQConstants.TRADE_EXCHANGE,
+                    exchangeFor(entry),
                     entry.routingKey(),
                     toJsonMessage(entry),
                     correlationData);
@@ -328,8 +328,9 @@ public class TradeOutboxRelay {
     private Message toJsonMessage(OutboxRow entry) {
         Instant startedAt = Instant.now();
         try {
-            if (!"TradeExecutedEvent".equals(entry.eventType())) {
-                throw new IllegalArgumentException("Unknown trade outbox event type: " + entry.eventType());
+            if (!"TradeExecutedEvent".equals(entry.eventType())
+                    && !"OrderCancellationResultEvent".equals(entry.eventType())) {
+                throw new IllegalArgumentException("Unknown Match outbox event type: " + entry.eventType());
             }
             MessageProperties properties = new MessageProperties();
             properties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
@@ -339,6 +340,15 @@ public class TradeOutboxRelay {
         } finally {
             metrics.recordMessageBuild(Duration.between(startedAt, Instant.now()));
         }
+    }
+
+    private String exchangeFor(OutboxRow entry) {
+        return switch (entry.eventType()) {
+            case "TradeExecutedEvent" -> RabbitMQConstants.TRADE_EXCHANGE;
+            case "OrderCancellationResultEvent" -> RabbitMQConstants.ORDER_EXCHANGE;
+            default -> throw new IllegalArgumentException(
+                    "Unknown Match outbox event type: " + entry.eventType());
+        };
     }
 
     private String payload(OutboxRow entry) {

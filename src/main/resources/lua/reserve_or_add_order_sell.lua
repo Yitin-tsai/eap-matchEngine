@@ -9,6 +9,7 @@
 -- KEYS[5]: match-id sequence key
 -- KEYS[6]: incoming-order processing state Hash key (guarded processing only)
 -- KEYS[7]: incoming-order completed bitmap key (guarded processing only)
+-- KEYS[8]: incoming-order cancellation intent key
 --
 -- ARGV[1]: min composite score (sell order's price limit)
 -- ARGV[2]: reserved timestamp epoch millis
@@ -29,6 +30,7 @@
 --   {'__RESERVATION_EXISTS__:<orderId>'}
 --   {'__DUPLICATE__'}
 --   {'__IN_PROGRESS__'}
+--   {'__CANCELLATION_PENDING__'}
 
 local buy_orderbook_key = KEYS[1]
 local sell_orderbook_key = KEYS[2]
@@ -37,6 +39,7 @@ local incoming_user_orders_key = KEYS[4]
 local sequence_key = KEYS[5]
 local incoming_state_hash_key = KEYS[6]
 local completed_bitmap_key = KEYS[7]
+local cancellation_intent_key = KEYS[8]
 
 local min_score = tonumber(ARGV[1])
 local reserved_at = tonumber(ARGV[2])
@@ -45,7 +48,8 @@ local incoming_score = tonumber(ARGV[4])
 local incoming_order_json = ARGV[5]
 local user_order_index_enabled = ARGV[6] ~= '0'
 
-if incoming_state_hash_key then
+local guarded = ARGV[7] ~= ''
+if guarded then
     local incoming_state_field = ARGV[7]
     local processing_token = ARGV[8]
     local completed_bit_offset = ARGV[9]
@@ -59,6 +63,9 @@ if incoming_state_hash_key then
         redis.call('HDEL', incoming_state_hash_key, incoming_state_field)
         return {'__DUPLICATE__'}
     end
+    if redis.call('GET', cancellation_intent_key) then
+        return {'__CANCELLATION_PENDING__'}
+    end
     if not existing_state then
         redis.call('HSET', incoming_state_hash_key, incoming_state_field, processing_prefix .. reserved_at)
     elseif string.sub(existing_state, 1, string.len(processing_prefix)) ~= processing_prefix then
@@ -66,6 +73,10 @@ if incoming_state_hash_key then
     else
         redis.call('HSET', incoming_state_hash_key, incoming_state_field, processing_prefix .. reserved_at)
     end
+end
+
+if not guarded and redis.call('GET', cancellation_intent_key) then
+    return {'__CANCELLATION_PENDING__'}
 end
 
 local orders = redis.call('ZREVRANGEBYSCORE', buy_orderbook_key, '+inf', min_score, 'LIMIT', 0, 1)
@@ -76,7 +87,7 @@ if #orders == 0 then
     if user_order_index_enabled then
         redis.call('SADD', incoming_user_orders_key, incoming_order_id)
     end
-    if incoming_state_hash_key then
+    if guarded then
         redis.call('SETBIT', completed_bitmap_key, ARGV[9], 1)
         redis.call('HDEL', incoming_state_hash_key, ARGV[7])
         return {'__ADDED_COMPLETED__'}

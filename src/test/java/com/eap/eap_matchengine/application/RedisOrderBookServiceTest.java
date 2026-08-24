@@ -23,6 +23,7 @@ import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
@@ -34,6 +35,67 @@ class RedisOrderBookServiceTest {
     private final RedisOrderBookService service = new RedisOrderBookService(
             redisTemplate,
             objectMapper);
+
+    @Test
+    void arbitrateCancellation_whenLuaRemovesOrder_shouldReturnCancelled() {
+        OrderConfirmedEvent order = incomingBuyOrder();
+        doReturn(List.of(
+                "__CANCELLED__".getBytes(StandardCharsets.UTF_8),
+                compactRedisOrderJson(order).getBytes(StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+
+        RedisOrderBookService.CancellationArbitration result = service.arbitrateCancellation(
+                order, UUID.randomUUID());
+
+        assertThat(result.outcome()).isEqualTo(RedisOrderBookService.CancellationOutcome.CANCELLED);
+        assertThat(result.cancelledOrder().getOrderId()).isEqualTo(order.getOrderId());
+        assertThat(result.cancelledOrder().getAmount()).isEqualTo(order.getAmount());
+    }
+
+    @Test
+    void arbitrateCancellation_whenMarkerAlreadyExists_shouldBeIdempotent() {
+        OrderConfirmedEvent order = incomingBuyOrder();
+        doReturn(List.of(
+                "__DUPLICATE__".getBytes(StandardCharsets.UTF_8),
+                compactRedisOrderJson(order).getBytes(StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+
+        RedisOrderBookService.CancellationArbitration result = service.arbitrateCancellation(
+                order, UUID.randomUUID());
+
+        assertThat(result.outcome())
+                .isEqualTo(RedisOrderBookService.CancellationOutcome.ALREADY_CANCELLED_BY_REQUEST);
+        assertThat(result.cancelledOrder().getAmount()).isEqualTo(order.getAmount());
+    }
+
+    @Test
+    void recordCancellationIntent_whenSameRequestIsReplayed_shouldNotRefreshRedisTtl() {
+        UUID orderId = UUID.randomUUID();
+        UUID cancellationId = UUID.randomUUID();
+        String key = "order:cancellation-intent:" + orderId;
+        ValueOperations<String, String> valueOperations = mock(ValueOperations.class);
+        doReturn(valueOperations).when(redisTemplate).opsForValue();
+        doReturn(false).when(valueOperations)
+                .setIfAbsent(key, cancellationId.toString(), Duration.ofDays(7));
+        doReturn(cancellationId.toString()).when(valueOperations).get(key);
+
+        service.recordCancellationIntent(orderId, cancellationId);
+
+        verify(valueOperations).get(key);
+        verify(redisTemplate, never()).expire(eq(key), any(Duration.class));
+    }
+
+    @Test
+    void arbitrateCancellation_whenMatchWon_shouldReturnNotOpen() {
+        doReturn(List.of("__NOT_OPEN__".getBytes(StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+
+        RedisOrderBookService.CancellationArbitration result = service.arbitrateCancellation(
+                incomingBuyOrder(), UUID.randomUUID());
+
+        assertThat(result.outcome()).isEqualTo(RedisOrderBookService.CancellationOutcome.NOT_OPEN);
+        assertThat(result.cancelledOrder()).isNull();
+    }
 
     @Test
     void reserveBestMatchOrderLua_whenOrderbookDetailIsMissing_shouldFailFast() {
@@ -159,6 +221,26 @@ class RedisOrderBookServiceTest {
     }
 
     @Test
+    void reserveBestMatchOrAddOrderWithSequenceLua_whenCancellationIntentExists_shouldStopAdmission() {
+        doReturn(List.of("__CANCELLATION_PENDING__".getBytes(StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+        IncomingOrderProcessingStore.Claim claim = new IncomingOrderProcessingStore.Claim(
+                "match:incoming-order:states:00",
+                incomingBuyOrder().getOrderId().toString(),
+                "token",
+                "match:incoming-order:completed:TEST:0",
+                100L);
+
+        RedisOrderBookService.MatchOrAddResult result =
+                service.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuyOrder(), claim);
+
+        assertThat(result.incomingOrderAdmission())
+                .isEqualTo(RedisOrderBookService.IncomingOrderAdmission.CANCELLATION_PENDING);
+        assertThat(result.orderAdded()).isFalse();
+        assertThat(result.reservedMatch()).isNull();
+    }
+
+    @Test
     void reserveBestMatchOrAddOrderWithSequenceLua_whenUserIndexDisabled_shouldPassDisabledFlagToLua() {
         RedisConnection connection = mock(RedisConnection.class);
         RedisOrderBookService serviceWithoutUserIndex =
@@ -170,7 +252,7 @@ class RedisOrderBookServiceTest {
             assertThat(new String(userIndexArgument, StandardCharsets.UTF_8)).isEqualTo("0");
             assertThat(new String(marketIdArgument, StandardCharsets.UTF_8)).isEqualTo("TEST-MARKET");
             return List.of("__ADDED__".getBytes(StandardCharsets.UTF_8));
-        }).when(connection).evalSha(nullable(String.class), eq(ReturnType.MULTI), eq(5), any(byte[][].class));
+        }).when(connection).evalSha(nullable(String.class), eq(ReturnType.MULTI), eq(8), any(byte[][].class));
         doAnswer(invocation -> {
             RedisCallback<?> callback = invocation.getArgument(0);
             return callback.doInRedis(connection);

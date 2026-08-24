@@ -21,6 +21,7 @@ import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -86,10 +87,18 @@ public final class MatchProcessorLoadProbe {
                     new MatchingEngineService(orderBookService, redisson, recorder, matchingMetrics);
             IncomingOrderProcessingStore processingStore =
                     new IncomingOrderProcessingStore(redisTemplate);
+            TradeExecutionRepository recoveryRepository = unusedRecoveryRepository();
+            OrderCancellationCoordinator cancellationCoordinator = new OrderCancellationCoordinator(
+                    orderBookService,
+                    processingStore,
+                    new OrderCancellationDecisionStore(
+                            new NamedParameterJdbcTemplate(dataSource), objectMapper),
+                    recoveryRepository);
             OrderConfirmedProcessor processor = new OrderConfirmedProcessor(
                     matchingEngine,
                     processingStore,
-                    unusedRecoveryRepository(),
+                    recoveryRepository,
+                    cancellationCoordinator,
                     redisson,
                     30);
 

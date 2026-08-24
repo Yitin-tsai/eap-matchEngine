@@ -2,6 +2,7 @@ package com.eap.eap_matchengine.application;
 
 import com.eap.common.constants.RabbitMQConstants;
 import com.eap.common.event.TradeExecutedEvent;
+import com.eap.common.event.OrderCancellationResultEvent;
 import com.eap.eap_matchengine.configuration.observability.TradeOutboxMetrics;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -161,6 +162,57 @@ class TradeOutboxRelayTest {
         verify(metrics).published();
         verify(metrics).recordPayloadRebuild(any(Duration.class));
         verify(metrics).recordMessageBuild(any(Duration.class));
+    }
+
+    @Test
+    void cancellationResult_shouldPublishStoredPayloadToOrderExchange() throws Exception {
+        OrderCancellationResultEvent cancellation = OrderCancellationResultEvent.builder()
+                .cancellationId(UUID.randomUUID())
+                .orderId(UUID.randomUUID())
+                .userId(UUID.randomUUID())
+                .outcome(OrderCancellationResultEvent.CANCELLED)
+                .orderType("BUY")
+                .limitPrice(100)
+                .cancelledAmount(6)
+                .decidedAt(LocalDateTime.now())
+                .build();
+        TestOutboxRow entry = new TestOutboxRow(
+                1L,
+                "OrderCancellationResultEvent",
+                cancellation.getCancellationId().toString(),
+                RabbitMQConstants.ORDER_CANCELLATION_RESULT_KEY,
+                objectMapper.writeValueAsString(cancellation),
+                null,
+                0);
+        stubPendingRows(List.of(entry), List.of());
+        when(namedJdbcTemplate.update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class)))
+                .thenReturn(1);
+        doAnswer(invocation -> {
+            RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
+            RabbitOperations operations = mock(RabbitOperations.class);
+            doAnswer(sendInvocation -> {
+                Message message = sendInvocation.getArgument(2);
+                OrderCancellationResultEvent published = objectMapper.readValue(
+                        message.getBody(), OrderCancellationResultEvent.class);
+                org.assertj.core.api.Assertions.assertThat(published.getCancellationId())
+                        .isEqualTo(cancellation.getCancellationId());
+                org.assertj.core.api.Assertions.assertThat(published.getCancelledAmount()).isEqualTo(6);
+                CorrelationData correlationData = sendInvocation.getArgument(3);
+                correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
+                return null;
+            }).when(operations).send(
+                    eq(RabbitMQConstants.ORDER_EXCHANGE),
+                    eq(RabbitMQConstants.ORDER_CANCELLATION_RESULT_KEY),
+                    any(Message.class),
+                    any(CorrelationData.class));
+            callback.doInRabbit(operations);
+            return null;
+        }).when(rabbitTemplate).invoke(any(RabbitOperations.OperationsCallback.class));
+
+        relay().pollAndPublish();
+
+        verify(namedJdbcTemplate).update(contains("SET status = 'SENT'"), any(MapSqlParameterSource.class));
+        verify(metrics).published();
     }
 
     private TradeOutboxRelay relay() {

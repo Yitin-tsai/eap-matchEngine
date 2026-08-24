@@ -1,6 +1,5 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderCancelEvent;
 import com.eap.common.event.OrderConfirmedEvent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -62,6 +61,7 @@ public class RedisOrderBookService {
     private String releaseReservedOrderLuaScript;
     private String completeReservedOrderLuaScript;
     private String removeOrderLuaScript;
+    private String cancelOrderRequestLuaScript;
     private String addOrderLuaSha;
     private String reserveMatchOrderBuyLuaSha;
     private String reserveMatchOrderSellLuaSha;
@@ -70,6 +70,7 @@ public class RedisOrderBookService {
     private String releaseReservedOrderLuaSha;
     private String completeReservedOrderLuaSha;
     private String removeOrderLuaSha;
+    private String cancelOrderRequestLuaSha;
 
     public RedisOrderBookService(RedisTemplate<String, String> redisTemplate, ObjectMapper objectMapper) {
         this(redisTemplate, objectMapper, null, true);
@@ -109,6 +110,7 @@ public class RedisOrderBookService {
             releaseReservedOrderLuaScript = loadLuaScript("lua/release_reserved_order.lua");
             completeReservedOrderLuaScript = loadLuaScript("lua/complete_reserved_order.lua");
             removeOrderLuaScript = loadLuaScript("lua/remove_order.lua");
+            cancelOrderRequestLuaScript = loadLuaScript("lua/cancel_order_request.lua");
             addOrderLuaSha = loadLuaScriptSha(addOrderLuaScript);
             reserveMatchOrderBuyLuaSha = loadLuaScriptSha(reserveMatchOrderBuyLuaScript);
             reserveMatchOrderSellLuaSha = loadLuaScriptSha(reserveMatchOrderSellLuaScript);
@@ -117,6 +119,7 @@ public class RedisOrderBookService {
             releaseReservedOrderLuaSha = loadLuaScriptSha(releaseReservedOrderLuaScript);
             completeReservedOrderLuaSha = loadLuaScriptSha(completeReservedOrderLuaScript);
             removeOrderLuaSha = loadLuaScriptSha(removeOrderLuaScript);
+            cancelOrderRequestLuaSha = loadLuaScriptSha(cancelOrderRequestLuaScript);
             log.info("Successfully loaded all Lua scripts for atomic Redis operations");
         } catch (IOException e) {
             log.error("Failed to load Lua scripts", e);
@@ -477,7 +480,7 @@ public class RedisOrderBookService {
             recordReserveSerializeIncoming(Duration.between(serializeStartedAt, Instant.now()));
         }
 
-        List<String> keys = new ArrayList<>(7);
+        List<String> keys = new ArrayList<>(8);
         keys.add(oppositeOrderbookKey);
         keys.add(ownOrderbookKey);
         keys.add(incomingOrderIdKey);
@@ -497,10 +500,13 @@ public class RedisOrderBookService {
             args.add(processingClaim.token());
             args.add(String.valueOf(processingClaim.completedBitOffset()));
         } else {
+            keys.add("match:incoming-order:unused-state");
+            keys.add("match:incoming-order:unused-completed");
             args.add("");
             args.add("");
             args.add("");
         }
+        keys.add(cancellationIntentKey(incomingOrder.getOrderId()));
         args.add(marketId(incomingOrder));
 
         @SuppressWarnings("unchecked")
@@ -549,6 +555,9 @@ public class RedisOrderBookService {
         if ("__IN_PROGRESS__".equals(status)) {
             return MatchOrAddResult.inProgress();
         }
+        if ("__CANCELLATION_PENDING__".equals(status)) {
+            return MatchOrAddResult.cancellationPending();
+        }
         if (status.startsWith(MISSING_ORDER_DETAIL_PREFIX)) {
             String missingOrderId = status.substring(MISSING_ORDER_DETAIL_PREFIX.length());
             log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
@@ -591,7 +600,8 @@ public class RedisOrderBookService {
         CLAIMED,
         COMPLETED,
         DUPLICATE,
-        IN_PROGRESS
+        IN_PROGRESS,
+        CANCELLATION_PENDING
     }
 
     public record MatchOrAddResult(
@@ -616,6 +626,10 @@ public class RedisOrderBookService {
 
         public static MatchOrAddResult inProgress() {
             return new MatchOrAddResult(false, null, IncomingOrderAdmission.IN_PROGRESS);
+        }
+
+        public static MatchOrAddResult cancellationPending() {
+            return new MatchOrAddResult(false, null, IncomingOrderAdmission.CANCELLATION_PENDING);
         }
     }
 
@@ -858,62 +872,113 @@ public class RedisOrderBookService {
         }
     }
 
-    /**
-     * Atomically cancels an order.
-     * First retrieves order details, then uses Lua script to remove atomically.
-     *
-     * @param event The order cancel event
-     * @return true if order was cancelled, false if not found
-     */
-    public boolean cancelOrder(OrderCancelEvent event) {
-        String orderIdKey = "order:" + event.getOrderId();
-
-        // First get the order to know which orderbook to remove from
-        String orderJson = redisTemplate.opsForValue().get(orderIdKey);
+    public OrderConfirmedEvent findOpenOrder(UUID orderId) {
+        String orderJson = redisTemplate.opsForValue().get("order:" + orderId);
         if (orderJson == null) {
-            log.warn("Order {} not found for cancellation", event.getOrderId());
-            return false;
+            return null;
+        }
+        try {
+            return deserializeRedisOrder(orderJson);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Cannot deserialize open order for cancellation: orderId=" + orderId, e);
+        }
+    }
+
+    public void recordCancellationIntent(UUID orderId, UUID cancellationId) {
+        String key = cancellationIntentKey(orderId);
+        Boolean inserted = redisTemplate.opsForValue().setIfAbsent(
+                key, cancellationId.toString(), Duration.ofDays(7));
+        if (Boolean.TRUE.equals(inserted)) {
+            return;
+        }
+        String existing = redisTemplate.opsForValue().get(key);
+        if (!cancellationId.toString().equals(existing)) {
+            throw new IllegalStateException("Order already has another cancellation intent: orderId=" + orderId);
+        }
+    }
+
+    public CancellationArbitration arbitrateCancellation(
+            OrderConfirmedEvent order,
+            UUID cancellationId) {
+        String orderbookKey = orderbookKey(order);
+        String orderIdKey = "order:" + order.getOrderId();
+        String userOrdersKey = "user:" + order.getUserId() + ":orders";
+        String markerKey = "order:cancellation:" + order.getOrderId();
+        List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey, markerKey);
+        List<String> args = List.of(
+                order.getOrderId().toString(),
+                userOpenOrderIndexEnabledArg(),
+                cancellationId.toString());
+
+        @SuppressWarnings("unchecked")
+        List<byte[]> result = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
+            byte[][] keysBytes = keys.stream()
+                    .map(key -> key.getBytes(StandardCharsets.UTF_8))
+                    .toArray(byte[][]::new);
+            byte[][] argsBytes = args.stream()
+                    .map(arg -> arg.getBytes(StandardCharsets.UTF_8))
+                    .toArray(byte[][]::new);
+            byte[][] params = new byte[keysBytes.length + argsBytes.length][];
+            System.arraycopy(keysBytes, 0, params, 0, keysBytes.length);
+            System.arraycopy(argsBytes, 0, params, keysBytes.length, argsBytes.length);
+            Object response = evalLoadedScript(
+                    connection,
+                    cancelOrderRequestLuaSha,
+                    cancelOrderRequestLuaScript,
+                    ReturnType.MULTI,
+                    keys.size(),
+                    params);
+            return (List<byte[]>) response;
+        });
+
+        if (result == null || result.isEmpty()) {
+            throw new IllegalStateException("Redis cancellation script returned no result: orderId="
+                    + order.getOrderId());
+        }
+        String status = new String(result.get(0), StandardCharsets.UTF_8);
+        if ("__NOT_OPEN__".equals(status)) {
+            return CancellationArbitration.notOpen();
+        }
+        if (("__CANCELLED__".equals(status) || "__DUPLICATE__".equals(status))
+                && result.size() == 2 && result.get(1) != null) {
+            try {
+                OrderConfirmedEvent cancelledOrder = deserializeRedisOrder(
+                        new String(result.get(1), StandardCharsets.UTF_8));
+                return "__CANCELLED__".equals(status)
+                        ? CancellationArbitration.cancelled(cancelledOrder)
+                        : CancellationArbitration.duplicate(cancelledOrder);
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("Cannot deserialize atomically cancelled order: orderId="
+                        + order.getOrderId(), e);
+            }
+        }
+        throw new IllegalStateException("Redis cancellation script returned unknown result: " + status);
+    }
+
+    private String cancellationIntentKey(UUID orderId) {
+        return "order:cancellation-intent:" + orderId;
+    }
+
+    public enum CancellationOutcome {
+        CANCELLED,
+        ALREADY_CANCELLED_BY_REQUEST,
+        NOT_OPEN
+    }
+
+    public record CancellationArbitration(
+            CancellationOutcome outcome,
+            OrderConfirmedEvent cancelledOrder) {
+
+        static CancellationArbitration cancelled(OrderConfirmedEvent order) {
+            return new CancellationArbitration(CancellationOutcome.CANCELLED, order);
         }
 
-        try {
-            OrderConfirmedEvent order = deserializeRedisOrder(orderJson);
+        static CancellationArbitration duplicate(OrderConfirmedEvent order) {
+            return new CancellationArbitration(CancellationOutcome.ALREADY_CANCELLED_BY_REQUEST, order);
+        }
 
-            // Use Lua script to atomically remove
-            String orderbookKey = orderbookKey(order);
-            String userOrdersKey = "user:" + order.getUserId() + ":orders";
-
-            List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey);
-            List<String> args = List.of(event.getOrderId().toString(), userOpenOrderIndexEnabledArg());
-
-            Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
-                // Flatten keys and args into single byte[] varargs array
-                byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
-                byte[][] argsBytes = args.stream().map(a -> a.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
-
-                // Combine keys and args into single varargs array
-                byte[][] allParams = new byte[keysBytes.length + argsBytes.length][];
-                System.arraycopy(keysBytes, 0, allParams, 0, keysBytes.length);
-                System.arraycopy(argsBytes, 0, allParams, keysBytes.length, argsBytes.length);
-
-                Object res = connection.eval(
-                    removeOrderLuaScript.getBytes(StandardCharsets.UTF_8),
-                    ReturnType.INTEGER,
-                    keys.size(),
-                    allParams
-                );
-                return res != null ? (Long) res : 0L;
-            });
-
-            boolean removed = result != null && result == 1L;
-            if (removed) {
-                log.info("Successfully cancelled order {}", event.getOrderId());
-            } else {
-                log.warn("Order {} was not in orderbook (might have been matched)", event.getOrderId());
-            }
-            return removed;
-        } catch (Exception e) {
-            log.error("Failed to cancel order {}", event.getOrderId(), e);
-            return false;
+        static CancellationArbitration notOpen() {
+            return new CancellationArbitration(CancellationOutcome.NOT_OPEN, null);
         }
     }
 

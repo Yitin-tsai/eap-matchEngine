@@ -312,4 +312,70 @@
         <dropTable tableName="trade_completion_view" schemaName="match_engine"/>
     </changeSet>
 
+    <changeSet id="match-trade-019" author="eap">
+        <comment>Persist CDA cancellation arbitration before publishing its result through the existing Match outbox relay</comment>
+        <sql>
+            CREATE TABLE match_engine.order_cancellations (
+                cancellation_id UUID PRIMARY KEY,
+                order_id UUID NOT NULL UNIQUE,
+                user_id UUID NOT NULL,
+                status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+                reason VARCHAR(200),
+                market_id VARCHAR(100),
+                market_sequence BIGINT,
+                order_type VARCHAR(4),
+                limit_price INTEGER,
+                cancelled_amount INTEGER,
+                order_created_at TIMESTAMP,
+                requested_at TIMESTAMP NOT NULL,
+                decided_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_match_order_cancellation_status
+                    CHECK (status IN ('PENDING', 'CANCELLED', 'ALREADY_MATCHED', 'NOT_OPEN')),
+                CONSTRAINT ck_match_order_cancellation_side
+                    CHECK (order_type IS NULL OR order_type IN ('BUY', 'SELL')),
+                CONSTRAINT ck_match_order_cancellation_price
+                    CHECK (limit_price IS NULL OR limit_price &gt; 0),
+                CONSTRAINT ck_match_order_cancellation_amount
+                    CHECK (cancelled_amount IS NULL OR cancelled_amount &gt; 0)
+            );
+            CREATE INDEX idx_match_order_cancellations_pending
+                ON match_engine.order_cancellations(created_at, cancellation_id)
+                WHERE status = 'PENDING';
+        </sql>
+    </changeSet>
+
+    <changeSet id="match-trade-020" author="eap">
+        <comment>Separate immutable order quantity from cancelled remainder and lease cancellation reconciliation</comment>
+        <sql>
+            ALTER TABLE match_engine.order_cancellations
+                ADD COLUMN original_amount INTEGER,
+                ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN next_retry_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                ADD COLUMN claimed_by VARCHAR(80),
+                ADD COLUMN claim_until TIMESTAMP,
+                ADD COLUMN last_error TEXT;
+
+            ALTER TABLE match_engine.order_cancellations
+                DROP CONSTRAINT ck_match_order_cancellation_status;
+            ALTER TABLE match_engine.order_cancellations
+                ADD CONSTRAINT ck_match_order_cancellation_status
+                    CHECK (status IN ('PENDING', 'IN_PROGRESS', 'CANCELLED',
+                                      'ALREADY_MATCHED', 'NOT_OPEN')),
+                ADD CONSTRAINT ck_match_order_cancellation_original_amount
+                    CHECK (original_amount IS NULL OR original_amount &gt; 0),
+                ADD CONSTRAINT ck_match_order_cancellation_amount_relation
+                    CHECK (original_amount IS NULL OR cancelled_amount IS NULL
+                           OR cancelled_amount &lt;= original_amount),
+                ADD CONSTRAINT ck_match_order_cancellation_attempt
+                    CHECK (attempt_count &gt;= 0);
+
+            DROP INDEX IF EXISTS match_engine.idx_match_order_cancellations_pending;
+            CREATE INDEX idx_match_order_cancellations_retry
+                ON match_engine.order_cancellations(next_retry_at, created_at, cancellation_id)
+                WHERE status IN ('PENDING', 'IN_PROGRESS');
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>
