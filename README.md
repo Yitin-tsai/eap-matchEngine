@@ -5,7 +5,9 @@
 ## Current Flow
 
 ```text
-OrderConfirmedEvent
+OrderAssetReservationSucceededEvent
+  -> persist order_admission_inbox and ACK Rabbit delivery
+  -> bounded concurrent lease worker claims durable admission work
   -> atomic Redis Lua reserve/match operation
   -> persist TradeExecuted + trade_outbox + reservation_cleanup_task
      in one PostgreSQL transaction
@@ -54,6 +56,7 @@ Order and Wallet consume `TradeExecutedEvent` directly and preserve their own du
 
 ## Reliability
 
+- The PostgreSQL order-admission inbox keeps ACKed work durable, classifies failures, and reclaims expired worker leases.
 - Redis Lua keeps match/reserve operations atomic within the order book.
 - `trade_executions`, `trade_outbox`, and the cleanup task share one database transaction.
 - `trade_id` makes repeated trade recording idempotent.
@@ -66,6 +69,15 @@ Order and Wallet consume `TradeExecutedEvent` directly and preserve their own du
 ## Current Performance Risk
 
 Trade outbox polling and reservation maintenance now use isolated schedulers; the focused same-seed A/B passed its correctness gate and removed the earlier scheduler-serialization tail. Later isolated probes showed that the real RabbitMQ listener, Redis matching, durable trade write, cleanup, trade relay, and downstream fanout each clear the current full-chain rate when measured without the rest of the lifecycle. The remaining risk is integrated same-host contention across HTTP admission, reservation, matching, relays, settlement, databases, broker, JVMs, monitoring, and the load generator. These probes reject a standalone MatchEngine ceiling; they do not establish production capacity or justify increasing concurrency by itself.
+
+The durable admission inbox adds PostgreSQL insert, claim, and terminal-update writes to
+every admitted order. Results measured before this change are historical evidence for
+their commits, not current-worktree capacity. The Rabbit-to-Match and full-chain runners
+require all workload inbox rows to be `APPLIED` with zero non-applied debt. The
+2026-09-03 long-window campaign additionally showed Match trades staying current while
+Order reservation-result debt accumulated at 300/400 orders/s; the present integrated
+bottleneck is therefore downstream Order state application, not evidence of a Match
+ceiling.
 
 ## Run
 
@@ -82,4 +94,5 @@ Default port: `8082`; context path: `/match-engine`.
 - [2026-08-14 canonical mixed short-window boundary](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/benchmarks/2026-08-14-canonical-mixed-short-window-boundary.md)
 - [2026-08-14 RabbitMQ-to-Match isolated diagnostic](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/benchmarks/2026-08-14-rabbit-match-intake-isolated.md)
 - [2026-08-07 scheduler-isolation diagnostic](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/benchmarks/2026-08-07-canonical-mixed-http-diagnostic.md)
+- [2026-09-03 current-version full-chain diagnostic](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/benchmarks/2026-09-03-current-version-full-chain.md)
 - [EAP system architecture](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/architecture.md)

@@ -2,7 +2,7 @@ package com.eap.eap_matchengine.application;
 
 import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.common.event.OrderCancellationResultEvent;
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -44,7 +44,7 @@ public class OrderCancellationCoordinator {
         resolve(decision);
     }
 
-    public void resolveAdmissionBlockedByCancellationIntent(OrderConfirmedEvent order) {
+    public void resolveAdmissionBlockedByCancellationIntent(OrderAssetReservationSucceededEvent order) {
         OrderCancellationDecisionStore.Decision decision = decisions.findByOrderId(order.getOrderId());
         if (decision == null) {
             throw new IllegalStateException("Redis reported cancellation intent without a pending decision: orderId="
@@ -109,7 +109,7 @@ public class OrderCancellationCoordinator {
             return;
         }
 
-        OrderConfirmedEvent visibleOrder = orderBook.findOpenOrder(decision.orderId());
+        OrderAssetReservationSucceededEvent visibleOrder = orderBook.findOpenOrder(decision.orderId());
         if (visibleOrder != null) {
             decision = decisions.refreshSnapshot(decision.cancellationId(), visibleOrder);
             if (completeFromRedisArbitration(decision, visibleOrder)) {
@@ -155,7 +155,7 @@ public class OrderCancellationCoordinator {
             return;
         }
 
-        OrderConfirmedEvent snapshot = decision.snapshot();
+        OrderAssetReservationSucceededEvent snapshot = decision.snapshot();
         if (snapshot == null) {
             return;
         }
@@ -171,7 +171,7 @@ public class OrderCancellationCoordinator {
 
     private boolean completeFromRedisArbitration(
             OrderCancellationDecisionStore.Decision decision,
-            OrderConfirmedEvent candidate) {
+            OrderAssetReservationSucceededEvent candidate) {
         validateOwner(decision, candidate);
         RedisOrderBookService.CancellationArbitration arbitration =
                 orderBook.arbitrateCancellation(candidate, decision.cancellationId());
@@ -193,7 +193,7 @@ public class OrderCancellationCoordinator {
 
     private void validateOwner(
             OrderCancellationDecisionStore.Decision decision,
-            OrderConfirmedEvent order) {
+            OrderAssetReservationSucceededEvent order) {
         if (!decision.userId().equals(order.getUserId())) {
             throw new IllegalArgumentException("Cancellation request user does not own Match order: orderId="
                     + order.getOrderId());
@@ -202,8 +202,8 @@ public class OrderCancellationCoordinator {
 
     private void validateStableIdentity(
             OrderCancellationDecisionStore.Decision decision,
-            OrderConfirmedEvent order) {
-        OrderConfirmedEvent snapshot = decision.snapshot();
+            OrderAssetReservationSucceededEvent order) {
+        OrderAssetReservationSucceededEvent snapshot = decision.snapshot();
         if (snapshot == null
                 || !Objects.equals(snapshot.getMarketId(), order.getMarketId())
                 || !Objects.equals(snapshot.getMarketSequence(), order.getMarketSequence())
@@ -211,7 +211,7 @@ public class OrderCancellationCoordinator {
                 || !Objects.equals(snapshot.getPrice(), order.getPrice())
                 || !Objects.equals(decision.originalAmount(), order.getAmount())
                 || !sameTimestampAtMicrosecondPrecision(snapshot.getCreatedAt(), order.getCreatedAt())) {
-            throw new IllegalStateException("Completed cancellation conflicts with OrderConfirmed identity: orderId="
+            throw new IllegalStateException("Completed cancellation conflicts with asset-reservation success identity: orderId="
                     + order.getOrderId());
         }
     }

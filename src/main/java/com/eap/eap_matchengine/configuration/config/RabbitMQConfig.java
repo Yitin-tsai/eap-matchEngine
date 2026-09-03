@@ -18,7 +18,7 @@ import static com.eap.common.constants.RabbitMQConstants.*;
  * MatchEngine Module RabbitMQ Configuration
  *
  * This module consumes:
- * - order.confirmed events (wallet-validated orders for CDA matching)
+ * - order.asset-reservation.succeeded events (wallet-validated orders for CDA matching)
  * - order.cancellation.requested events (durable CDA cancellation commands)
  * - auction.bid.confirmed events (wallet-confirmed auction bids for Redis collection)
  *
@@ -35,11 +35,12 @@ public class RabbitMQConfig {
     // ==================== CDA (Continuous Double Auction) ====================
 
     /**
-     * MatchEngine-specific queue for order confirmed events (wallet validation complete)
+     * MatchEngine-specific queue for asset-reservation success facts.
+     * The physical queue name remains legacy-compatible so already queued messages are not orphaned.
      */
     @Bean
-    public Queue matchEngineOrderConfirmedQueue() {
-        return QueueBuilder.durable(MATCH_ENGINE_ORDER_CONFIRMED_QUEUE)
+    public Queue matchEngineAssetReservationSucceededQueue() {
+        return QueueBuilder.durable(MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE)
                 .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
                 .build();
     }
@@ -65,15 +66,15 @@ public class RabbitMQConfig {
     }
 
     /**
-     * Bind matchEngine queue to order.confirmed routing key
+     * Bind matchEngine queue to order.asset-reservation.succeeded routing key
      */
     @Bean
-    public Binding matchEngineOrderConfirmedBinding(
-            @Qualifier("matchEngineOrderConfirmedQueue") Queue matchEngineOrderConfirmedQueue,
+    public Binding matchEngineAssetReservationSucceededBinding(
+            @Qualifier("matchEngineAssetReservationSucceededQueue") Queue queue,
             @Qualifier("orderExchange") TopicExchange orderExchange) {
-        return BindingBuilder.bind(matchEngineOrderConfirmedQueue)
+        return BindingBuilder.bind(queue)
                 .to(orderExchange)
-                .with(ORDER_CONFIRMED_KEY);
+                .with(ORDER_ASSET_RESERVATION_SUCCEEDED_KEY);
     }
 
     @Bean

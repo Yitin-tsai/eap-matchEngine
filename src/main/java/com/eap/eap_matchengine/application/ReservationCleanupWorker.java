@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -218,8 +218,8 @@ public class ReservationCleanupWorker {
         return Math.min(initialBackoffMs * multiplier, maxBackoffMs);
     }
 
-    private OrderConfirmedEvent toOrder(CleanupRow task) {
-        return OrderConfirmedEvent.builder()
+    private OrderAssetReservationSucceededEvent toOrder(CleanupRow task) {
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(task.orderId())
                 .userId(task.userId())
                 .build();

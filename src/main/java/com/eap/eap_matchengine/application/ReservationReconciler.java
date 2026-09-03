@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
 import com.eap.eap_matchengine.domain.entity.TradeExecutionEntity;
 import lombok.extern.slf4j.Slf4j;
@@ -96,7 +96,7 @@ public class ReservationReconciler {
     }
 
     private int reconcileReservation(RedisOrderBookService.ReservationSnapshot reservation) {
-        OrderConfirmedEvent reservedOrder = reservation.order();
+        OrderAssetReservationSucceededEvent reservedOrder = reservation.order();
         Optional<TradeExecutionEntity> durableTrade = reservation.tradeId() == null
                 ? findLegacyDurableTrade(reservedOrder, reservedAtLowerBound(reservation))
                 : tradeExecutionRepository.findByTradeId(reservation.tradeId());
@@ -120,7 +120,7 @@ public class ReservationReconciler {
     private int convergeDurableTradeReservation(
             RedisOrderBookService.ReservationSnapshot reservation,
             TradeExecutionEntity trade) {
-        OrderConfirmedEvent reservedOrder = reservation.order();
+        OrderAssetReservationSucceededEvent reservedOrder = reservation.order();
         int remainingAmount = reservedOrder.getAmount() - trade.getQuantity();
         try {
             if (remainingAmount > 0) {
@@ -154,7 +154,7 @@ public class ReservationReconciler {
     }
 
     private Optional<TradeExecutionEntity> findLegacyDurableTrade(
-            OrderConfirmedEvent reservedOrder,
+            OrderAssetReservationSucceededEvent reservedOrder,
             LocalDateTime reservedAt) {
         return tradeExecutionRepository
                 .findFirstByCreatedAtGreaterThanEqualAndBuyerOrderIdOrCreatedAtGreaterThanEqualAndSellerOrderIdOrderByCreatedAtDesc(

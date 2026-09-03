@@ -2,7 +2,7 @@ package com.eap.eap_matchengine.application;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -57,7 +57,7 @@ public final class MatchProcessorLoadProbe {
         quietApplicationLogs();
         ProbeConfig config = ProbeConfig.from(args);
         String marketId = "MATCH-PROCESSOR-" + UUID.randomUUID();
-        List<OrderConfirmedEvent> orders = orders(config, marketId);
+        List<OrderAssetReservationSucceededEvent> orders = orders(config, marketId);
 
         HikariDataSource dataSource = dataSource(config);
         LettuceConnectionFactory redisConnectionFactory =
@@ -94,7 +94,7 @@ public final class MatchProcessorLoadProbe {
                     new OrderCancellationDecisionStore(
                             new NamedParameterJdbcTemplate(dataSource), objectMapper),
                     recoveryRepository);
-            OrderConfirmedProcessor processor = new OrderConfirmedProcessor(
+            MatchOrderAdmissionProcessor processor = new MatchOrderAdmissionProcessor(
                     matchingEngine,
                     processingStore,
                     recoveryRepository,
@@ -135,8 +135,8 @@ public final class MatchProcessorLoadProbe {
 
     private static ProcessingResult runProcessing(
             ProbeConfig config,
-            OrderConfirmedProcessor processor,
-            List<OrderConfirmedEvent> orders) throws InterruptedException {
+            MatchOrderAdmissionProcessor processor,
+            List<OrderAssetReservationSucceededEvent> orders) throws InterruptedException {
         AtomicInteger next = new AtomicInteger();
         AtomicInteger failures = new AtomicInteger();
         List<Long> latencies = Collections.synchronizedList(new ArrayList<>(orders.size()));
@@ -367,8 +367,8 @@ public final class MatchProcessorLoadProbe {
                 });
     }
 
-    private static List<OrderConfirmedEvent> orders(ProbeConfig config, String marketId) {
-        List<OrderConfirmedEvent> orders = new ArrayList<>(config.totalOrders());
+    private static List<OrderAssetReservationSucceededEvent> orders(ProbeConfig config, String marketId) {
+        List<OrderAssetReservationSucceededEvent> orders = new ArrayList<>(config.totalOrders());
         for (int index = 0; index < config.pairs(); index++) {
             long sellSequence = index * 2L + 1;
             long buySequence = sellSequence + 1;
@@ -379,8 +379,8 @@ public final class MatchProcessorLoadProbe {
         return orders;
     }
 
-    private static OrderConfirmedEvent order(String marketId, String side, long sequence) {
-        return OrderConfirmedEvent.builder()
+    private static OrderAssetReservationSucceededEvent order(String marketId, String side, long sequence) {
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(UUID.randomUUID())
                 .userId(UUID.randomUUID())
                 .marketId(marketId)
@@ -482,10 +482,10 @@ public final class MatchProcessorLoadProbe {
 
     private static void cleanupRedis(
             RedisTemplate<String, String> redisTemplate,
-            List<OrderConfirmedEvent> orders,
+            List<OrderAssetReservationSucceededEvent> orders,
             String marketId) {
         List<String> keys = new ArrayList<>(orders.size() * 3 + 3);
-        for (OrderConfirmedEvent order : orders) {
+        for (OrderAssetReservationSucceededEvent order : orders) {
             keys.add("order:" + order.getOrderId());
             keys.add("user:" + order.getUserId() + ":orders");
             keys.add("order:reservation:" + order.getOrderId());

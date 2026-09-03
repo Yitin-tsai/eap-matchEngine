@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
@@ -75,7 +75,7 @@ public class IncomingOrderProcessingStore {
         throw new IllegalStateException("Unknown incoming order processing state: " + serialized);
     }
 
-    State state(OrderConfirmedEvent order) {
+    State state(OrderAssetReservationSucceededEvent order) {
         if (isCompleted(order)) {
             return State.completed();
         }
@@ -86,7 +86,7 @@ public class IncomingOrderProcessingStore {
         return legacyState;
     }
 
-    Claim newClaim(OrderConfirmedEvent order) {
+    Claim newClaim(OrderAssetReservationSucceededEvent order) {
         UUID orderId = order.getOrderId();
         String token = UUID.randomUUID().toString();
         return new Claim(
@@ -104,7 +104,7 @@ public class IncomingOrderProcessingStore {
                 serializedProcessingState(claim, System.currentTimeMillis()));
     }
 
-    void markCompleted(OrderConfirmedEvent order) {
+    void markCompleted(OrderAssetReservationSucceededEvent order) {
         redisTemplate.execute(
                 MARK_COMPLETED_SCRIPT,
                 List.of(completedBitmapKey(order), stateHashKey(order.getOrderId())),
@@ -112,7 +112,7 @@ public class IncomingOrderProcessingStore {
                 order.getOrderId().toString());
     }
 
-    boolean isCompleted(OrderConfirmedEvent order) {
+    boolean isCompleted(OrderAssetReservationSucceededEvent order) {
         return Boolean.TRUE.equals(redisTemplate.opsForValue().getBit(
                 completedBitmapKey(order), completedBitOffset(order)));
     }
@@ -130,23 +130,23 @@ public class IncomingOrderProcessingStore {
         return STATE_HASH_PREFIX + HEX[bucket >>> 4] + HEX[bucket & 0x0f];
     }
 
-    private String completedBitmapKey(OrderConfirmedEvent order) {
+    private String completedBitmapKey(OrderAssetReservationSucceededEvent order) {
         long sequence = requiredSequence(order);
         long shard = (sequence - 1) / COMPLETED_BITMAP_SHARD_SIZE;
         return COMPLETED_BITMAP_PREFIX + order.getMarketId() + ":" + shard;
     }
 
-    private long completedBitOffset(OrderConfirmedEvent order) {
+    private long completedBitOffset(OrderAssetReservationSucceededEvent order) {
         long sequence = requiredSequence(order);
         return (sequence - 1) % COMPLETED_BITMAP_SHARD_SIZE;
     }
 
-    private long requiredSequence(OrderConfirmedEvent order) {
+    private long requiredSequence(OrderAssetReservationSucceededEvent order) {
         if (order == null || order.getMarketId() == null || order.getMarketId().isBlank()) {
-            throw new IllegalArgumentException("OrderConfirmedEvent must contain marketId");
+            throw new IllegalArgumentException("OrderAssetReservationSucceededEvent must contain marketId");
         }
         if (order.getMarketSequence() == null || order.getMarketSequence() <= 0) {
-            throw new IllegalArgumentException("OrderConfirmedEvent marketSequence must be positive");
+            throw new IllegalArgumentException("OrderAssetReservationSucceededEvent marketSequence must be positive");
         }
         return order.getMarketSequence();
     }

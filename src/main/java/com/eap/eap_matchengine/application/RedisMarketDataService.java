@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.dto.OrderBookResponseDto;
 import com.eap.common.dto.MarketSummaryDto;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -65,7 +65,7 @@ public class RedisMarketDataService {
                 for (String orderId : buyOrderIds) {
                     String orderJson = redisTemplate.opsForValue().get("order:" + orderId);
                     if (orderJson != null) {
-                        OrderConfirmedEvent order = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+                        OrderAssetReservationSucceededEvent order = objectMapper.readValue(orderJson, OrderAssetReservationSucceededEvent.class);
                         buyLevels.computeIfAbsent(order.getPrice(), price -> 
                             new PriceLevelData(price))
                             .addOrder(order.getAmount());
@@ -102,7 +102,7 @@ public class RedisMarketDataService {
                 for (String orderId : sellOrderIds) {
                     String orderJson = redisTemplate.opsForValue().get("order:" + orderId);
                     if (orderJson != null) {
-                        OrderConfirmedEvent order = objectMapper.readValue(orderJson, OrderConfirmedEvent.class);
+                        OrderAssetReservationSucceededEvent order = objectMapper.readValue(orderJson, OrderAssetReservationSucceededEvent.class);
                         sellLevels.computeIfAbsent(order.getPrice(), price -> 
                             new PriceLevelData(price))
                             .addOrder(order.getAmount());

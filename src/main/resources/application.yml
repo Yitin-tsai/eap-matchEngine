@@ -68,6 +68,20 @@ springdoc:
 
 eap:
   match-engine:
+    listeners:
+      asset-reservation-succeeded:
+        concurrency: 8
+    order-admission-inbox:
+      enabled: true
+      admin-enabled: false
+      worker-concurrency: ${EAP_MATCH_ADMISSION_WORKER_CONCURRENCY:16}
+      batch-size: 100
+      poll-interval-ms: 100
+      initial-delay-ms: 500
+      lease-ms: 30000
+      max-attempts: 20
+      initial-backoff-ms: 250
+      max-backoff-ms: 30000
     trade-persistence:
       enabled: true
     trade-outbox:
@@ -100,7 +114,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,metrics,prometheus
+        include: health,metrics,prometheus,matchOrderAdmissionInbox
   metrics:
     tags:
       application: eap-matchEngine

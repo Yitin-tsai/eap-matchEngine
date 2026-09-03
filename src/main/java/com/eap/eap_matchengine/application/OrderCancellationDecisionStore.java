@@ -2,7 +2,7 @@ package com.eap.eap_matchengine.application;
 
 import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.common.event.OrderCancellationResultEvent;
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -44,7 +44,7 @@ public class OrderCancellationDecisionStore {
     @Transactional
     public Decision begin(
             OrderCancellationRequestedEvent request,
-            OrderConfirmedEvent openOrder) {
+            OrderAssetReservationSucceededEvent openOrder) {
         jdbc.update("""
                 INSERT INTO match_engine.order_cancellations
                     (cancellation_id, order_id, user_id, status, market_id, order_type,
@@ -132,7 +132,7 @@ public class OrderCancellationDecisionStore {
                 this::mapDecision);
     }
 
-    public Decision refreshSnapshot(UUID cancellationId, OrderConfirmedEvent order) {
+    public Decision refreshSnapshot(UUID cancellationId, OrderAssetReservationSucceededEvent order) {
         jdbc.update("""
                 UPDATE match_engine.order_cancellations
                 SET market_id = :marketId,
@@ -160,7 +160,7 @@ public class OrderCancellationDecisionStore {
             Decision pending,
             String outcome,
             String reason,
-            OrderConfirmedEvent cancelledOrder,
+            OrderAssetReservationSucceededEvent cancelledOrder,
             Integer originalAmount) {
         if (pending.complete()) {
             return pending;
@@ -247,7 +247,7 @@ public class OrderCancellationDecisionStore {
 
     private Decision refreshSnapshot(
             UUID cancellationId,
-            OrderConfirmedEvent order,
+            OrderAssetReservationSucceededEvent order,
             Integer originalAmount) {
         jdbc.update("""
                 UPDATE match_engine.order_cancellations
@@ -321,11 +321,11 @@ public class OrderCancellationDecisionStore {
                     || OrderCancellationResultEvent.NOT_OPEN.equals(status);
         }
 
-        public OrderConfirmedEvent snapshot() {
+        public OrderAssetReservationSucceededEvent snapshot() {
             if (orderType == null || limitPrice == null || cancelledAmount == null) {
                 return null;
             }
-            return OrderConfirmedEvent.builder()
+            return OrderAssetReservationSucceededEvent.builder()
                     .orderId(orderId)
                     .userId(userId)
                     .marketId(marketId)

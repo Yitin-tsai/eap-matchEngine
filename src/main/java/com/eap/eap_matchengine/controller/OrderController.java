@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.controller;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.dto.OrderBookResponseDto;
 import com.eap.common.dto.MarketSummaryDto;
 import com.eap.eap_matchengine.application.OrderQueryService;
@@ -22,8 +22,8 @@ public class OrderController {
     RedisMarketDataService redisMarketDataService;
 
     @GetMapping("query/{userId}")
-    public ResponseEntity<List<OrderConfirmedEvent>> queryOrder(@PathVariable UUID userId) {
-        List<OrderConfirmedEvent> orders = orderQueryService.excute(userId);
+    public ResponseEntity<List<OrderAssetReservationSucceededEvent>> queryOrder(@PathVariable UUID userId) {
+        List<OrderAssetReservationSucceededEvent> orders = orderQueryService.excute(userId);
         return ResponseEntity.ok(orders);
     }
     

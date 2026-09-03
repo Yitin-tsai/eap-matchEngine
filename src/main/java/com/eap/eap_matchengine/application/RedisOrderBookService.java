@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -166,19 +166,19 @@ public class RedisOrderBookService {
         return false;
     }
 
-    private String serializeRedisOrder(OrderConfirmedEvent event) throws JsonProcessingException {
+    private String serializeRedisOrder(OrderAssetReservationSucceededEvent event) throws JsonProcessingException {
         return objectMapper.writeValueAsString(RedisOrderEntry.from(event));
     }
 
-    private OrderConfirmedEvent deserializeRedisOrder(String value) throws JsonProcessingException {
+    private OrderAssetReservationSucceededEvent deserializeRedisOrder(String value) throws JsonProcessingException {
         return deserializeRedisOrder(objectMapper.readTree(value));
     }
 
-    private OrderConfirmedEvent deserializeRedisOrder(JsonNode root) throws JsonProcessingException {
+    private OrderAssetReservationSucceededEvent deserializeRedisOrder(JsonNode root) throws JsonProcessingException {
         if (root.has("i")) {
             return objectMapper.treeToValue(root, RedisOrderEntry.class).toEvent();
         }
-        return objectMapper.treeToValue(root, OrderConfirmedEvent.class);
+        return objectMapper.treeToValue(root, OrderAssetReservationSucceededEvent.class);
     }
 
     /**
@@ -191,7 +191,7 @@ public class RedisOrderBookService {
      * @param event The order event to be added
      * @throws JsonProcessingException if the order cannot be serialized to JSON
      */
-    public void addOrder(OrderConfirmedEvent event) throws JsonProcessingException {
+    public void addOrder(OrderAssetReservationSucceededEvent event) throws JsonProcessingException {
         String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
@@ -244,7 +244,7 @@ public class RedisOrderBookService {
      *
      * @param event The order event to be removed
      */
-    public void removeOrder(OrderConfirmedEvent event) {
+    public void removeOrder(OrderAssetReservationSucceededEvent event) {
         String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
@@ -288,7 +288,7 @@ public class RedisOrderBookService {
      * user:{userId}:orders set entry. Keeping this as a single Redis SREM avoids a redundant
      * remove_order.lua round trip on the trade hot path.
      */
-    public void unlinkUserOrder(OrderConfirmedEvent event) {
+    public void unlinkUserOrder(OrderAssetReservationSucceededEvent event) {
         if (!userOpenOrderIndexEnabled) {
             return;
         }
@@ -309,7 +309,7 @@ public class RedisOrderBookService {
      * TradeExecuted fact is being persisted. If persistence fails, the reservation can be
      * released back to the orderbook with the original amount.
      */
-    public OrderConfirmedEvent reserveBestMatchOrderLua(OrderConfirmedEvent incomingOrder) {
+    public OrderAssetReservationSucceededEvent reserveBestMatchOrderLua(OrderAssetReservationSucceededEvent incomingOrder) {
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
         String orderbookKey = isBuy
                 ? orderbookKey(marketId(incomingOrder), "sell")
@@ -359,7 +359,7 @@ public class RedisOrderBookService {
         }
 
         try {
-            OrderConfirmedEvent reservedOrder = deserializeRedisOrder(orderJson);
+            OrderAssetReservationSucceededEvent reservedOrder = deserializeRedisOrder(orderJson);
             log.debug("Successfully reserved order {} for matching", reservedOrder.getOrderId());
             return reservedOrder;
         } catch (Exception e) {
@@ -374,7 +374,7 @@ public class RedisOrderBookService {
      * The match ID is generated inside the same Redis Lua script after the reservation is
      * created. No-match orders do not consume a sequence value.
      */
-    public ReservedMatch reserveBestMatchOrderWithSequenceLua(OrderConfirmedEvent incomingOrder) {
+    public ReservedMatch reserveBestMatchOrderWithSequenceLua(OrderAssetReservationSucceededEvent incomingOrder) {
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
         String orderbookKey = isBuy
                 ? orderbookKey(marketId(incomingOrder), "sell")
@@ -430,7 +430,7 @@ public class RedisOrderBookService {
         }
 
         try {
-            OrderConfirmedEvent reservedOrder = deserializeRedisOrder(orderJson);
+            OrderAssetReservationSucceededEvent reservedOrder = deserializeRedisOrder(orderJson);
             Long matchId = Long.valueOf(new String(rawResult.get(1), StandardCharsets.UTF_8));
             log.debug("Successfully reserved order {} for matching with matchId={}",
                     reservedOrder.getOrderId(), matchId);
@@ -448,12 +448,12 @@ public class RedisOrderBookService {
      * This removes the no-match hot-path round trip where Java first ran a reserve Lua script,
      * observed null, and then ran add_order.lua.
      */
-    public MatchOrAddResult reserveBestMatchOrAddOrderWithSequenceLua(OrderConfirmedEvent incomingOrder) {
+    public MatchOrAddResult reserveBestMatchOrAddOrderWithSequenceLua(OrderAssetReservationSucceededEvent incomingOrder) {
         return reserveBestMatchOrAddOrderWithSequenceLua(incomingOrder, null);
     }
 
     MatchOrAddResult reserveBestMatchOrAddOrderWithSequenceLua(
-            OrderConfirmedEvent incomingOrder,
+            OrderAssetReservationSucceededEvent incomingOrder,
             IncomingOrderProcessingStore.Claim processingClaim) {
         Instant prepareStartedAt = Instant.now();
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
@@ -580,7 +580,7 @@ public class RedisOrderBookService {
         Instant deserializeStartedAt = Instant.now();
         try {
             String orderJson = new String(rawResult.get(1), StandardCharsets.UTF_8);
-            OrderConfirmedEvent reservedOrder = deserializeRedisOrder(orderJson);
+            OrderAssetReservationSucceededEvent reservedOrder = deserializeRedisOrder(orderJson);
             Long matchId = Long.valueOf(new String(rawResult.get(2), StandardCharsets.UTF_8));
             log.debug("Successfully reserved order {} for matching with matchId={}",
                     reservedOrder.getOrderId(), matchId);
@@ -593,7 +593,7 @@ public class RedisOrderBookService {
         }
     }
 
-    public record ReservedMatch(OrderConfirmedEvent order, Long matchId) {
+    public record ReservedMatch(OrderAssetReservationSucceededEvent order, Long matchId) {
     }
 
     public enum IncomingOrderAdmission {
@@ -636,7 +636,7 @@ public class RedisOrderBookService {
     /**
      * Releases a reserved order back to the visible orderbook.
      */
-    public void releaseReservedOrder(OrderConfirmedEvent event, String expectedTradeId)
+    public void releaseReservedOrder(OrderAssetReservationSucceededEvent event, String expectedTradeId)
             throws JsonProcessingException {
         String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
@@ -684,7 +684,7 @@ public class RedisOrderBookService {
     /**
      * Completes a reserved order after its corresponding TradeExecuted fact is durable.
      */
-    public void completeReservedOrder(OrderConfirmedEvent event, String expectedTradeId) {
+    public void completeReservedOrder(OrderAssetReservationSucceededEvent event, String expectedTradeId) {
         Instant prepareStartedAt = Instant.now();
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
@@ -847,7 +847,7 @@ public class RedisOrderBookService {
         try {
             JsonNode root = objectMapper.readTree(value);
             if (root.has("order")) {
-                OrderConfirmedEvent order = deserializeRedisOrder(root.get("order"));
+                OrderAssetReservationSucceededEvent order = deserializeRedisOrder(root.get("order"));
                 long reservedAtEpochMillis = root.path("reservedAtEpochMillis").asLong(0L);
                 String tradeId = root.path("tradeId").asText(null);
                 return ReservationSnapshot.valid(key, order, reservedAtEpochMillis, tradeId);
@@ -858,21 +858,21 @@ public class RedisOrderBookService {
                 if (orderJson == null || orderJson.isBlank()) {
                     return ReservationSnapshot.invalid(key, "missing reserved order detail " + orderId);
                 }
-                OrderConfirmedEvent order = deserializeRedisOrder(orderJson);
+                OrderAssetReservationSucceededEvent order = deserializeRedisOrder(orderJson);
                 long reservedAtEpochMillis = root.path("reservedAtEpochMillis").asLong(0L);
                 String tradeId = root.path("tradeId").asText(null);
                 return ReservationSnapshot.valid(key, order, reservedAtEpochMillis, tradeId);
             }
 
             // Backward compatibility for pre-TPS-59 reservation values that stored only order JSON.
-            OrderConfirmedEvent order = deserializeRedisOrder(root);
+            OrderAssetReservationSucceededEvent order = deserializeRedisOrder(root);
             return ReservationSnapshot.valid(key, order, 0L);
         } catch (Exception e) {
             return ReservationSnapshot.invalid(key, e.getMessage());
         }
     }
 
-    public OrderConfirmedEvent findOpenOrder(UUID orderId) {
+    public OrderAssetReservationSucceededEvent findOpenOrder(UUID orderId) {
         String orderJson = redisTemplate.opsForValue().get("order:" + orderId);
         if (orderJson == null) {
             return null;
@@ -898,7 +898,7 @@ public class RedisOrderBookService {
     }
 
     public CancellationArbitration arbitrateCancellation(
-            OrderConfirmedEvent order,
+            OrderAssetReservationSucceededEvent order,
             UUID cancellationId) {
         String orderbookKey = orderbookKey(order);
         String orderIdKey = "order:" + order.getOrderId();
@@ -942,7 +942,7 @@ public class RedisOrderBookService {
         if (("__CANCELLED__".equals(status) || "__DUPLICATE__".equals(status))
                 && result.size() == 2 && result.get(1) != null) {
             try {
-                OrderConfirmedEvent cancelledOrder = deserializeRedisOrder(
+                OrderAssetReservationSucceededEvent cancelledOrder = deserializeRedisOrder(
                         new String(result.get(1), StandardCharsets.UTF_8));
                 return "__CANCELLED__".equals(status)
                         ? CancellationArbitration.cancelled(cancelledOrder)
@@ -967,13 +967,13 @@ public class RedisOrderBookService {
 
     public record CancellationArbitration(
             CancellationOutcome outcome,
-            OrderConfirmedEvent cancelledOrder) {
+            OrderAssetReservationSucceededEvent cancelledOrder) {
 
-        static CancellationArbitration cancelled(OrderConfirmedEvent order) {
+        static CancellationArbitration cancelled(OrderAssetReservationSucceededEvent order) {
             return new CancellationArbitration(CancellationOutcome.CANCELLED, order);
         }
 
-        static CancellationArbitration duplicate(OrderConfirmedEvent order) {
+        static CancellationArbitration duplicate(OrderAssetReservationSucceededEvent order) {
             return new CancellationArbitration(CancellationOutcome.ALREADY_CANCELLED_BY_REQUEST, order);
         }
 
@@ -988,7 +988,7 @@ public class RedisOrderBookService {
      * @param userId The user ID
      * @return List of orders for the user
      */
-    public List<OrderConfirmedEvent> getOrderByUserId(UUID userId) {
+    public List<OrderAssetReservationSucceededEvent> getOrderByUserId(UUID userId) {
         if (!userOpenOrderIndexEnabled) {
             return List.of();
         }
@@ -1023,7 +1023,7 @@ public class RedisOrderBookService {
      * @param incomingOrder The order to find matches for
      * @return List of matching orders sorted by best price (lowest for sells, highest for buys)
      */
-    public List<OrderConfirmedEvent> getMatchableOrders(OrderConfirmedEvent incomingOrder) {
+    public List<OrderAssetReservationSucceededEvent> getMatchableOrders(OrderAssetReservationSucceededEvent incomingOrder) {
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
         String oppositeKey = isBuy
                 ? orderbookKey(marketId(incomingOrder), "sell")
@@ -1058,7 +1058,7 @@ public class RedisOrderBookService {
                 .collect(Collectors.toList());
     }
 
-    private String orderbookKey(OrderConfirmedEvent event) {
+    private String orderbookKey(OrderAssetReservationSucceededEvent event) {
         String side = event.getOrderType().equalsIgnoreCase("BUY") ? "buy" : "sell";
         return orderbookKey(marketId(event), side);
     }
@@ -1067,7 +1067,7 @@ public class RedisOrderBookService {
         return "orderbook:" + marketId + ":" + side;
     }
 
-    private String reservationKey(OrderConfirmedEvent event) {
+    private String reservationKey(OrderAssetReservationSucceededEvent event) {
         return "order:reservation:" + event.getOrderId();
     }
 
@@ -1075,13 +1075,13 @@ public class RedisOrderBookService {
         return userOpenOrderIndexEnabled ? "1" : "0";
     }
 
-    private String marketId(OrderConfirmedEvent event) {
+    private String marketId(OrderAssetReservationSucceededEvent event) {
         return event.getMarketId() == null || event.getMarketId().isBlank()
                 ? DEFAULT_MARKET_ID
                 : event.getMarketId();
     }
 
-    private double scoreFor(OrderConfirmedEvent event) {
+    private double scoreFor(OrderAssetReservationSucceededEvent event) {
         long sequence = event.getMarketSequence() == null ? 0L : event.getMarketSequence();
         long boundedSequence = Math.floorMod(sequence, SCORE_FACTOR);
         if (event.getOrderType().equalsIgnoreCase("BUY")) {
@@ -1108,7 +1108,7 @@ public class RedisOrderBookService {
             String t,
             String c) {
 
-        static RedisOrderEntry from(OrderConfirmedEvent event) {
+        static RedisOrderEntry from(OrderAssetReservationSucceededEvent event) {
             return new RedisOrderEntry(
                     event.getOrderId(),
                     event.getUserId(),
@@ -1120,8 +1120,8 @@ public class RedisOrderBookService {
                     event.getCreatedAt() == null ? null : event.getCreatedAt().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
         }
 
-        OrderConfirmedEvent toEvent() {
-            return OrderConfirmedEvent.builder()
+        OrderAssetReservationSucceededEvent toEvent() {
+            return OrderAssetReservationSucceededEvent.builder()
                     .orderId(i)
                     .userId(u)
                     .marketId(m)
@@ -1136,19 +1136,19 @@ public class RedisOrderBookService {
 
     public record ReservationSnapshot(
             String key,
-            OrderConfirmedEvent order,
+            OrderAssetReservationSucceededEvent order,
             long reservedAtEpochMillis,
             String tradeId,
             boolean valid,
             String invalidReason) {
 
-        static ReservationSnapshot valid(String key, OrderConfirmedEvent order, long reservedAtEpochMillis) {
+        static ReservationSnapshot valid(String key, OrderAssetReservationSucceededEvent order, long reservedAtEpochMillis) {
             return valid(key, order, reservedAtEpochMillis, null);
         }
 
         static ReservationSnapshot valid(
                 String key,
-                OrderConfirmedEvent order,
+                OrderAssetReservationSucceededEvent order,
                 long reservedAtEpochMillis,
                 String tradeId) {
             return new ReservationSnapshot(key, order, reservedAtEpochMillis, tradeId, true, null);

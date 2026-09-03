@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.connection.RedisConnection;
@@ -38,7 +38,7 @@ class RedisOrderBookServiceTest {
 
     @Test
     void arbitrateCancellation_whenLuaRemovesOrder_shouldReturnCancelled() {
-        OrderConfirmedEvent order = incomingBuyOrder();
+        OrderAssetReservationSucceededEvent order = incomingBuyOrder();
         doReturn(List.of(
                 "__CANCELLED__".getBytes(StandardCharsets.UTF_8),
                 compactRedisOrderJson(order).getBytes(StandardCharsets.UTF_8)))
@@ -54,7 +54,7 @@ class RedisOrderBookServiceTest {
 
     @Test
     void arbitrateCancellation_whenMarkerAlreadyExists_shouldBeIdempotent() {
-        OrderConfirmedEvent order = incomingBuyOrder();
+        OrderAssetReservationSucceededEvent order = incomingBuyOrder();
         doReturn(List.of(
                 "__DUPLICATE__".getBytes(StandardCharsets.UTF_8),
                 compactRedisOrderJson(order).getBytes(StandardCharsets.UTF_8)))
@@ -127,7 +127,7 @@ class RedisOrderBookServiceTest {
 
     @Test
     void reserveBestMatchOrderWithSequenceLua_shouldReturnReservedOrderAndMatchId() throws Exception {
-        OrderConfirmedEvent restingSell = OrderConfirmedEvent.builder()
+        OrderAssetReservationSucceededEvent restingSell = OrderAssetReservationSucceededEvent.builder()
                 .orderId(UUID.fromString("00000000-0000-0000-0000-000000000004"))
                 .userId(UUID.fromString("00000000-0000-0000-0000-000000000005"))
                 .marketId("TEST-MARKET")
@@ -267,7 +267,7 @@ class RedisOrderBookServiceTest {
 
     @Test
     void reserveBestMatchOrAddOrderWithSequenceLua_whenMatched_shouldReturnReservedOrderAndMatchId() throws Exception {
-        OrderConfirmedEvent restingSell = OrderConfirmedEvent.builder()
+        OrderAssetReservationSucceededEvent restingSell = OrderAssetReservationSucceededEvent.builder()
                 .orderId(UUID.fromString("00000000-0000-0000-0000-000000000014"))
                 .userId(UUID.fromString("00000000-0000-0000-0000-000000000015"))
                 .marketId("TEST-MARKET")
@@ -295,7 +295,7 @@ class RedisOrderBookServiceTest {
     @Test
     void reserveBestMatchOrAddOrderWithSequenceLua_whenMatchedWithCompactRedisOrder_shouldReturnReservedOrder()
             throws Exception {
-        OrderConfirmedEvent restingSell = OrderConfirmedEvent.builder()
+        OrderAssetReservationSucceededEvent restingSell = OrderAssetReservationSucceededEvent.builder()
                 .orderId(UUID.fromString("00000000-0000-0000-0000-000000000024"))
                 .userId(UUID.fromString("00000000-0000-0000-0000-000000000025"))
                 .marketId("TEST-MARKET")
@@ -359,7 +359,7 @@ class RedisOrderBookServiceTest {
     @Test
     void scanReservations_whenReservationStoresOrderId_shouldResolveOrderDetail() {
         UUID orderId = UUID.fromString("00000000-0000-0000-0000-000000000034");
-        OrderConfirmedEvent restingSell = OrderConfirmedEvent.builder()
+        OrderAssetReservationSucceededEvent restingSell = OrderAssetReservationSucceededEvent.builder()
                 .orderId(orderId)
                 .userId(UUID.fromString("00000000-0000-0000-0000-000000000035"))
                 .marketId("TEST-MARKET")
@@ -389,8 +389,8 @@ class RedisOrderBookServiceTest {
         assertThat(snapshots.get(0).order().getAmount()).isEqualTo(4);
     }
 
-    private OrderConfirmedEvent incomingBuyOrder() {
-        return OrderConfirmedEvent.builder()
+    private OrderAssetReservationSucceededEvent incomingBuyOrder() {
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(UUID.fromString("00000000-0000-0000-0000-000000000002"))
                 .userId(UUID.fromString("00000000-0000-0000-0000-000000000003"))
                 .marketId("TEST-MARKET")
@@ -402,7 +402,7 @@ class RedisOrderBookServiceTest {
                 .build();
     }
 
-    private String compactRedisOrderJson(OrderConfirmedEvent event) {
+    private String compactRedisOrderJson(OrderAssetReservationSucceededEvent event) {
         return """
                 {"i":"%s","u":"%s","m":"%s","s":%d,"p":%d,"a":%d,"t":"%s","c":"%s"}
                 """.formatted(

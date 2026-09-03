@@ -5,7 +5,7 @@
 
 > 實作狀態：2026-06-03 已完成 Phase 1、Phase 2，並先以 Redis ZSET composite score 完成 price + sequence 的 MVP 排序。完整 price-level FIFO queue 保留為下一階段強化。
 
-> 2026-08-21 補充：現行成交事件是 `TradeExecutedEvent`，包含買賣雙方 `marketSequence`；`OrderSubmittedEvent` 與 `OrderConfirmedEvent` 也已帶有 `marketId`/`marketSequence`。舊 `OrderMatchedEvent` 與讀取 legacy `audit_events` 的 `OrderReplayService` 均已退役。下方「背景限制」與分階段 checklist 是 2026-06 的演進紀錄；完整 price-level FIFO、跨節點分片與 Super Stream 仍是未來方向。現行 CDA 容量測試以單一市場、單一撮合權威與 Redis Lua 原子操作為邊界，不能代表 TDA。
+> 2026-08-21 補充：現行成交事件是 `TradeExecutedEvent`，包含買賣雙方 `marketSequence`；`OrderSubmittedEvent` 與 `OrderAssetReservationSucceededEvent` 也已帶有 `marketId`/`marketSequence`。舊 `OrderMatchedEvent` 與讀取 legacy `audit_events` 的 `OrderReplayService` 均已退役。下方「背景限制」與分階段 checklist 是 2026-06 的演進紀錄；完整 price-level FIFO、跨節點分片與 Super Stream 仍是未來方向。現行 CDA 容量測試以單一市場、單一撮合權威與 Redis Lua 原子操作為邊界，不能代表 TDA。
 
 ## 背景
 
@@ -20,7 +20,7 @@
 
 當時版本仍有幾個限制（現行 event schema 與 audit 寫入已完成其中一部分）：
 
-- `OrderSubmittedEvent` / `OrderConfirmedEvent` 沒有 `marketId` 與 `marketSequence`
+- `OrderSubmittedEvent` / `OrderAssetReservationSucceededEvent` 沒有 `marketId` 與 `marketSequence`
 - Redis order book 目前主要以 `price` 排序，同價位 FIFO 不嚴格
 - 多個 `eap-order` pod 可以接單，但缺少可驗證的 per-market order acceptance sequence
 - audit hash chain 目前是全域串連，語意偏重且會讓 audit 寫入序列化
@@ -91,7 +91,7 @@ private String marketId;
 private Long marketSequence;
 ```
 
-### OrderConfirmedEvent
+### OrderAssetReservationSucceededEvent
 
 新增：
 
@@ -273,7 +273,7 @@ createdAt
 - [x] 新增 `MarketSequenceService`
 - [x] 使用 Redis `INCR seq:{marketId}`
 - [x] `OrderSubmittedEvent` 新增 `marketId` / `marketSequence`
-- [x] `OrderConfirmedEvent` pass-through `marketId` / `marketSequence`
+- [x] `OrderAssetReservationSucceededEvent` pass-through `marketId` / `marketSequence`
 - [x] 下單 API response 回傳 `marketId` / `marketSequence`
 
 ### Phase 2：Audit 語意修正

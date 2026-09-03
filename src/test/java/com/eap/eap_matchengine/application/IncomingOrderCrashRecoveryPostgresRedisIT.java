@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.common.event.OrderCancellationResultEvent;
 import com.eap.common.event.TradeExecutedEvent;
@@ -38,6 +38,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
                 "spring.liquibase.enabled=true",
                 "eap.match-engine.trade-outbox-relay.enabled=false",
                 "eap.match-engine.trade-checkpoint-relay.enabled=false",
+                "eap.match-engine.order-admission-inbox.enabled=false",
                 "eap.match-engine.reservation-reconciler.enabled=false",
                 "eap.match-engine.reservation-cleanup.enabled=false"
         })
@@ -95,12 +96,15 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     @Autowired
     private OrderCancellationDecisionStore cancellationDecisions;
     @Autowired
-    private OrderConfirmedProcessor orderConfirmedProcessor;
+    private MatchOrderAdmissionProcessor matchOrderAdmissionProcessor;
+    @Autowired
+    private MatchOrderAdmissionInbox matchOrderAdmissionInbox;
 
     @BeforeEach
     void resetState() {
         jdbc.execute("""
                 TRUNCATE TABLE
+                    match_engine.order_admission_inbox,
                     match_engine.order_cancellations,
                     match_engine.reservation_cleanup_tasks,
                     match_engine.trade_outbox,
@@ -113,8 +117,88 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     }
 
     @Test
+    void admissionInbox_duplicateAndIdentityConflict_shouldRemainAuditable() {
+        OrderAssetReservationSucceededEvent original = order("BUY", 501, 1L, 7);
+
+        assertThat(matchOrderAdmissionInbox.receive(original))
+                .isEqualTo(MatchOrderAdmissionInbox.ReceiveOutcome.ACCEPTED);
+        assertThat(matchOrderAdmissionInbox.receive(original))
+                .isEqualTo(MatchOrderAdmissionInbox.ReceiveOutcome.DUPLICATE);
+
+        OrderAssetReservationSucceededEvent conflicting = order("BUY", 501, 1L, 8);
+        assertThat(matchOrderAdmissionInbox.receive(conflicting))
+                .isEqualTo(MatchOrderAdmissionInbox.ReceiveOutcome.CONFLICT);
+        assertThat(jdbc.queryForObject("""
+                SELECT status
+                FROM match_engine.order_admission_inbox
+                WHERE order_id = ?
+                """, String.class, INCOMING_ORDER_ID)).isEqualTo("FAILED_PERMANENT");
+        assertThat(jdbc.queryForObject("""
+                SELECT error_type
+                FROM match_engine.order_admission_inbox
+                WHERE order_id = ?
+                """, String.class, INCOMING_ORDER_ID)).isEqualTo("IDENTITY_CONFLICT");
+        assertThat(matchOrderAdmissionInbox.retryExhaustedTechnicalFailure(INCOMING_ORDER_ID)).isFalse();
+    }
+
+    @Test
+    void admissionInbox_operatorRetry_shouldOnlyReopenExhaustedTechnicalFailure() {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 1L, 7);
+        matchOrderAdmissionInbox.receive(incoming);
+        jdbc.update("""
+                UPDATE match_engine.order_admission_inbox
+                SET status = 'FAILED_PERMANENT',
+                    attempt_count = 20,
+                    error_type = 'RETRY_EXHAUSTED_TRANSIENT_REDIS'
+                WHERE order_id = ?
+                """, INCOMING_ORDER_ID);
+
+        assertThat(matchOrderAdmissionInbox.retryExhaustedTechnicalFailure(INCOMING_ORDER_ID)).isTrue();
+        assertThat(jdbc.queryForMap("""
+                SELECT status, attempt_count, error_type
+                FROM match_engine.order_admission_inbox
+                WHERE order_id = ?
+                """, INCOMING_ORDER_ID))
+                .containsEntry("status", "PENDING")
+                .containsEntry("attempt_count", 0)
+                .containsEntry("error_type", null);
+    }
+
+    @Test
+    void admissionInbox_crashAfterMatchBeforeAppliedMarker_shouldReclaimAndConvergeOnce() {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 1L, 7);
+        assertThat(matchOrderAdmissionInbox.receive(incoming))
+                .isEqualTo(MatchOrderAdmissionInbox.ReceiveOutcome.ACCEPTED);
+
+        MatchOrderAdmissionInbox.InboxEntry first =
+                matchOrderAdmissionInbox.claimRetryable(1, "worker-a", 30_000).get(0);
+        matchOrderAdmissionProcessor.process(first.event());
+
+        // Simulate process death after the Redis admission completed but before the inbox APPLIED update.
+        jdbc.update("""
+                UPDATE match_engine.order_admission_inbox
+                SET claim_until = CURRENT_TIMESTAMP - INTERVAL '1 second'
+                WHERE order_id = ?
+                """, INCOMING_ORDER_ID);
+
+        MatchOrderAdmissionInbox.InboxEntry reclaimed =
+                matchOrderAdmissionInbox.claimRetryable(1, "worker-b", 30_000).get(0);
+        assertThat(reclaimed.attemptCount()).isEqualTo(2);
+        matchOrderAdmissionProcessor.process(reclaimed.event());
+        assertThat(matchOrderAdmissionInbox.markApplied(reclaimed, "worker-b")).isTrue();
+
+        assertThat(visibleAmount(incoming)).isEqualTo(7);
+        assertThat(tradeCount()).isZero();
+        assertThat(jdbc.queryForObject("""
+                SELECT status
+                FROM match_engine.order_admission_inbox
+                WHERE order_id = ?
+                """, String.class, INCOMING_ORDER_ID)).isEqualTo("APPLIED");
+    }
+
+    @Test
     void cancellationLua_shouldReturnExactRemovedOrderAndRemainIdempotent() throws Exception {
-        OrderConfirmedEvent open = order("BUY", 501, 1L, 7);
+        OrderAssetReservationSucceededEvent open = order("BUY", 501, 1L, 7);
         UUID cancellationId = UUID.randomUUID();
         orderBookService.addOrder(open);
 
@@ -133,8 +217,8 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void cancellationLua_shouldLoseWhenMatchingAlreadyReservedTheOrder() throws Exception {
-        OrderConfirmedEvent resting = order("SELL", 501, 1L, 7);
-        OrderConfirmedEvent incoming = order("BUY", 502, 2L, 1);
+        OrderAssetReservationSucceededEvent resting = order("SELL", 501, 1L, 7);
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 502, 2L, 1);
         orderBookService.addOrder(resting);
         RedisOrderBookService.ReservedMatch reserved =
                 orderBookService.reserveBestMatchOrderWithSequenceLua(incoming);
@@ -150,11 +234,11 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void cancellationBeforeOrderConfirmed_shouldPersistDecisionAndPreventAdmission() {
-        OrderConfirmedEvent order = order("BUY", 501, 1L, 7);
+        OrderAssetReservationSucceededEvent order = order("BUY", 501, 1L, 7);
         UUID cancellationId = UUID.randomUUID();
         cancellationCoordinator.request(cancellationRequest(order, cancellationId));
 
-        orderConfirmedProcessor.process(order);
+        matchOrderAdmissionProcessor.process(order);
 
         OrderCancellationDecisionStore.Decision decision = cancellationDecisions.find(cancellationId);
         assertThat(decision.status()).isEqualTo(OrderCancellationResultEvent.CANCELLED);
@@ -172,13 +256,13 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void pendingDecisionWithoutRedisIntent_whenMatchingWins_shouldConvergeAsAlreadyMatched() throws Exception {
-        OrderConfirmedEvent resting = order("SELL", 502, 1L, 7);
-        OrderConfirmedEvent incoming = order("BUY", 501, 2L, 7);
+        OrderAssetReservationSucceededEvent resting = order("SELL", 502, 1L, 7);
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 2L, 7);
         UUID cancellationId = UUID.randomUUID();
         orderBookService.addOrder(resting);
 
         cancellationDecisions.begin(cancellationRequest(incoming, cancellationId), null);
-        orderConfirmedProcessor.process(incoming);
+        matchOrderAdmissionProcessor.process(incoming);
         cancellationCoordinator.reconcilePending();
 
         assertThat(tradeCount()).isEqualTo(1);
@@ -194,7 +278,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void crashAfterRedisCancellationBeforeDecisionCommit_shouldRecoverFromMarker() throws Exception {
-        OrderConfirmedEvent order = order("BUY", 501, 1L, 7);
+        OrderAssetReservationSucceededEvent order = order("BUY", 501, 1L, 7);
         UUID cancellationId = UUID.randomUUID();
         OrderCancellationRequestedEvent request = cancellationRequest(order, cancellationId);
         orderBookService.addOrder(order);
@@ -221,12 +305,12 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void crashAfterPreAdmissionDecisionBeforeCompletedMarker_shouldHealOnRedelivery() {
-        OrderConfirmedEvent order = order("BUY", 501, 1L, 7);
+        OrderAssetReservationSucceededEvent order = order("BUY", 501, 1L, 7);
         UUID cancellationId = UUID.randomUUID();
         cancellationCoordinator.request(cancellationRequest(order, cancellationId));
         IncomingOrderProcessingStore markerFailingStore =
                 new FailOnceCompletedStore(redisTemplate);
-        OrderConfirmedProcessor crashingProcessor = new OrderConfirmedProcessor(
+        MatchOrderAdmissionProcessor crashingProcessor = new MatchOrderAdmissionProcessor(
                 matchingEngine(durableRecorder),
                 markerFailingStore,
                 tradeExecutionRepository,
@@ -255,8 +339,8 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void legacyCompletedHashRedelivery_shouldMigrateToBitmapWithoutMatchingAgain() throws Exception {
-        OrderConfirmedEvent resting = order("SELL", 901, 1L, 1);
-        OrderConfirmedEvent incoming = order("BUY", 501, 2L, 1);
+        OrderAssetReservationSucceededEvent resting = order("SELL", 901, 1L, 1);
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 2L, 1);
         orderBookService.addOrder(resting);
         IncomingOrderProcessingStore.Claim claim = processingStore.newClaim(incoming);
         redisTemplate.opsForHash().put(
@@ -274,10 +358,10 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void noMatchAdd_shouldAtomicallyCompleteGuardWithoutSeparateMarkerWrite() {
-        OrderConfirmedEvent incoming = order("BUY", 501, 1L, 3);
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 1L, 3);
         IncomingOrderProcessingStore markerFailingStore =
                 new FailOnceCompletedStore(redisTemplate);
-        OrderConfirmedProcessor processor = new OrderConfirmedProcessor(
+        MatchOrderAdmissionProcessor processor = new MatchOrderAdmissionProcessor(
                 matchingEngine(durableRecorder),
                 markerFailingStore,
                 tradeExecutionRepository,
@@ -299,9 +383,9 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void staleCleanup_shouldNotDeleteNewerReservationForSameOrder() throws Exception {
-        OrderConfirmedEvent resting = order("BUY", 611, 1L, 1);
-        OrderConfirmedEvent firstIncoming = order("SELL", 612, 2L, 1);
-        OrderConfirmedEvent secondIncoming = order("SELL", 613, 3L, 1);
+        OrderAssetReservationSucceededEvent resting = order("BUY", 611, 1L, 1);
+        OrderAssetReservationSucceededEvent firstIncoming = order("SELL", 612, 2L, 1);
+        OrderAssetReservationSucceededEvent secondIncoming = order("SELL", 613, 3L, 1);
         orderBookService.addOrder(resting);
 
         RedisOrderBookService.ReservedMatch firstReservation =
@@ -326,14 +410,14 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void crashAfterTradeCommitBeforeRedisCleanup_shouldResumeOnlyDurableRemainder() throws Exception {
-        OrderConfirmedEvent firstResting = order("SELL", 601, 1L, 2);
-        OrderConfirmedEvent secondResting = order("SELL", 602, 2L, 1);
-        OrderConfirmedEvent incoming = order("BUY", 501, 3L, 5);
+        OrderAssetReservationSucceededEvent firstResting = order("SELL", 601, 1L, 2);
+        OrderAssetReservationSucceededEvent secondResting = order("SELL", 602, 2L, 1);
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 3L, 5);
         orderBookService.addOrder(firstResting);
         orderBookService.addOrder(secondResting);
 
         MatchingEngineService crashingEngine = matchingEngine(crashAfterCommitRecorder());
-        OrderConfirmedProcessor crashingProcessor = processor(crashingEngine);
+        MatchOrderAdmissionProcessor crashingProcessor = processor(crashingEngine);
 
         assertThatThrownBy(() -> crashingProcessor.process(incoming))
                 .isInstanceOf(SimulatedCrash.class);
@@ -353,7 +437,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         assertThat(orderBookService.countActiveReservations()).isZero();
         backdateIncomingClaim();
 
-        OrderConfirmedProcessor recoveryProcessor = processor(matchingEngine(durableRecorder));
+        MatchOrderAdmissionProcessor recoveryProcessor = processor(matchingEngine(durableRecorder));
         recoveryProcessor.process(incoming);
         cleanupWorker().cleanupOnce();
 
@@ -384,11 +468,11 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void crashAfterLuaReservationBeforeTradeCommit_shouldReleaseOrphanAndMatchOnce() throws Exception {
-        OrderConfirmedEvent resting = order("SELL", 701, 1L, 2);
-        OrderConfirmedEvent incoming = order("BUY", 501, 2L, 2);
+        OrderAssetReservationSucceededEvent resting = order("SELL", 701, 1L, 2);
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 2L, 2);
         orderBookService.addOrder(resting);
 
-        OrderConfirmedProcessor crashingProcessor =
+        MatchOrderAdmissionProcessor crashingProcessor =
                 processor(matchingEngine(crashBeforeCommitRecorder()));
 
         assertThatThrownBy(() -> crashingProcessor.process(incoming))
@@ -406,7 +490,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         assertThat(visibleAmount(resting)).isEqualTo(2);
         backdateIncomingClaim();
 
-        OrderConfirmedProcessor recoveryProcessor = processor(matchingEngine(durableRecorder));
+        MatchOrderAdmissionProcessor recoveryProcessor = processor(matchingEngine(durableRecorder));
         recoveryProcessor.process(incoming);
         cleanupWorker().cleanupOnce();
 
@@ -430,13 +514,13 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
 
     @Test
     void crashBeforeCompletedMarker_shouldConvergeFromDurableTradeAndIgnoreRedelivery() throws Exception {
-        OrderConfirmedEvent resting = order("SELL", 801, 1L, 5);
-        OrderConfirmedEvent incoming = order("BUY", 501, 2L, 5);
+        OrderAssetReservationSucceededEvent resting = order("SELL", 801, 1L, 5);
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 2L, 5);
         orderBookService.addOrder(resting);
         IncomingOrderProcessingStore markerFailingStore =
                 new FailOnceCompletedStore(redisTemplate);
 
-        OrderConfirmedProcessor crashingProcessor = new OrderConfirmedProcessor(
+        MatchOrderAdmissionProcessor crashingProcessor = new MatchOrderAdmissionProcessor(
                 matchingEngine(durableRecorder),
                 markerFailingStore,
                 tradeExecutionRepository,
@@ -457,7 +541,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         cleanupWorker().cleanupOnce();
         backdateIncomingClaim();
 
-        OrderConfirmedProcessor recoveryProcessor = processor(matchingEngine(durableRecorder));
+        MatchOrderAdmissionProcessor recoveryProcessor = processor(matchingEngine(durableRecorder));
         recoveryProcessor.process(incoming);
 
         assertThat(tradeCount()).isEqualTo(1);
@@ -482,8 +566,8 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         return new MatchingEngineService(orderBookService, redissonClient, recorder, matchingMetrics);
     }
 
-    private OrderConfirmedProcessor processor(MatchingEngineService matchingEngineService) {
-        return new OrderConfirmedProcessor(
+    private MatchOrderAdmissionProcessor processor(MatchingEngineService matchingEngineService) {
+        return new MatchOrderAdmissionProcessor(
                 matchingEngineService,
                 processingStore,
                 tradeExecutionRepository,
@@ -556,7 +640,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                 "PROCESSING:" + state.token() + ":0");
     }
 
-    private int visibleAmount(OrderConfirmedEvent order) {
+    private int visibleAmount(OrderAssetReservationSucceededEvent order) {
         return orderBookService.getOrderByUserId(order.getUserId()).stream()
                 .filter(candidate -> candidate.getOrderId().equals(order.getOrderId()))
                 .findFirst()
@@ -592,12 +676,12 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                 """, Long.class, orderId, orderId);
     }
 
-    private OrderConfirmedEvent order(String side, int suffix, long sequence, int amount) {
+    private OrderAssetReservationSucceededEvent order(String side, int suffix, long sequence, int amount) {
         UUID orderId = suffix == 501
                 ? INCOMING_ORDER_ID
                 : UUID.fromString("00000000-0000-0000-0000-%012d".formatted(suffix));
         UUID userId = UUID.fromString("00000000-0000-0000-0001-%012d".formatted(suffix));
-        return OrderConfirmedEvent.builder()
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(orderId)
                 .userId(userId)
                 .marketId(MARKET_ID)
@@ -610,7 +694,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     }
 
     private OrderCancellationRequestedEvent cancellationRequest(
-            OrderConfirmedEvent order,
+            OrderAssetReservationSucceededEvent order,
             UUID cancellationId) {
         return OrderCancellationRequestedEvent.builder()
                 .cancellationId(cancellationId)
@@ -632,7 +716,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         }
 
         @Override
-        void markCompleted(OrderConfirmedEvent order) {
+        void markCompleted(OrderAssetReservationSucceededEvent order) {
             if (fail) {
                 fail = false;
                 throw new SimulatedCrash();

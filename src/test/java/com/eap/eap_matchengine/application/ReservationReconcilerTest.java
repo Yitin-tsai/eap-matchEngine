@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
 import com.eap.eap_matchengine.domain.entity.TradeExecutionEntity;
 import org.junit.jupiter.api.Test;
@@ -31,7 +31,7 @@ class ReservationReconcilerTest {
 
     @Test
     void reconcileOnce_whenReservationHasNoDurableTradeAndIsOld_shouldReleaseOrder() throws Exception {
-        OrderConfirmedEvent order = order(1);
+        OrderAssetReservationSucceededEvent order = order(1);
         when(orderBookService.scanReservations(100))
                 .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
                         "order:reservation:" + order.getOrderId(),
@@ -49,7 +49,7 @@ class ReservationReconcilerTest {
 
     @Test
     void reconcileOnce_whenReservationHasFullDurableTrade_shouldCompleteReservation() throws Exception {
-        OrderConfirmedEvent order = order(1);
+        OrderAssetReservationSucceededEvent order = order(1);
         TradeExecutionEntity trade = trade(order, 1);
         when(orderBookService.scanReservations(100))
                 .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
@@ -68,7 +68,7 @@ class ReservationReconcilerTest {
 
     @Test
     void reconcileOnce_whenReservationHasFreshDurableTrade_shouldLeaveCleanupWorkerAsOwner() throws Exception {
-        OrderConfirmedEvent order = order(1);
+        OrderAssetReservationSucceededEvent order = order(1);
         when(orderBookService.scanReservations(100))
                 .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
                         "order:reservation:" + order.getOrderId(),
@@ -85,7 +85,7 @@ class ReservationReconcilerTest {
 
     @Test
     void reconcileOnce_whenActiveCleanupTaskOwnsReservation_shouldDeferRecovery() throws Exception {
-        OrderConfirmedEvent order = order(1);
+        OrderAssetReservationSucceededEvent order = order(1);
         when(orderBookService.scanReservations(100))
                 .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
                         "order:reservation:" + order.getOrderId(),
@@ -104,7 +104,7 @@ class ReservationReconcilerTest {
 
     @Test
     void reconcileOnce_whenReservationHasPartialDurableTrade_shouldReleaseRemainingAmount() throws Exception {
-        OrderConfirmedEvent order = order(3);
+        OrderAssetReservationSucceededEvent order = order(3);
         TradeExecutionEntity trade = trade(order, 1);
         when(orderBookService.scanReservations(100))
                 .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
@@ -146,8 +146,8 @@ class ReservationReconcilerTest {
                 100);
     }
 
-    private OrderConfirmedEvent order(int amount) {
-        return OrderConfirmedEvent.builder()
+    private OrderAssetReservationSucceededEvent order(int amount) {
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(UUID.fromString("00000000-0000-0000-0000-000000000101"))
                 .userId(UUID.fromString("00000000-0000-0000-0000-000000000102"))
                 .marketId("TEST-MARKET")
@@ -159,7 +159,7 @@ class ReservationReconcilerTest {
                 .build();
     }
 
-    private TradeExecutionEntity trade(OrderConfirmedEvent order, int quantity) {
+    private TradeExecutionEntity trade(OrderAssetReservationSucceededEvent order, int quantity) {
         return new TradeExecutionEntity(
                 "TEST-MARKET-1",
                 1L,

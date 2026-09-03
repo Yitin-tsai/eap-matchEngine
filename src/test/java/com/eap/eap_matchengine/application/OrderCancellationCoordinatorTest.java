@@ -2,7 +2,7 @@ package com.eap.eap_matchengine.application;
 
 import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.common.event.OrderCancellationResultEvent;
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -69,7 +69,7 @@ class OrderCancellationCoordinatorTest {
 
     @Test
     void visibleRemainder_whenLuaRemovalWins_shouldCompleteWithExactRemovedSnapshot() {
-        OrderConfirmedEvent visible = openOrder(3);
+        OrderAssetReservationSucceededEvent visible = openOrder(3);
         OrderCancellationDecisionStore.Decision pending = pending(visible);
         when(decisions.begin(request(), null)).thenReturn(pending(null));
         when(decisions.find(CANCELLATION_ID)).thenReturn(pending(null));
@@ -88,7 +88,7 @@ class OrderCancellationCoordinatorTest {
 
     @Test
     void orderReservedByMatching_shouldKeepCancellationPending() {
-        OrderConfirmedEvent snapshot = openOrder(5);
+        OrderAssetReservationSucceededEvent snapshot = openOrder(5);
         OrderCancellationDecisionStore.Decision pending = pending(snapshot);
         when(decisions.begin(request(), null)).thenReturn(pending);
         when(decisions.find(CANCELLATION_ID)).thenReturn(pending);
@@ -108,7 +108,7 @@ class OrderCancellationCoordinatorTest {
 
     @Test
     void redisCancellationMarker_shouldHealCrashBeforeDecisionCommit() {
-        OrderConfirmedEvent snapshot = openOrder(5);
+        OrderAssetReservationSucceededEvent snapshot = openOrder(5);
         OrderCancellationDecisionStore.Decision pending = pending(snapshot);
         when(decisions.begin(request(), null)).thenReturn(pending);
         when(decisions.find(CANCELLATION_ID)).thenReturn(pending);
@@ -126,8 +126,8 @@ class OrderCancellationCoordinatorTest {
 
     @Test
     void partialMatchRemainderReappearingAfterReservation_shouldBeCancelled() {
-        OrderConfirmedEvent reservedSnapshot = openOrder(5);
-        OrderConfirmedEvent remainder = openOrder(3);
+        OrderAssetReservationSucceededEvent reservedSnapshot = openOrder(5);
+        OrderAssetReservationSucceededEvent remainder = openOrder(3);
         OrderCancellationDecisionStore.Decision beforeMatch = pending(reservedSnapshot);
         OrderCancellationDecisionStore.Decision afterRemainder = pending(remainder);
         when(decisions.begin(request(), null)).thenReturn(beforeMatch);
@@ -154,7 +154,7 @@ class OrderCancellationCoordinatorTest {
 
     @Test
     void fullyMatchedOrder_shouldRejectOnlyAfterCompletedAdmissionAndDurableTrade() {
-        OrderConfirmedEvent snapshot = openOrder(5);
+        OrderAssetReservationSucceededEvent snapshot = openOrder(5);
         OrderCancellationDecisionStore.Decision pending = pending(snapshot);
         when(decisions.begin(request(), null)).thenReturn(pending);
         when(decisions.find(CANCELLATION_ID)).thenReturn(pending);
@@ -239,7 +239,7 @@ class OrderCancellationCoordinatorTest {
 
     @Test
     void pendingIntentSeenByAdmission_shouldCancelOriginalOrderBeforeMatching() {
-        OrderConfirmedEvent order = openOrder(5);
+        OrderAssetReservationSucceededEvent order = openOrder(5);
         OrderCancellationDecisionStore.Decision pending = pending(null);
         when(decisions.findByOrderId(ORDER_ID)).thenReturn(pending);
 
@@ -251,7 +251,7 @@ class OrderCancellationCoordinatorTest {
 
     @Test
     void completedPreAdmissionCancellation_shouldBeIdempotentSoMarkerCanHeal() {
-        OrderConfirmedEvent order = openOrder(5);
+        OrderAssetReservationSucceededEvent order = openOrder(5);
         OrderCancellationDecisionStore.Decision completed = new OrderCancellationDecisionStore.Decision(
                 CANCELLATION_ID,
                 ORDER_ID,
@@ -278,7 +278,7 @@ class OrderCancellationCoordinatorTest {
 
     @Test
     void completedCancellationIntentRetry_shouldToleratePostgresTimestampPrecision() {
-        OrderConfirmedEvent order = openOrder(5);
+        OrderAssetReservationSucceededEvent order = openOrder(5);
         order.setCreatedAt(order.getCreatedAt().plusNanos(789));
         OrderCancellationDecisionStore.Decision completed = new OrderCancellationDecisionStore.Decision(
                 CANCELLATION_ID,
@@ -306,7 +306,7 @@ class OrderCancellationCoordinatorTest {
 
     @Test
     void completedPreAdmissionCancellation_shouldRejectConflictingOriginalAmount() {
-        OrderConfirmedEvent original = openOrder(5);
+        OrderAssetReservationSucceededEvent original = openOrder(5);
         OrderCancellationDecisionStore.Decision completed = new OrderCancellationDecisionStore.Decision(
                 CANCELLATION_ID,
                 ORDER_ID,
@@ -323,13 +323,13 @@ class OrderCancellationCoordinatorTest {
                 REQUESTED_AT,
                 REQUESTED_AT.plusSeconds(1),
                 1);
-        OrderConfirmedEvent conflicting = openOrder(5);
+        OrderAssetReservationSucceededEvent conflicting = openOrder(5);
         conflicting.setAmount(6);
         when(decisions.findByOrderId(ORDER_ID)).thenReturn(completed);
 
         assertThatThrownBy(() -> coordinator.resolveAdmissionBlockedByCancellationIntent(conflicting))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("conflicts with OrderConfirmed identity");
+                .hasMessageContaining("conflicts with asset-reservation success identity");
 
         verify(decisions, never()).complete(
                 completed, OrderCancellationResultEvent.CANCELLED, null, conflicting, conflicting.getAmount());
@@ -345,8 +345,8 @@ class OrderCancellationCoordinatorTest {
                 .build();
     }
 
-    private OrderConfirmedEvent openOrder(int amount) {
-        return OrderConfirmedEvent.builder()
+    private OrderAssetReservationSucceededEvent openOrder(int amount) {
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(ORDER_ID)
                 .userId(USER_ID)
                 .marketId("ENERGY-SPOT")
@@ -358,7 +358,7 @@ class OrderCancellationCoordinatorTest {
                 .build();
     }
 
-    private OrderCancellationDecisionStore.Decision pending(OrderConfirmedEvent order) {
+    private OrderCancellationDecisionStore.Decision pending(OrderAssetReservationSucceededEvent order) {
         return new OrderCancellationDecisionStore.Decision(
                 CANCELLATION_ID,
                 ORDER_ID,
@@ -377,7 +377,7 @@ class OrderCancellationCoordinatorTest {
                 0);
     }
 
-    private OrderCancellationDecisionStore.Decision claimed(OrderConfirmedEvent order, int attemptCount) {
+    private OrderCancellationDecisionStore.Decision claimed(OrderAssetReservationSucceededEvent order, int attemptCount) {
         OrderCancellationDecisionStore.Decision pending = pending(order);
         return new OrderCancellationDecisionStore.Decision(
                 pending.cancellationId(),

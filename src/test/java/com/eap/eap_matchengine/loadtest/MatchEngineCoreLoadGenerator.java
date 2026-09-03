@@ -2,7 +2,7 @@ package com.eap.eap_matchengine.loadtest;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_matchengine.application.MatchingEngineMetrics;
 import com.eap.eap_matchengine.application.MatchingEngineService;
@@ -112,9 +112,9 @@ public class MatchEngineCoreLoadGenerator {
         cleanMarket(redisTemplate, marketId);
         recordedTrades.clear();
 
-        OrderConfirmedEvent firstSell = order(marketId, "SELL", 100, 1, 1);
-        OrderConfirmedEvent secondSell = order(marketId, "SELL", 99, 1, 2);
-        OrderConfirmedEvent buy = order(marketId, "BUY", 100, 2, 3);
+        OrderAssetReservationSucceededEvent firstSell = order(marketId, "SELL", 100, 1, 1);
+        OrderAssetReservationSucceededEvent secondSell = order(marketId, "SELL", 99, 1, 2);
+        OrderAssetReservationSucceededEvent buy = order(marketId, "BUY", 100, 2, 3);
         service.tryMatch(firstSell);
         service.tryMatch(secondSell);
         service.tryMatch(buy);
@@ -154,14 +154,14 @@ public class MatchEngineCoreLoadGenerator {
         cleanMarket(redisTemplate, marketId);
         recordedTrades.clear();
 
-        OrderConfirmedEvent sell = order(marketId, "SELL", 100, 5, 1);
+        OrderAssetReservationSucceededEvent sell = order(marketId, "SELL", 100, 5, 1);
         service.tryMatch(sell);
         service.tryMatch(order(marketId, "BUY", 100, 2, 2));
 
         require(recordedTrades.size() == 1, "partial fill should produce 1 trade");
         require(recordedTrades.get(0).getQuantity() == 2, "partial fill should match incoming buy amount");
 
-        List<OrderConfirmedEvent> sellerOrders = orderBookService.getOrderByUserId(sell.getUserId());
+        List<OrderAssetReservationSucceededEvent> sellerOrders = orderBookService.getOrderByUserId(sell.getUserId());
         require(sellerOrders.size() == 1, "partial resting order should remain in seller open orders");
         require(sellerOrders.get(0).getAmount() == 3, "partial resting order should keep remaining amount");
         require(userOrderSetSize(redisTemplate, sell) == 1, "partial resting order should keep one user order reference");
@@ -176,8 +176,8 @@ public class MatchEngineCoreLoadGenerator {
         cleanMarket(redisTemplate, marketId);
         recordedTrades.clear();
 
-        OrderConfirmedEvent sell = order(marketId, "SELL", 110, 1, 1);
-        OrderConfirmedEvent buy = order(marketId, "BUY", 100, 1, 2);
+        OrderAssetReservationSucceededEvent sell = order(marketId, "SELL", 110, 1, 1);
+        OrderAssetReservationSucceededEvent buy = order(marketId, "BUY", 100, 1, 2);
         service.tryMatch(sell);
         service.tryMatch(buy);
 
@@ -268,13 +268,13 @@ public class MatchEngineCoreLoadGenerator {
         require(remainingBuyOrders == 0, "all incoming BUY orders should be fully matched");
     }
 
-    private static OrderConfirmedEvent order(String marketId, String side, int price, int amount, long sequence) {
+    private static OrderAssetReservationSucceededEvent order(String marketId, String side, int price, int amount, long sequence) {
         UUID orderId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
         GENERATED_REDIS_KEYS.add("order:" + orderId);
         GENERATED_REDIS_KEYS.add("user:" + userId + ":orders");
 
-        return OrderConfirmedEvent.builder()
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(orderId)
                 .userId(userId)
                 .marketId(marketId)
@@ -307,7 +307,7 @@ public class MatchEngineCoreLoadGenerator {
         return size == null ? 0L : size;
     }
 
-    private static long userOrderSetSize(RedisTemplate<String, String> redisTemplate, OrderConfirmedEvent order) {
+    private static long userOrderSetSize(RedisTemplate<String, String> redisTemplate, OrderAssetReservationSucceededEvent order) {
         Long size = redisTemplate.opsForSet().size("user:" + order.getUserId() + ":orders");
         return size == null ? 0L : size;
     }

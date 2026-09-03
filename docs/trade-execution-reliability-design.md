@@ -30,7 +30,7 @@ MatchEngine 不接收 `OrderTradeAppliedEvent` 或 `WalletTradeSettledEvent`，�
 
 ## 撮合與資料庫交易邊界
 
-`OrderConfirmedListener` 將 Wallet 已確認的訂單送入 `MatchingEngineService`。撮合流程保留以下順序：
+`OrderAssetReservationSucceededListener` 將 Wallet 已確認的訂單送入 `MatchingEngineService`。撮合流程保留以下順序：
 
 1. Redis Lua 原子取得或保留可成交的 resting order。
 2. 建立包含買賣方 order/user、市場順序、價格與數量的 `TradeExecutedEvent`。

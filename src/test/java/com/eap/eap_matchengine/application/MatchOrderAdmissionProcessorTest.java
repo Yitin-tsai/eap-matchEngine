@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -28,7 +28,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
-class OrderConfirmedProcessorTest {
+class MatchOrderAdmissionProcessorTest {
 
     private static final UUID ORDER_ID = UUID.fromString("00000000-0000-0000-0000-000000000101");
     private static final IncomingOrderProcessingStore.Claim CLAIM =
@@ -48,30 +48,30 @@ class OrderConfirmedProcessorTest {
     @Mock
     private RLock lock;
 
-    private OrderConfirmedProcessor processor;
+    private MatchOrderAdmissionProcessor processor;
 
     @BeforeEach
     void setUp() {
         lenient().when(redissonClient.getLock("lock:incoming-order:" + ORDER_ID)).thenReturn(lock);
         lenient().when(processingStore.newClaim(any())).thenReturn(CLAIM);
-        processor = new OrderConfirmedProcessor(
+        processor = new MatchOrderAdmissionProcessor(
                 matchingEngineService, processingStore, tradeExecutionRepository,
                 cancellationCoordinator, redissonClient, 1);
     }
 
     @Test
     void processNewOrder_shouldGuardMatchAndMarkCompleted() {
-        OrderConfirmedEvent source = order("BUY", 5);
+        OrderAssetReservationSucceededEvent source = order("BUY", 5);
         when(matchingEngineService.tryMatchGuarded(any(), any()))
                 .thenReturn(MatchingEngineService.GuardedMatchResult.PROCESSED);
 
         processor.process(source);
 
-        ArgumentCaptor<OrderConfirmedEvent> captor = ArgumentCaptor.forClass(OrderConfirmedEvent.class);
+        ArgumentCaptor<OrderAssetReservationSucceededEvent> captor = ArgumentCaptor.forClass(OrderAssetReservationSucceededEvent.class);
         InOrder sequence = inOrder(processingStore, matchingEngineService);
         sequence.verify(processingStore).newClaim(any());
         sequence.verify(matchingEngineService).tryMatchGuarded(captor.capture(), any());
-        sequence.verify(processingStore).markCompleted(any(OrderConfirmedEvent.class));
+        sequence.verify(processingStore).markCompleted(any(OrderAssetReservationSucceededEvent.class));
         assertThat(captor.getValue()).isNotSameAs(source);
         assertThat(captor.getValue().getAmount()).isEqualTo(5);
         assertThat(source.getAmount()).isEqualTo(5);
@@ -88,22 +88,22 @@ class OrderConfirmedProcessorTest {
 
         verify(processingStore).newClaim(any());
         verify(matchingEngineService).tryMatchGuarded(any(), any());
-        verify(processingStore, never()).markCompleted(any(OrderConfirmedEvent.class));
+        verify(processingStore, never()).markCompleted(any(OrderAssetReservationSucceededEvent.class));
         verifyNoInteractions(tradeExecutionRepository);
     }
 
     @Test
     void processCancellationAfterPartialIncomingMatch_shouldCancelOnlyRemainder() {
-        OrderConfirmedEvent source = order("BUY", 5);
+        OrderAssetReservationSucceededEvent source = order("BUY", 5);
         when(matchingEngineService.tryMatchGuarded(any(), any())).thenAnswer(invocation -> {
-            OrderConfirmedEvent workingOrder = invocation.getArgument(0);
+            OrderAssetReservationSucceededEvent workingOrder = invocation.getArgument(0);
             workingOrder.setAmount(2);
             return MatchingEngineService.GuardedMatchResult.CANCELLATION_PENDING;
         });
 
         processor.process(source);
 
-        ArgumentCaptor<OrderConfirmedEvent> cancelled = ArgumentCaptor.forClass(OrderConfirmedEvent.class);
+        ArgumentCaptor<OrderAssetReservationSucceededEvent> cancelled = ArgumentCaptor.forClass(OrderAssetReservationSucceededEvent.class);
         verify(cancellationCoordinator).resolveAdmissionBlockedByCancellationIntent(cancelled.capture());
         assertThat(cancelled.getValue().getAmount()).isEqualTo(2);
         assertThat(source.getAmount()).isEqualTo(5);
@@ -117,14 +117,14 @@ class OrderConfirmedProcessorTest {
 
         processor.process(order("SELL", 5));
 
-        verify(processingStore, never()).markCompleted(any(OrderConfirmedEvent.class));
+        verify(processingStore, never()).markCompleted(any(OrderAssetReservationSucceededEvent.class));
         verifyNoInteractions(tradeExecutionRepository);
         verifyNoInteractions(redissonClient);
     }
 
     @Test
     void processWithoutMarketSequence_shouldRejectUnsafeDeduplicationIdentity() {
-        OrderConfirmedEvent source = order("BUY", 1);
+        OrderAssetReservationSucceededEvent source = order("BUY", 1);
         source.setMarketSequence(null);
 
         assertThatThrownBy(() -> processor.process(source))
@@ -135,15 +135,16 @@ class OrderConfirmedProcessorTest {
     }
 
     @Test
-    void processConcurrentRedelivery_whenOriginalClaimIsFresh_shouldWaitForCompletionWithoutTakeover() {
+    void processConcurrentRedelivery_whenOriginalClaimIsFresh_shouldDeferToInboxRetryWithoutTakeover() {
         long now = System.currentTimeMillis();
         when(matchingEngineService.tryMatchGuarded(any(), any()))
                 .thenReturn(MatchingEngineService.GuardedMatchResult.IN_PROGRESS);
-        when(processingStore.state(any(OrderConfirmedEvent.class))).thenReturn(
-                IncomingOrderProcessingStore.State.processing("original", now),
-                IncomingOrderProcessingStore.State.completed());
+        when(processingStore.state(any(OrderAssetReservationSucceededEvent.class)))
+                .thenReturn(IncomingOrderProcessingStore.State.processing("original", now));
 
-        processor.process(order("BUY", 1));
+        assertThatThrownBy(() -> processor.process(order("BUY", 1)))
+                .isInstanceOf(MatchOrderAdmissionPrerequisiteNotReadyException.class)
+                .hasMessageContaining("not stale");
 
         verify(matchingEngineService).tryMatchGuarded(any(), any());
         verify(processingStore, never()).replaceWithClaim(any());
@@ -157,8 +158,8 @@ class OrderConfirmedProcessorTest {
         when(matchingEngineService.tryMatchGuarded(any(), any())).thenReturn(
                 MatchingEngineService.GuardedMatchResult.PROCESSED,
                 MatchingEngineService.GuardedMatchResult.IN_PROGRESS);
-        doThrow(markerFailure).doNothing().when(processingStore).markCompleted(any(OrderConfirmedEvent.class));
-        when(processingStore.state(any(OrderConfirmedEvent.class)))
+        doThrow(markerFailure).doNothing().when(processingStore).markCompleted(any(OrderAssetReservationSucceededEvent.class));
+        when(processingStore.state(any(OrderAssetReservationSucceededEvent.class)))
                 .thenReturn(IncomingOrderProcessingStore.State.processing("interrupted", 0L));
         when(processingStore.isVisible(ORDER_ID)).thenReturn(true);
 
@@ -169,7 +170,7 @@ class OrderConfirmedProcessorTest {
 
         verify(matchingEngineService, times(2)).tryMatchGuarded(any(), any());
         verify(processingStore).replaceWithClaim(any());
-        verify(processingStore, times(2)).markCompleted(any(OrderConfirmedEvent.class));
+        verify(processingStore, times(2)).markCompleted(any(OrderAssetReservationSucceededEvent.class));
         verifyNoInteractions(tradeExecutionRepository);
         verify(lock).unlock();
     }
@@ -178,13 +179,13 @@ class OrderConfirmedProcessorTest {
     void processInterruptedOrder_whenRemainderIsVisible_shouldConvergeWithoutMatchingAgain() {
         when(matchingEngineService.tryMatchGuarded(any(), any()))
                 .thenReturn(MatchingEngineService.GuardedMatchResult.IN_PROGRESS);
-        when(processingStore.state(any(OrderConfirmedEvent.class)))
+        when(processingStore.state(any(OrderAssetReservationSucceededEvent.class)))
                 .thenReturn(IncomingOrderProcessingStore.State.processing("existing", 0L));
         when(processingStore.isVisible(ORDER_ID)).thenReturn(true);
 
         processor.process(order("BUY", 5));
 
-        verify(processingStore).markCompleted(any(OrderConfirmedEvent.class));
+        verify(processingStore).markCompleted(any(OrderAssetReservationSucceededEvent.class));
         verify(matchingEngineService).tryMatchGuarded(any(), any());
         verifyNoInteractions(tradeExecutionRepository);
         verify(lock).unlock();
@@ -196,16 +197,16 @@ class OrderConfirmedProcessorTest {
                 .thenReturn(
                         MatchingEngineService.GuardedMatchResult.IN_PROGRESS,
                         MatchingEngineService.GuardedMatchResult.PROCESSED);
-        when(processingStore.state(any(OrderConfirmedEvent.class)))
+        when(processingStore.state(any(OrderAssetReservationSucceededEvent.class)))
                 .thenReturn(IncomingOrderProcessingStore.State.processing("existing", 0L));
         when(tradeExecutionRepository.sumQuantityByBuyerOrderId(ORDER_ID)).thenReturn(3L);
 
         processor.process(order("BUY", 5));
 
-        ArgumentCaptor<OrderConfirmedEvent> captor = ArgumentCaptor.forClass(OrderConfirmedEvent.class);
+        ArgumentCaptor<OrderAssetReservationSucceededEvent> captor = ArgumentCaptor.forClass(OrderAssetReservationSucceededEvent.class);
         verify(matchingEngineService, times(2)).tryMatchGuarded(captor.capture(), any());
         assertThat(captor.getAllValues().get(1).getAmount()).isEqualTo(2);
-        verify(processingStore).markCompleted(any(OrderConfirmedEvent.class));
+        verify(processingStore).markCompleted(any(OrderAssetReservationSucceededEvent.class));
         verify(lock).unlock();
     }
 
@@ -215,14 +216,14 @@ class OrderConfirmedProcessorTest {
                 .thenReturn(
                         MatchingEngineService.GuardedMatchResult.IN_PROGRESS,
                         MatchingEngineService.GuardedMatchResult.CANCELLATION_PENDING);
-        when(processingStore.state(any(OrderConfirmedEvent.class)))
+        when(processingStore.state(any(OrderAssetReservationSucceededEvent.class)))
                 .thenReturn(IncomingOrderProcessingStore.State.processing("existing", 0L));
         when(tradeExecutionRepository.sumQuantityByBuyerOrderId(ORDER_ID)).thenReturn(3L);
 
-        OrderConfirmedEvent source = order("BUY", 5);
+        OrderAssetReservationSucceededEvent source = order("BUY", 5);
         processor.process(source);
 
-        ArgumentCaptor<OrderConfirmedEvent> cancelled = ArgumentCaptor.forClass(OrderConfirmedEvent.class);
+        ArgumentCaptor<OrderAssetReservationSucceededEvent> cancelled = ArgumentCaptor.forClass(OrderAssetReservationSucceededEvent.class);
         verify(cancellationCoordinator).resolveAdmissionBlockedByCancellationIntent(cancelled.capture());
         assertThat(cancelled.getValue().getAmount()).isEqualTo(2);
         verify(processingStore).markCompleted(source);
@@ -235,14 +236,14 @@ class OrderConfirmedProcessorTest {
                 .thenReturn(
                         MatchingEngineService.GuardedMatchResult.IN_PROGRESS,
                         MatchingEngineService.GuardedMatchResult.PROCESSED_AND_COMPLETED);
-        when(processingStore.state(any(OrderConfirmedEvent.class)))
+        when(processingStore.state(any(OrderAssetReservationSucceededEvent.class)))
                 .thenReturn(IncomingOrderProcessingStore.State.processing("existing", 0L));
         when(tradeExecutionRepository.sumQuantityByBuyerOrderId(ORDER_ID)).thenReturn(3L);
 
         processor.process(order("BUY", 5));
 
         verify(matchingEngineService, times(2)).tryMatchGuarded(any(), any());
-        verify(processingStore, never()).markCompleted(any(OrderConfirmedEvent.class));
+        verify(processingStore, never()).markCompleted(any(OrderAssetReservationSucceededEvent.class));
         verify(lock).unlock();
     }
 
@@ -250,14 +251,14 @@ class OrderConfirmedProcessorTest {
     void processInterruptedOrder_whenDurableTradesCoverAmount_shouldNotMatchAgain() {
         when(matchingEngineService.tryMatchGuarded(any(), any()))
                 .thenReturn(MatchingEngineService.GuardedMatchResult.IN_PROGRESS);
-        when(processingStore.state(any(OrderConfirmedEvent.class)))
+        when(processingStore.state(any(OrderAssetReservationSucceededEvent.class)))
                 .thenReturn(IncomingOrderProcessingStore.State.processing("existing", 0L));
         when(tradeExecutionRepository.sumQuantityBySellerOrderId(ORDER_ID)).thenReturn(5L);
 
         processor.process(order("SELL", 5));
 
         verify(matchingEngineService).tryMatchGuarded(any(), any());
-        verify(processingStore).markCompleted(any(OrderConfirmedEvent.class));
+        verify(processingStore).markCompleted(any(OrderAssetReservationSucceededEvent.class));
         verify(lock).unlock();
     }
 
@@ -265,22 +266,22 @@ class OrderConfirmedProcessorTest {
     void processInterruptedOrder_whenOrderIsStillReserved_shouldWaitForReservationConvergence() {
         when(matchingEngineService.tryMatchGuarded(any(), any()))
                 .thenReturn(MatchingEngineService.GuardedMatchResult.IN_PROGRESS);
-        when(processingStore.state(any(OrderConfirmedEvent.class)))
+        when(processingStore.state(any(OrderAssetReservationSucceededEvent.class)))
                 .thenReturn(IncomingOrderProcessingStore.State.processing("existing", 0L));
         when(tradeExecutionRepository.sumQuantityByBuyerOrderId(ORDER_ID)).thenReturn(2L);
         when(processingStore.isReserved(ORDER_ID)).thenReturn(true);
 
         assertThatThrownBy(() -> processor.process(order("BUY", 5)))
-                .isInstanceOf(IllegalStateException.class)
+                .isInstanceOf(MatchOrderAdmissionPrerequisiteNotReadyException.class)
                 .hasMessageContaining("reservation convergence");
 
         verify(matchingEngineService).tryMatchGuarded(any(), any());
-        verify(processingStore, never()).markCompleted(any(OrderConfirmedEvent.class));
+        verify(processingStore, never()).markCompleted(any(OrderAssetReservationSucceededEvent.class));
         verify(lock).unlock();
     }
 
-    private OrderConfirmedEvent order(String side, int amount) {
-        return OrderConfirmedEvent.builder()
+    private OrderAssetReservationSucceededEvent order(String side, int amount) {
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(ORDER_ID)
                 .userId(UUID.fromString("00000000-0000-0000-0000-000000000102"))
                 .marketId("TEST-MARKET")

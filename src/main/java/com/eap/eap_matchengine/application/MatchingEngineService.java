@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.fasterxml.jackson.core.JsonProcessingException;
 
@@ -50,18 +50,18 @@ public class MatchingEngineService {
    *
    * @param incomingOrder The new order to be matched
    */
-  public void tryMatch(OrderConfirmedEvent incomingOrder) {
+  public void tryMatch(OrderAssetReservationSucceededEvent incomingOrder) {
     tryMatch(incomingOrder, null);
   }
 
   GuardedMatchResult tryMatchGuarded(
-      OrderConfirmedEvent incomingOrder,
+      OrderAssetReservationSucceededEvent incomingOrder,
       IncomingOrderProcessingStore.Claim processingClaim) {
     return tryMatch(incomingOrder, processingClaim);
   }
 
   private GuardedMatchResult tryMatch(
-      OrderConfirmedEvent incomingOrder,
+      OrderAssetReservationSucceededEvent incomingOrder,
       IncomingOrderProcessingStore.Claim processingClaim) {
     Instant tryMatchStartedAt = Instant.now();
     boolean addedToBook = false;
@@ -100,7 +100,7 @@ public class MatchingEngineService {
         }
 
         RedisOrderBookService.ReservedMatch reservedMatch = matchAttempt.reservedMatch();
-        OrderConfirmedEvent matchOrder = reservedMatch.order();
+        OrderAssetReservationSucceededEvent matchOrder = reservedMatch.order();
         int incomingAmountBeforeMatch = incomingOrder.getAmount();
         int matchOrderAmountBeforeMatch = matchOrder.getAmount();
 
@@ -204,7 +204,7 @@ public class MatchingEngineService {
   }
 
   private RedisOrderBookService.MatchOrAddResult reserveBestMatchOrAddOrder(
-      OrderConfirmedEvent incomingOrder,
+      OrderAssetReservationSucceededEvent incomingOrder,
       IncomingOrderProcessingStore.Claim processingClaim) {
     Instant startedAt = Instant.now();
     try {
@@ -235,7 +235,7 @@ public class MatchingEngineService {
     }
   }
 
-  private void completeReservedOrder(OrderConfirmedEvent matchOrder, String tradeId) {
+  private void completeReservedOrder(OrderAssetReservationSucceededEvent matchOrder, String tradeId) {
     Instant startedAt = Instant.now();
     try {
       orderBookService.completeReservedOrder(matchOrder, tradeId);
@@ -245,7 +245,7 @@ public class MatchingEngineService {
     }
   }
 
-  private void releaseReservedOrder(OrderConfirmedEvent matchOrder, String tradeId)
+  private void releaseReservedOrder(OrderAssetReservationSucceededEvent matchOrder, String tradeId)
       throws JsonProcessingException {
     Instant startedAt = Instant.now();
     try {
@@ -257,7 +257,7 @@ public class MatchingEngineService {
   }
 
   private void releaseReservedRestingOrder(
-      OrderConfirmedEvent matchOrder,
+      OrderAssetReservationSucceededEvent matchOrder,
       int originalAmount,
       String tradeId,
       RuntimeException cause) {
@@ -273,14 +273,14 @@ public class MatchingEngineService {
     }
   }
 
-  private String tradeId(OrderConfirmedEvent incomingOrder, Long matchId) {
+  private String tradeId(OrderAssetReservationSucceededEvent incomingOrder, Long matchId) {
     return (incomingOrder.getMarketId() == null ? "UNKNOWN" : incomingOrder.getMarketId())
         + "-" + matchId;
   }
 
   private TradeExecutedEvent toTradeExecutedEvent(
-      OrderConfirmedEvent incomingOrder,
-      OrderConfirmedEvent matchOrder,
+      OrderAssetReservationSucceededEvent incomingOrder,
+      OrderAssetReservationSucceededEvent matchOrder,
       boolean incomingIsBuy,
       Long matchId,
       int matchedAmount) {

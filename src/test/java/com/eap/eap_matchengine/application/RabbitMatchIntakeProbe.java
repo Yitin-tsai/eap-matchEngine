@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.eap_matchengine.EapMatchengineApplication;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -38,8 +38,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONFIRMED_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.ORDER_CONFIRMED_KEY;
+import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_ASSET_RESERVATION_SUCCEEDED_KEY;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_EXCHANGE;
 
 /**
@@ -53,7 +53,7 @@ public final class RabbitMatchIntakeProbe {
     public static void main(String[] args) throws Exception {
         ProbeConfig config = ProbeConfig.from(args);
         String marketId = "RABBIT-MATCH-" + UUID.randomUUID();
-        List<OrderConfirmedEvent> orders = orders(config, marketId);
+        List<OrderAssetReservationSucceededEvent> orders = orders(config, marketId);
 
         ConfigurableApplicationContext context = SpringApplication.run(
                 EapMatchengineApplication.class,
@@ -72,7 +72,7 @@ public final class RabbitMatchIntakeProbe {
 
         try (QueueMonitor monitor = new QueueMonitor(config, objectMapper)) {
             requireCleanInputState(jdbc, redis, marketId);
-            rabbitAdmin.purgeQueue(MATCH_ENGINE_ORDER_CONFIRMED_QUEUE, false);
+            rabbitAdmin.purgeQueue(MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE, false);
             rabbitAdmin.purgeQueue(DEAD_LETTER_QUEUE, false);
             waitForConsumers(monitor, config.timeoutSeconds());
             monitor.start();
@@ -81,7 +81,7 @@ public final class RabbitMatchIntakeProbe {
             ConvergenceResult convergence = awaitConvergence(
                     config, jdbc, redis, marketId, orders, publish.startedAtNanos());
             waitForQueueDrain(monitor, config.timeoutSeconds());
-            QueueStats finalQueue = monitor.read(MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+            QueueStats finalQueue = monitor.read(MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
             QueueStats finalDlq = monitor.read(DEAD_LETTER_QUEUE);
 
             Map<String, Object> result = resultMap(
@@ -99,7 +99,7 @@ public final class RabbitMatchIntakeProbe {
     private static PublishResult publish(
             ProbeConfig config,
             RabbitTemplate rabbit,
-            List<OrderConfirmedEvent> orders) throws Exception {
+            List<OrderAssetReservationSucceededEvent> orders) throws Exception {
         List<CorrelationData> confirmations = new ArrayList<>(orders.size());
         long intervalNanos = Math.max(1L, 1_000_000_000L / config.targetOrderTps());
         long startedAt = System.nanoTime();
@@ -112,7 +112,7 @@ public final class RabbitMatchIntakeProbe {
             }
             CorrelationData correlation = new CorrelationData(orders.get(index).getOrderId().toString());
             confirmations.add(correlation);
-            rabbit.convertAndSend(ORDER_EXCHANGE, ORDER_CONFIRMED_KEY, orders.get(index), correlation);
+            rabbit.convertAndSend(ORDER_EXCHANGE, ORDER_ASSET_RESERVATION_SUCCEEDED_KEY, orders.get(index), correlation);
         }
         double offerSeconds = elapsedSeconds(startedAt);
 
@@ -141,7 +141,7 @@ public final class RabbitMatchIntakeProbe {
             JdbcTemplate jdbc,
             StringRedisTemplate redis,
             String marketId,
-            List<OrderConfirmedEvent> orders,
+            List<OrderAssetReservationSucceededEvent> orders,
             long startedAt) throws InterruptedException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(config.timeoutSeconds());
         ProbeState state = state(jdbc, redis, marketId, config.totalOrders(), false, orders);
@@ -169,7 +169,7 @@ public final class RabbitMatchIntakeProbe {
             String marketId,
             int totalOrders,
             boolean includeReservationScan,
-            List<OrderConfirmedEvent> orders) {
+            List<OrderAssetReservationSucceededEvent> orders) {
         Map<String, Object> trade = jdbc.queryForMap("""
                 SELECT count(*) AS rows,
                        count(DISTINCT trade_id) AS distinct_ids,
@@ -184,6 +184,13 @@ public final class RabbitMatchIntakeProbe {
                 FROM match_engine.reservation_cleanup_tasks
                 WHERE trade_id LIKE ?
                 """, marketId + "-%");
+        Map<String, Object> inbox = jdbc.queryForMap("""
+                SELECT count(*) AS rows,
+                       count(*) FILTER (WHERE status = 'APPLIED') AS applied,
+                       count(*) FILTER (WHERE status != 'APPLIED') AS non_applied
+                FROM match_engine.order_admission_inbox
+                WHERE market_id = ?
+                """, marketId);
         long outboxRows = count(jdbc,
                 "SELECT count(*) FROM match_engine.trade_outbox WHERE aggregate_id LIKE ?",
                 marketId + "-%");
@@ -195,6 +202,9 @@ public final class RabbitMatchIntakeProbe {
                 number(cleanup, "rows"),
                 number(cleanup, "completed"),
                 number(cleanup, "non_completed"),
+                number(inbox, "rows"),
+                number(inbox, "applied"),
+                number(inbox, "non_applied"),
                 completedMarkerCount(redis, marketId, totalOrders),
                 zsetSize(redis, "orderbook:" + marketId + ":buy"),
                 zsetSize(redis, "orderbook:" + marketId + ":sell"),
@@ -250,13 +260,19 @@ public final class RabbitMatchIntakeProbe {
         result.put("cleanupTaskRows", state.cleanupRows());
         result.put("completedCleanupTasks", state.completedCleanup());
         result.put("nonCompletedCleanupTasks", state.nonCompletedCleanup());
+        result.put("admissionInboxRows", state.admissionInboxRows());
+        result.put("appliedAdmissionInboxRows", state.appliedAdmissionInboxRows());
+        result.put("nonAppliedAdmissionInboxRows", state.nonAppliedAdmissionInboxRows());
         result.put("completedIncomingMarkers", state.completedMarkers());
         result.put("remainingBuyOrders", state.remainingBuyOrders());
         result.put("remainingSellOrders", state.remainingSellOrders());
         result.put("remainingWorkloadReservations", state.remainingReservations());
-        result.put("listenerCount", timerCount(registry, "match_engine_order_confirmed_listener_duration"));
-        result.put("listenerMeanMs", round(timerMeanMillis(registry, "match_engine_order_confirmed_listener_duration")));
-        result.put("listenerMaxMs", round(timerMaxMillis(registry, "match_engine_order_confirmed_listener_duration")));
+        result.put("listenerCount", timerCount(
+                registry, "match_engine_asset_reservation_succeeded_listener_duration"));
+        result.put("listenerMeanMs", round(timerMeanMillis(
+                registry, "match_engine_asset_reservation_succeeded_listener_duration")));
+        result.put("listenerMaxMs", round(timerMaxMillis(
+                registry, "match_engine_asset_reservation_succeeded_listener_duration")));
         result.put("tradeTransactionMeanMs", round(timerMeanMillis(
                 registry, "match_engine_trade_record_phase_duration", "phase", "transaction_total")));
         result.put("tradeTransactionMaxMs", round(timerMaxMillis(
@@ -285,7 +301,7 @@ public final class RabbitMatchIntakeProbe {
     private static void waitForConsumers(QueueMonitor monitor, int timeoutSeconds) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
         while (System.nanoTime() < deadline) {
-            QueueStats stats = monitor.read(MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+            QueueStats stats = monitor.read(MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
             if (stats.consumers() > 0) {
                 return;
             }
@@ -297,7 +313,7 @@ public final class RabbitMatchIntakeProbe {
     private static void waitForQueueDrain(QueueMonitor monitor, int timeoutSeconds) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
         while (System.nanoTime() < deadline) {
-            QueueStats stats = monitor.read(MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+            QueueStats stats = monitor.read(MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
             if (stats.ready() == 0 && stats.unacked() == 0) {
                 return;
             }
@@ -316,14 +332,21 @@ public final class RabbitMatchIntakeProbe {
                 WHERE status IN ('PENDING', 'PROCESSING')
                 """);
         require(claimable == 0, "dedicated MatchEngine database contains claimable cleanup tasks");
+        long claimableAdmissions = count(jdbc, """
+                SELECT count(*)
+                FROM match_engine.order_admission_inbox
+                WHERE status != 'APPLIED'
+                """);
+        require(claimableAdmissions == 0,
+                "dedicated MatchEngine database contains non-applied admission inbox rows");
         require(!Boolean.TRUE.equals(redis.hasKey("orderbook:" + marketId + ":buy")),
                 "probe BUY orderbook already exists");
         require(!Boolean.TRUE.equals(redis.hasKey("orderbook:" + marketId + ":sell")),
                 "probe SELL orderbook already exists");
     }
 
-    private static List<OrderConfirmedEvent> orders(ProbeConfig config, String marketId) {
-        List<OrderConfirmedEvent> orders = new ArrayList<>(config.totalOrders());
+    private static List<OrderAssetReservationSucceededEvent> orders(ProbeConfig config, String marketId) {
+        List<OrderAssetReservationSucceededEvent> orders = new ArrayList<>(config.totalOrders());
         for (int index = 0; index < config.pairs(); index++) {
             long sellSequence = index * 2L + 1;
             orders.add(order(marketId, "SELL", sellSequence));
@@ -333,8 +356,8 @@ public final class RabbitMatchIntakeProbe {
         return orders;
     }
 
-    private static OrderConfirmedEvent order(String marketId, String side, long sequence) {
-        return OrderConfirmedEvent.builder()
+    private static OrderAssetReservationSucceededEvent order(String marketId, String side, long sequence) {
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(UUID.randomUUID())
                 .userId(UUID.randomUUID())
                 .marketId(marketId)
@@ -364,10 +387,10 @@ public final class RabbitMatchIntakeProbe {
 
     private static long workloadReservationCount(
             StringRedisTemplate redis,
-            List<OrderConfirmedEvent> orders) {
+            List<OrderAssetReservationSucceededEvent> orders) {
         return redis.execute((RedisCallback<Long>) connection -> {
             long count = 0;
-            for (OrderConfirmedEvent order : orders) {
+            for (OrderAssetReservationSucceededEvent order : orders) {
                 if (connection.keyCommands().exists(bytes("order:reservation:" + order.getOrderId()))) {
                     count++;
                 }
@@ -392,6 +415,7 @@ public final class RabbitMatchIntakeProbe {
 
     private static void cleanupDatabaseQuietly(JdbcTemplate jdbc, String marketId) {
         try {
+            jdbc.update("DELETE FROM match_engine.order_admission_inbox WHERE market_id = ?", marketId);
             jdbc.update("DELETE FROM match_engine.reservation_cleanup_tasks WHERE trade_id LIKE ?", marketId + "-%");
             jdbc.update("DELETE FROM match_engine.trade_outbox WHERE aggregate_id LIKE ?", marketId + "-%");
             jdbc.update("DELETE FROM match_engine.trade_executions WHERE market_id = ?", marketId);
@@ -402,10 +426,10 @@ public final class RabbitMatchIntakeProbe {
 
     private static void cleanupRedis(
             StringRedisTemplate redis,
-            List<OrderConfirmedEvent> orders,
+            List<OrderAssetReservationSucceededEvent> orders,
             String marketId) {
         List<String> keys = new ArrayList<>(orders.size() * 3 + 3);
-        for (OrderConfirmedEvent order : orders) {
+        for (OrderAssetReservationSucceededEvent order : orders) {
             keys.add("order:" + order.getOrderId());
             keys.add("user:" + order.getUserId() + ":orders");
             keys.add("order:reservation:" + order.getOrderId());
@@ -492,6 +516,9 @@ public final class RabbitMatchIntakeProbe {
             long cleanupRows,
             long completedCleanup,
             long nonCompletedCleanup,
+            long admissionInboxRows,
+            long appliedAdmissionInboxRows,
+            long nonAppliedAdmissionInboxRows,
             long completedMarkers,
             long remainingBuyOrders,
             long remainingSellOrders,
@@ -514,6 +541,9 @@ public final class RabbitMatchIntakeProbe {
                     && matchedQuantity == pairs
                     && outboxRows == pairs
                     && cleanupRows == pairs
+                    && admissionInboxRows == totalOrders
+                    && appliedAdmissionInboxRows == totalOrders
+                    && nonAppliedAdmissionInboxRows == 0
                     && completedMarkers == totalOrders
                     && remainingBuyOrders == 0
                     && remainingSellOrders == 0;
@@ -559,7 +589,7 @@ public final class RabbitMatchIntakeProbe {
         private void sampleLoop() {
             while (running.get()) {
                 try {
-                    QueueStats stats = read(MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+                    QueueStats stats = read(MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
                     maxReady.accumulateAndGet(stats.ready(), Math::max);
                     maxUnacked.accumulateAndGet(stats.unacked(), Math::max);
                     samples.incrementAndGet();

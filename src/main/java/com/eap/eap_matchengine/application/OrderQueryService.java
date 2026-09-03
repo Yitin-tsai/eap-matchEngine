@@ -1,7 +1,7 @@
 package com.eap.eap_matchengine.application;
 
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -15,7 +15,7 @@ public class OrderQueryService {
     @Autowired
     RedisOrderBookService redisOrderBookService;
 
-    public List<OrderConfirmedEvent> excute(UUID userId) {
+    public List<OrderAssetReservationSucceededEvent> excute(UUID userId) {
         log.info("Querying orders for user: {}", userId);
         return redisOrderBookService.getOrderByUserId(userId);
 

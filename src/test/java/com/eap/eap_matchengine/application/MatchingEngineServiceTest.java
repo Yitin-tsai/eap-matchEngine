@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import java.time.LocalDateTime;
 import java.util.UUID;
@@ -33,13 +33,13 @@ class MatchingEngineServiceTest {
 
     @Test
     void tryMatch_whenRecorderDoesNotDeferCleanup_shouldCompleteReservedRestingOrder() throws Exception {
-        OrderConfirmedEvent incomingBuy = order(
+        OrderAssetReservationSucceededEvent incomingBuy = order(
                 "BUY",
                 "00000000-0000-0000-0000-000000000021",
                 "00000000-0000-0000-0000-000000000022",
                 301L,
                 1);
-        OrderConfirmedEvent restingSell = order(
+        OrderAssetReservationSucceededEvent restingSell = order(
                 "SELL",
                 "00000000-0000-0000-0000-000000000023",
                 "00000000-0000-0000-0000-000000000024",
@@ -69,13 +69,13 @@ class MatchingEngineServiceTest {
 
     @Test
     void tryMatch_whenRecorderDefersCleanup_shouldNotCompleteReservedRestingOrderSynchronously() throws Exception {
-        OrderConfirmedEvent incomingBuy = order(
+        OrderAssetReservationSucceededEvent incomingBuy = order(
                 "BUY",
                 "00000000-0000-0000-0000-000000000121",
                 "00000000-0000-0000-0000-000000000122",
                 301L,
                 1);
-        OrderConfirmedEvent restingSell = order(
+        OrderAssetReservationSucceededEvent restingSell = order(
                 "SELL",
                 "00000000-0000-0000-0000-000000000123",
                 "00000000-0000-0000-0000-000000000124",
@@ -102,13 +102,13 @@ class MatchingEngineServiceTest {
 
     @Test
     void tryMatch_whenTradePersistenceFailsAfterReservation_shouldReleaseRestingOrder() throws Exception {
-        OrderConfirmedEvent incomingBuy = order(
+        OrderAssetReservationSucceededEvent incomingBuy = order(
                 "BUY",
                 "00000000-0000-0000-0000-000000000001",
                 "00000000-0000-0000-0000-000000000002",
                 101L,
                 1);
-        OrderConfirmedEvent restingSell = order(
+        OrderAssetReservationSucceededEvent restingSell = order(
                 "SELL",
                 "00000000-0000-0000-0000-000000000003",
                 "00000000-0000-0000-0000-000000000004",
@@ -125,7 +125,7 @@ class MatchingEngineServiceTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("db unavailable");
 
-        verify(orderBookService).releaseReservedOrder(argThat((OrderConfirmedEvent order) ->
+        verify(orderBookService).releaseReservedOrder(argThat((OrderAssetReservationSucceededEvent order) ->
                 order.getOrderId().equals(restingSell.getOrderId())
                         && order.getAmount() == 1
                         && order.getOrderType().equals("SELL")), eq("TEST-MARKET-42"));
@@ -136,7 +136,7 @@ class MatchingEngineServiceTest {
 
     @Test
     void tryMatch_whenCombinedReservationFails_shouldNotRecordTrade() throws Exception {
-        OrderConfirmedEvent incomingBuy = order(
+        OrderAssetReservationSucceededEvent incomingBuy = order(
                 "BUY",
                 "00000000-0000-0000-0000-000000000011",
                 "00000000-0000-0000-0000-000000000012",
@@ -158,7 +158,7 @@ class MatchingEngineServiceTest {
 
     @Test
     void tryMatch_whenNoMatch_shouldKeepOrderInRedisWithoutSecondAddCall() throws Exception {
-        OrderConfirmedEvent incomingSell = order(
+        OrderAssetReservationSucceededEvent incomingSell = order(
                 "SELL",
                 "00000000-0000-0000-0000-000000000031",
                 "00000000-0000-0000-0000-000000000032",
@@ -180,7 +180,7 @@ class MatchingEngineServiceTest {
 
     @Test
     void tryMatchGuarded_whenNoMatchCompletesInLua_shouldReturnCompletedResult() {
-        OrderConfirmedEvent incomingSell = order(
+        OrderAssetReservationSucceededEvent incomingSell = order(
                 "SELL",
                 "00000000-0000-0000-0000-000000000033",
                 "00000000-0000-0000-0000-000000000034",
@@ -204,7 +204,7 @@ class MatchingEngineServiceTest {
 
     @Test
     void tryMatchGuarded_whenLuaDetectsDuplicate_shouldNotTouchOrderBookOrRecordTrade() throws Exception {
-        OrderConfirmedEvent incomingBuy = order(
+        OrderAssetReservationSucceededEvent incomingBuy = order(
                 "BUY",
                 "00000000-0000-0000-0000-000000000041",
                 "00000000-0000-0000-0000-000000000042",
@@ -228,13 +228,13 @@ class MatchingEngineServiceTest {
         assertThat(incomingBuy.getAmount()).isEqualTo(1);
     }
 
-    private OrderConfirmedEvent order(
+    private OrderAssetReservationSucceededEvent order(
             String side,
             String orderId,
             String userId,
             long marketSequence,
             int amount) {
-        return OrderConfirmedEvent.builder()
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(UUID.fromString(orderId))
                 .userId(UUID.fromString(userId))
                 .marketId("TEST-MARKET")

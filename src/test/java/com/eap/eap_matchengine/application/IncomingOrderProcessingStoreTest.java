@@ -1,6 +1,6 @@
 package com.eap.eap_matchengine.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -96,7 +96,7 @@ class IncomingOrderProcessingStoreTest {
 
     @Test
     void state_whenCompletedBitIsSet_shouldNotReadProcessingHash() {
-        OrderConfirmedEvent order = order(101L);
+        OrderAssetReservationSucceededEvent order = order(101L);
         when(valueOperations.getBit("match:incoming-order:completed:TEST-MARKET:0", 100L))
                 .thenReturn(true);
 
@@ -108,7 +108,7 @@ class IncomingOrderProcessingStoreTest {
 
     @Test
     void markCompleted_shouldSetBitmapAndDeleteProcessingLeaseAtomically() {
-        OrderConfirmedEvent order = order(101L);
+        OrderAssetReservationSucceededEvent order = order(101L);
 
         store.markCompleted(order);
 
@@ -121,8 +121,8 @@ class IncomingOrderProcessingStoreTest {
                 eq(ORDER_ID.toString()));
     }
 
-    private OrderConfirmedEvent order(long marketSequence) {
-        return OrderConfirmedEvent.builder()
+    private OrderAssetReservationSucceededEvent order(long marketSequence) {
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(ORDER_ID)
                 .userId(UUID.fromString("00000000-0000-0000-0000-000000000102"))
                 .marketId("TEST-MARKET")

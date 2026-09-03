@@ -10,7 +10,18 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
  * Basic Spring Boot application context test.
  * Uses mocked beans to avoid requiring external dependencies (Redis, RabbitMQ) during testing.
  */
-@SpringBootTest
+@SpringBootTest(properties = {
+		"spring.datasource.url=jdbc:h2:mem:match_context;MODE=PostgreSQL;DB_CLOSE_DELAY=-1",
+		"spring.datasource.driver-class-name=org.h2.Driver",
+		"spring.jpa.hibernate.ddl-auto=none",
+		"spring.liquibase.enabled=false",
+		"spring.rabbitmq.listener.simple.auto-startup=false",
+		"eap.match-engine.order-admission-inbox.enabled=false",
+		"eap.match-engine.trade-outbox-relay.enabled=false",
+		"eap.match-engine.trade-checkpoint-relay.enabled=false",
+		"eap.match-engine.reservation-reconciler.enabled=false",
+		"eap.match-engine.reservation-cleanup.enabled=false"
+})
 class EapMatchengineApplicationTests {
 
 	@MockitoBean
