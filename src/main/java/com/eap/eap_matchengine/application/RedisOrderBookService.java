@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Set;
 import java.util.List;
 import java.util.UUID;
@@ -49,6 +50,47 @@ public class RedisOrderBookService {
     private static final String INVALID_ORDER_DETAIL_PREFIX = "__INVALID_ORDER_DETAIL__:";
     private static final String RESERVATION_EXISTS_PREFIX = "__RESERVATION_EXISTS__:";
     private static final String RESERVATION_KEY_PATTERN = "order:reservation:*";
+    private static final String RESERVATION_SCAN_STATE_KEY =
+            "match:reservation-reconciler:scan-state";
+    private static final String RESERVATION_SCAN_BUFFER_KEY =
+            "match:reservation-reconciler:scan-buffer";
+    @SuppressWarnings("rawtypes")
+    private static final DefaultRedisScript<List> RESERVATION_SCAN_PAGE_SCRIPT =
+            new DefaultRedisScript<>("""
+                    local expected_generation = ARGV[3]
+                    local stored_generation = redis.call('HGET', KEYS[1], 'generation')
+                    if stored_generation ~= expected_generation then
+                        redis.call('HSET', KEYS[1],
+                            'generation', expected_generation,
+                            'cursor', '0')
+                        redis.call('DEL', KEYS[2])
+                    end
+
+                    local limit = math.max(1, tonumber(ARGV[2]))
+                    local keys = {}
+                    while #keys < limit do
+                        local buffered = redis.call('LPOP', KEYS[2])
+                        if not buffered then
+                            break
+                        end
+                        table.insert(keys, buffered)
+                    end
+
+                    local cursor = redis.call('HGET', KEYS[1], 'cursor') or '0'
+                    if #keys < limit then
+                        local page = redis.call('SCAN', cursor, 'MATCH', ARGV[1], 'COUNT', limit)
+                        cursor = page[1]
+                        redis.call('HSET', KEYS[1], 'cursor', cursor)
+                        for _, key in ipairs(page[2]) do
+                            if #keys < limit then
+                                table.insert(keys, key)
+                            else
+                                redis.call('RPUSH', KEYS[2], key)
+                            end
+                        end
+                    end
+                    return {cursor, keys}
+                    """, List.class);
     private static final DefaultRedisScript<Long> UNLINK_USER_ORDER_SCRIPT = new DefaultRedisScript<>("""
             local expected_run_id = string.match(ARGV[2], '|([^|]+)$')
             local actual_run_id = string.match(redis.call('INFO', 'server'), 'run_id:([^\\r\\n]+)')
@@ -429,17 +471,17 @@ public class RedisOrderBookService {
             String missingOrderId = orderJson.substring(MISSING_ORDER_DETAIL_PREFIX.length());
             log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
                     missingOrderId);
-            throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+            throw new OrderBookDataInvariantException("Redis orderbook detail missing for order " + missingOrderId);
         }
         if (orderJson.startsWith(INVALID_ORDER_DETAIL_PREFIX)) {
             String invalidOrderId = orderJson.substring(INVALID_ORDER_DETAIL_PREFIX.length());
             log.error("Redis orderbook is inconsistent: order {} has no owner", invalidOrderId);
-            throw new IllegalStateException("Redis orderbook owner missing for order " + invalidOrderId);
+            throw new OrderBookDataInvariantException("Redis orderbook owner missing for order " + invalidOrderId);
         }
         if (orderJson.startsWith(RESERVATION_EXISTS_PREFIX)) {
             String orderId = orderJson.substring(RESERVATION_EXISTS_PREFIX.length());
             log.error("Redis orderbook is inconsistent: order {} is visible but already reserved", orderId);
-            throw new IllegalStateException("Redis order already reserved for order " + orderId);
+            throw new OrderBookDataInvariantException("Redis order already reserved for order " + orderId);
         }
 
         try {
@@ -448,7 +490,7 @@ public class RedisOrderBookService {
             return reservedOrder;
         } catch (Exception e) {
             log.error("Failed to deserialize reserved order", e);
-            throw new IllegalStateException("Failed to deserialize reserved Redis order", e);
+            throw new OrderBookDataInvariantException("Failed to deserialize reserved Redis order", e);
         }
     }
 
@@ -508,20 +550,20 @@ public class RedisOrderBookService {
             String missingOrderId = orderJson.substring(MISSING_ORDER_DETAIL_PREFIX.length());
             log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
                     missingOrderId);
-            throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+            throw new OrderBookDataInvariantException("Redis orderbook detail missing for order " + missingOrderId);
         }
         if (orderJson.startsWith(INVALID_ORDER_DETAIL_PREFIX)) {
             String invalidOrderId = orderJson.substring(INVALID_ORDER_DETAIL_PREFIX.length());
             log.error("Redis orderbook is inconsistent: order {} has no owner", invalidOrderId);
-            throw new IllegalStateException("Redis orderbook owner missing for order " + invalidOrderId);
+            throw new OrderBookDataInvariantException("Redis orderbook owner missing for order " + invalidOrderId);
         }
         if (orderJson.startsWith(RESERVATION_EXISTS_PREFIX)) {
             String orderId = orderJson.substring(RESERVATION_EXISTS_PREFIX.length());
             log.error("Redis orderbook is inconsistent: order {} is visible but already reserved", orderId);
-            throw new IllegalStateException("Redis order already reserved for order " + orderId);
+            throw new OrderBookDataInvariantException("Redis order already reserved for order " + orderId);
         }
         if (rawResult.size() < 2) {
-            throw new IllegalStateException("Redis reserve script did not return a match sequence");
+            throw new OrderBookDataInvariantException("Redis reserve script did not return a match sequence");
         }
 
         try {
@@ -532,7 +574,7 @@ public class RedisOrderBookService {
             return new ReservedMatch(reservedOrder, matchId);
         } catch (Exception e) {
             log.error("Failed to deserialize reserved order or match sequence", e);
-            throw new IllegalStateException("Failed to deserialize reserved Redis order with sequence", e);
+            throw new OrderBookDataInvariantException("Failed to deserialize reserved Redis order with sequence", e);
         }
     }
 
@@ -664,23 +706,23 @@ public class RedisOrderBookService {
             String missingOrderId = status.substring(MISSING_ORDER_DETAIL_PREFIX.length());
             log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
                     missingOrderId);
-            throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+            throw new OrderBookDataInvariantException("Redis orderbook detail missing for order " + missingOrderId);
         }
         if (status.startsWith(INVALID_ORDER_DETAIL_PREFIX)) {
             String invalidOrderId = status.substring(INVALID_ORDER_DETAIL_PREFIX.length());
             log.error("Redis orderbook is inconsistent: order {} has no owner", invalidOrderId);
-            throw new IllegalStateException("Redis orderbook owner missing for order " + invalidOrderId);
+            throw new OrderBookDataInvariantException("Redis orderbook owner missing for order " + invalidOrderId);
         }
         if (status.startsWith(RESERVATION_EXISTS_PREFIX)) {
             String orderId = status.substring(RESERVATION_EXISTS_PREFIX.length());
             log.error("Redis orderbook is inconsistent: order {} is visible but already reserved", orderId);
-            throw new IllegalStateException("Redis order already reserved for order " + orderId);
+            throw new OrderBookDataInvariantException("Redis order already reserved for order " + orderId);
         }
         if (!"__MATCH__".equals(status)) {
-            throw new IllegalStateException("Redis reserve-or-add script returned unknown status " + status);
+            throw new OrderBookDataInvariantException("Redis reserve-or-add script returned unknown status " + status);
         }
         if (rawResult.size() < 3) {
-            throw new IllegalStateException("Redis reserve-or-add script did not return reserved order and sequence");
+            throw new OrderBookDataInvariantException("Redis reserve-or-add script did not return reserved order and sequence");
         }
         recordReserveResult(Duration.between(resultStartedAt, Instant.now()));
 
@@ -694,7 +736,7 @@ public class RedisOrderBookService {
             return MatchOrAddResult.matched(new ReservedMatch(reservedOrder, matchId));
         } catch (Exception e) {
             log.error("Failed to deserialize reserve-or-add result", e);
-            throw new IllegalStateException("Failed to deserialize reserve-or-add Redis result", e);
+            throw new OrderBookDataInvariantException("Failed to deserialize reserve-or-add Redis result", e);
         } finally {
             recordReserveDeserializeResting(Duration.between(deserializeStartedAt, Instant.now()));
         }
@@ -938,30 +980,25 @@ public class RedisOrderBookService {
         });
     }
 
+    /**
+     * Reads one bounded, rotating page of the reservation keyspace. Redis SCAN's cursor is kept
+     * between polls so keys behind terminal or fresh reservations still receive a turn without
+     * forcing an O(keyspace) scan on the single-threaded Redis server every few seconds.
+     */
     public List<ReservationSnapshot> scanReservations(int limit) {
         OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
-        List<String> keys = redisTemplate.execute((RedisCallback<List<String>>) connection -> {
-            List<String> scanned = new ArrayList<>();
-            ScanOptions options = ScanOptions.scanOptions()
-                    .match(RESERVATION_KEY_PATTERN)
-                    .count(Math.max(limit, 1))
-                    .build();
-            try (Cursor<byte[]> cursor = connection.scan(options)) {
-                while (cursor.hasNext() && scanned.size() < limit) {
-                    scanned.add(new String(cursor.next(), StandardCharsets.UTF_8));
-                }
-            } catch (RuntimeException e) {
-                throw new IllegalStateException("Failed to scan Redis reservations", e);
-            }
-            return scanned;
-        });
+        String generationIdentity = runtime == null ? null : runtime.expectedSentinel();
+        List<String> keys = scanReservationKeys(Math.max(1, limit), generationIdentity);
         if (keys == null || keys.isEmpty()) {
             return List.of();
         }
         List<ReservationSnapshot> snapshots = new ArrayList<>(keys.size());
         for (String key : keys) {
             String value = redisTemplate.opsForValue().get(key);
-            ReservationSnapshot snapshot = parseReservationSnapshot(key, value);
+            ReservationSnapshot snapshot = parseReservationSnapshot(
+                    key,
+                    value,
+                    generationIdentity);
             if (snapshot != null) {
                 snapshots.add(snapshot);
             }
@@ -972,12 +1009,63 @@ public class RedisOrderBookService {
         return snapshots;
     }
 
-    private ReservationSnapshot parseReservationSnapshot(String key, String value) {
+    public ReservationSnapshot readReservation(String key) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
+        String value = redisTemplate.opsForValue().get(key);
+        ReservationSnapshot snapshot = parseReservationSnapshot(
+                key,
+                value,
+                runtime == null ? null : runtime.expectedSentinel());
+        if (runtime != null) {
+            runtimeGuard.verifyUnchanged(runtime);
+        }
+        return snapshot;
+    }
+
+    private List<String> scanReservationKeys(int count, String generationIdentity) {
+        Object raw;
+        try {
+            raw = redisTemplate.execute(
+                    RESERVATION_SCAN_PAGE_SCRIPT,
+                    List.of(RESERVATION_SCAN_STATE_KEY, RESERVATION_SCAN_BUFFER_KEY),
+                    RESERVATION_KEY_PATTERN,
+                    Integer.toString(count),
+                    generationIdentity == null ? "" : generationIdentity);
+        } catch (RuntimeException e) {
+            throw new IllegalStateException("Failed to scan Redis reservations", e);
+        }
+        if (!(raw instanceof List<?> result) || result.size() != 2) {
+            throw new IllegalStateException("Redis SCAN returned an invalid reservation page");
+        }
+        redisString(result.get(0));
+        if (!(result.get(1) instanceof Collection<?> rawKeys)) {
+            throw new IllegalStateException("Redis SCAN returned an invalid reservation key list");
+        }
+        return rawKeys.stream()
+                .map(this::redisString)
+                .toList();
+    }
+
+    private String redisString(Object value) {
+        if (value instanceof byte[] bytes) {
+            return new String(bytes, StandardCharsets.UTF_8);
+        }
+        if (value instanceof String text) {
+            return text;
+        }
+        throw new IllegalStateException("Redis returned an unsupported SCAN value type");
+    }
+
+    private ReservationSnapshot parseReservationSnapshot(
+            String key,
+            String value,
+            String generationIdentity) {
         if (value == null) {
             return null;
         }
         if (value.isBlank()) {
-            return ReservationSnapshot.invalid(key, "missing reservation value");
+            return ReservationSnapshot.invalid(
+                    key, "missing reservation value", value, generationIdentity);
         }
         try {
             JsonNode root = objectMapper.readTree(value);
@@ -985,25 +1073,28 @@ public class RedisOrderBookService {
                 OrderAssetReservationSucceededEvent order = deserializeRedisOrder(root.get("order"));
                 long reservedAtEpochMillis = root.path("reservedAtEpochMillis").asLong(0L);
                 String tradeId = root.path("tradeId").asText(null);
-                return ReservationSnapshot.valid(key, order, reservedAtEpochMillis, tradeId);
+                return ReservationSnapshot.valid(
+                        key, order, reservedAtEpochMillis, tradeId, value, generationIdentity);
             }
             if (root.has("orderId")) {
                 String orderId = root.path("orderId").asText();
                 String orderJson = redisTemplate.opsForValue().get("order:" + orderId);
                 if (orderJson == null || orderJson.isBlank()) {
-                    return ReservationSnapshot.invalid(key, "missing reserved order detail " + orderId);
+                    return ReservationSnapshot.invalid(
+                            key, "missing reserved order detail " + orderId, value, generationIdentity);
                 }
                 OrderAssetReservationSucceededEvent order = deserializeRedisOrder(orderJson);
                 long reservedAtEpochMillis = root.path("reservedAtEpochMillis").asLong(0L);
                 String tradeId = root.path("tradeId").asText(null);
-                return ReservationSnapshot.valid(key, order, reservedAtEpochMillis, tradeId);
+                return ReservationSnapshot.valid(
+                        key, order, reservedAtEpochMillis, tradeId, value, generationIdentity);
             }
 
             // Backward compatibility for pre-TPS-59 reservation values that stored only order JSON.
             OrderAssetReservationSucceededEvent order = deserializeRedisOrder(root);
-            return ReservationSnapshot.valid(key, order, 0L);
+            return ReservationSnapshot.valid(key, order, 0L, null, value, generationIdentity);
         } catch (Exception e) {
-            return ReservationSnapshot.invalid(key, e.getMessage());
+            return ReservationSnapshot.invalid(key, e.getMessage(), value, generationIdentity);
         }
     }
 
@@ -1019,7 +1110,8 @@ public class RedisOrderBookService {
         try {
             return deserializeRedisOrder(orderJson);
         } catch (JsonProcessingException e) {
-            throw new IllegalStateException("Cannot deserialize open order for cancellation: orderId=" + orderId, e);
+            throw new OrderBookDataInvariantException(
+                    "Cannot deserialize open order for cancellation: orderId=" + orderId, e);
         }
     }
 
@@ -1114,11 +1206,12 @@ public class RedisOrderBookService {
                         ? CancellationArbitration.cancelled(cancelledOrder)
                         : CancellationArbitration.duplicate(cancelledOrder);
             } catch (JsonProcessingException e) {
-                throw new IllegalStateException("Cannot deserialize atomically cancelled order: orderId="
+                throw new OrderBookDataInvariantException("Cannot deserialize atomically cancelled order: orderId="
                         + order.getOrderId(), e);
             }
         }
-        throw new IllegalStateException("Redis cancellation script returned unknown result: " + status);
+        throw new OrderBookDataInvariantException(
+                "Redis cancellation script returned unknown result: " + status);
     }
 
     private String cancellationIntentKey(UUID orderId) {
@@ -1325,7 +1418,9 @@ public class RedisOrderBookService {
             long reservedAtEpochMillis,
             String tradeId,
             boolean valid,
-            String invalidReason) {
+            String invalidReason,
+            String rawPayload,
+            String generationIdentity) {
 
         static ReservationSnapshot valid(String key, OrderAssetReservationSucceededEvent order, long reservedAtEpochMillis) {
             return valid(key, order, reservedAtEpochMillis, null);
@@ -1336,11 +1431,46 @@ public class RedisOrderBookService {
                 OrderAssetReservationSucceededEvent order,
                 long reservedAtEpochMillis,
                 String tradeId) {
-            return new ReservationSnapshot(key, order, reservedAtEpochMillis, tradeId, true, null);
+            return valid(key, order, reservedAtEpochMillis, tradeId, null);
+        }
+
+        static ReservationSnapshot valid(
+                String key,
+                OrderAssetReservationSucceededEvent order,
+                long reservedAtEpochMillis,
+                String tradeId,
+                String rawPayload) {
+            return valid(key, order, reservedAtEpochMillis, tradeId, rawPayload, null);
+        }
+
+        static ReservationSnapshot valid(
+                String key,
+                OrderAssetReservationSucceededEvent order,
+                long reservedAtEpochMillis,
+                String tradeId,
+                String rawPayload,
+                String generationIdentity) {
+            return new ReservationSnapshot(
+                    key, order, reservedAtEpochMillis, tradeId, true, null,
+                    rawPayload, generationIdentity);
         }
 
         static ReservationSnapshot invalid(String key, String invalidReason) {
-            return new ReservationSnapshot(key, null, 0L, null, false, invalidReason);
+            return invalid(key, invalidReason, null);
+        }
+
+        static ReservationSnapshot invalid(String key, String invalidReason, String rawPayload) {
+            return invalid(key, invalidReason, rawPayload, null);
+        }
+
+        static ReservationSnapshot invalid(
+                String key,
+                String invalidReason,
+                String rawPayload,
+                String generationIdentity) {
+            return new ReservationSnapshot(
+                    key, null, 0L, null, false, invalidReason, rawPayload, generationIdentity);
         }
     }
+
 }

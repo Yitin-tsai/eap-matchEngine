@@ -18,7 +18,9 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static com.eap.eap_matchengine.configuration.config.MatchEngineSchedulerConfig.RESERVATION_MAINTENANCE_SCHEDULER;
 
@@ -33,43 +35,53 @@ public class ReservationReconciler {
     private final RedisOrderBookService orderBookService;
     private final TradeExecutionRepository tradeExecutionRepository;
     private final ReservationCleanupTaskStore cleanupTaskStore;
+    private final ReservationReconciliationIssueStore issueStore;
     private final ReservationReconcilerMetrics metrics;
     private final OrderBookRuntimeGuard runtimeGuard;
     private final Duration orphanThreshold;
     private final int batchSize;
+    private final int maxAttempts;
 
     @Autowired
     public ReservationReconciler(
             RedisOrderBookService orderBookService,
             TradeExecutionRepository tradeExecutionRepository,
             ReservationCleanupTaskStore cleanupTaskStore,
+            ReservationReconciliationIssueStore issueStore,
             ReservationReconcilerMetrics metrics,
             OrderBookRuntimeGuard runtimeGuard,
             @Value("${eap.match-engine.reservation-reconciler.orphan-threshold-seconds:30}") long orphanThresholdSeconds,
-            @Value("${eap.match-engine.reservation-reconciler.batch-size:100}") int batchSize) {
+            @Value("${eap.match-engine.reservation-reconciler.batch-size:100}") int batchSize,
+            @Value("${eap.match-engine.reservation-reconciler.max-attempts:10}") int maxAttempts) {
         this.orderBookService = orderBookService;
         this.tradeExecutionRepository = tradeExecutionRepository;
         this.cleanupTaskStore = cleanupTaskStore;
+        this.issueStore = issueStore;
         this.metrics = metrics;
         this.runtimeGuard = runtimeGuard;
         this.orphanThreshold = Duration.ofSeconds(orphanThresholdSeconds);
         this.batchSize = batchSize;
+        this.maxAttempts = Math.max(1, maxAttempts);
     }
 
     ReservationReconciler(
             RedisOrderBookService orderBookService,
             TradeExecutionRepository tradeExecutionRepository,
             ReservationCleanupTaskStore cleanupTaskStore,
+            ReservationReconciliationIssueStore issueStore,
             ReservationReconcilerMetrics metrics,
             long orphanThresholdSeconds,
-            int batchSize) {
+            int batchSize,
+            int maxAttempts) {
         this.orderBookService = orderBookService;
         this.tradeExecutionRepository = tradeExecutionRepository;
         this.cleanupTaskStore = cleanupTaskStore;
+        this.issueStore = issueStore;
         this.metrics = metrics;
         this.runtimeGuard = null;
         this.orphanThreshold = Duration.ofSeconds(orphanThresholdSeconds);
         this.batchSize = batchSize;
+        this.maxAttempts = Math.max(1, maxAttempts);
     }
 
     @Scheduled(
@@ -85,12 +97,29 @@ public class ReservationReconciler {
         }
         List<RedisOrderBookService.ReservationSnapshot> reservations =
                 orderBookService.scanReservations(batchSize);
+        Set<String> currentIssueIds = reservations.stream()
+                .map(issueStore::fingerprint)
+                .collect(Collectors.toSet());
+        Set<String> terminalIssueIds = issueStore.findTerminalIssueIds(currentIssueIds);
+        reconcileAbsentRetryableIssues();
         List<RedisOrderBookService.ReservationSnapshot> readyReservations = new ArrayList<>();
         Set<String> readyTradeIds = new HashSet<>();
+        int consumedBudget = 0;
         for (RedisOrderBookService.ReservationSnapshot reservation : reservations) {
             metrics.scanned();
+            if (terminalIssueIds.contains(issueStore.fingerprint(reservation))) {
+                continue;
+            }
             if (!reservation.valid()) {
+                if (consumedBudget >= batchSize) {
+                    continue;
+                }
+                consumedBudget++;
                 metrics.invalid();
+                issueStore.recordTerminal(
+                        reservation,
+                        "INVALID_RESERVATION_PAYLOAD",
+                        reservation.invalidReason());
                 log.error("Invalid MatchEngine reservation: key={}, reason={}",
                         reservation.key(), reservation.invalidReason());
                 continue;
@@ -114,9 +143,26 @@ public class ReservationReconciler {
                 metrics.deferredToCleanup();
                 continue;
             }
+            if (consumedBudget >= batchSize) {
+                break;
+            }
+            consumedBudget++;
             actions += reconcileReservation(reservation);
         }
         return actions;
+    }
+
+    private void reconcileAbsentRetryableIssues() {
+        Set<String> absentIssueIds = new HashSet<>();
+        for (ReservationReconciliationIssueStore.RetryableIssue issue
+                : issueStore.claimRetryableAbsenceChecks(batchSize)) {
+            RedisOrderBookService.ReservationSnapshot current =
+                    orderBookService.readReservation(issue.reservationKey());
+            if (current == null || !issue.issueId().equals(issueStore.fingerprint(current))) {
+                absentIssueIds.add(issue.issueId());
+            }
+        }
+        issueStore.resolveAbsentRetryableIssues(absentIssueIds);
     }
 
     private int reconcileReservation(RedisOrderBookService.ReservationSnapshot reservation) {
@@ -125,10 +171,22 @@ public class ReservationReconciler {
                 ? findLegacyDurableTrade(reservedOrder, reservedAtLowerBound(reservation))
                 : tradeExecutionRepository.findByTradeId(reservation.tradeId());
         if (durableTrade.isPresent()) {
+            if (!validDurableTradeIdentity(reservedOrder, durableTrade.get())) {
+                String error = "Reservation references a durable trade with conflicting identity: key="
+                        + reservation.key() + ", reservationTradeId=" + reservation.tradeId()
+                        + ", orderId=" + reservedOrder.getOrderId()
+                        + ", durableTradeId=" + durableTrade.get().getTradeId();
+                issueStore.recordTerminal(
+                        reservation, "DURABLE_TRADE_IDENTITY_CONFLICT", error);
+                metrics.failure();
+                log.error(error);
+                return 0;
+            }
             return convergeDurableTradeReservation(reservation, durableTrade.get());
         }
         try {
             orderBookService.releaseReservedOrder(reservedOrder, reservation.tradeId());
+            issueStore.markResolved(issueStore.fingerprint(reservation));
             metrics.released();
             log.warn("Released orphan MatchEngine reservation without durable trade: orderId={}, key={}, amount={}",
                     reservedOrder.getOrderId(), reservation.key(), reservedOrder.getAmount());
@@ -136,9 +194,7 @@ public class ReservationReconciler {
         } catch (OrderBookRuntimeUnavailableException unavailable) {
             throw unavailable;
         } catch (Exception e) {
-            metrics.failure();
-            log.error("Failed to release orphan MatchEngine reservation: orderId={}, key={}",
-                    reservedOrder.getOrderId(), reservation.key(), e);
+            recordTransientFailure(reservation, "TRANSIENT_ORPHAN_RELEASE", e);
             return 0;
         }
     }
@@ -150,8 +206,9 @@ public class ReservationReconciler {
         int remainingAmount = reservedOrder.getAmount() - trade.getQuantity();
         try {
             if (remainingAmount > 0) {
-                reservedOrder.setAmount(remainingAmount);
-                orderBookService.releaseReservedOrder(reservedOrder, reservation.tradeId());
+                OrderAssetReservationSucceededEvent remainder =
+                        copyWithAmount(reservedOrder, remainingAmount);
+                orderBookService.releaseReservedOrder(remainder, reservation.tradeId());
                 metrics.released();
                 log.warn("Released remaining partial MatchEngine reservation after durable trade: tradeId={}, orderId={}, remainingAmount={}",
                         trade.getTradeId(), reservedOrder.getOrderId(), remainingAmount);
@@ -159,23 +216,85 @@ public class ReservationReconciler {
                 ReservationCompletionOutcome outcome =
                         orderBookService.completeReservedOrder(reservedOrder, reservation.tradeId());
                 if (!outcome.successful()) {
-                    throw new IllegalStateException("Reservation completion ownership conflict: orderId="
+                    String error = "Reservation completion ownership conflict: orderId="
                             + reservedOrder.getOrderId() + ", tradeId=" + reservation.tradeId()
-                            + ", outcome=" + outcome);
+                            + ", outcome=" + outcome;
+                    issueStore.recordTerminal(
+                            reservation, "RESERVATION_OWNERSHIP_CONFLICT", error);
+                    metrics.failure();
+                    log.error(error);
+                    return 0;
                 }
                 metrics.completed();
                 log.warn("Completed MatchEngine reservation after durable trade: tradeId={}, orderId={}",
                         trade.getTradeId(), reservedOrder.getOrderId());
             }
+            issueStore.markResolved(issueStore.fingerprint(reservation));
             return 1;
         } catch (OrderBookRuntimeUnavailableException unavailable) {
             throw unavailable;
         } catch (Exception e) {
-            metrics.failure();
-            log.error("Failed to converge MatchEngine reservation after durable trade: tradeId={}, orderId={}",
-                    trade.getTradeId(), reservedOrder.getOrderId(), e);
+            recordTransientFailure(reservation, "TRANSIENT_DURABLE_TRADE_CONVERGENCE", e);
             return 0;
         }
+    }
+
+    private void recordTransientFailure(
+            RedisOrderBookService.ReservationSnapshot reservation,
+            String errorType,
+            Exception failure) {
+        metrics.failure();
+        ReservationReconciliationIssueStore.FailureRecord record =
+                issueStore.recordTransientFailure(reservation, errorType, failure, maxAttempts);
+        if (record.terminal()) {
+            log.error("Match reservation reconciliation exhausted retries: key={}, tradeId={}, attempts={}",
+                    reservation.key(), reservation.tradeId(), record.attemptCount(), failure);
+        } else {
+            log.warn("Match reservation reconciliation will retry: key={}, tradeId={}, attempt={}",
+                    reservation.key(), reservation.tradeId(), record.attemptCount(), failure);
+        }
+    }
+
+    private boolean validDurableTradeIdentity(
+            OrderAssetReservationSucceededEvent reservedOrder,
+            TradeExecutionEntity trade) {
+        if (!Objects.equals(reservedOrder.getMarketId(), trade.getMarketId())
+                || trade.getQuantity() == null
+                || trade.getQuantity() <= 0
+                || reservedOrder.getAmount() == null
+                || trade.getQuantity() > reservedOrder.getAmount()) {
+            return false;
+        }
+        if ("BUY".equalsIgnoreCase(reservedOrder.getOrderType())) {
+            return Objects.equals(reservedOrder.getOrderId(), trade.getBuyerOrderId())
+                    && Objects.equals(reservedOrder.getUserId(), trade.getBuyerId())
+                    && Objects.equals(
+                            reservedOrder.getMarketSequence(), trade.getBuyerMarketSequence())
+                    && Objects.equals(reservedOrder.getPrice(), trade.getOriginBuyerPrice());
+        }
+        if ("SELL".equalsIgnoreCase(reservedOrder.getOrderType())) {
+            return Objects.equals(reservedOrder.getOrderId(), trade.getSellerOrderId())
+                    && Objects.equals(reservedOrder.getUserId(), trade.getSellerId())
+                    && Objects.equals(
+                            reservedOrder.getMarketSequence(), trade.getSellerMarketSequence())
+                    && Objects.equals(reservedOrder.getPrice(), trade.getOriginSellerPrice());
+        }
+        return false;
+    }
+
+    private OrderAssetReservationSucceededEvent copyWithAmount(
+            OrderAssetReservationSucceededEvent source,
+            int amount) {
+        return OrderAssetReservationSucceededEvent.builder()
+                .orderId(source.getOrderId())
+                .userId(source.getUserId())
+                .marketId(source.getMarketId())
+                .marketSequence(source.getMarketSequence())
+                .price(source.getPrice())
+                .amount(amount)
+                .orderType(source.getOrderType())
+                .createdAt(source.getCreatedAt())
+                .build();
     }
 
     private boolean isOrphanReady(RedisOrderBookService.ReservationSnapshot reservation) {

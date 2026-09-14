@@ -8,6 +8,7 @@ import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.data.redis.core.script.RedisScript;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -18,6 +19,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doAnswer;
@@ -434,8 +436,13 @@ class RedisOrderBookServiceTest {
                 .createdAt(LocalDateTime.of(2026, 7, 13, 12, 3))
                 .build();
         ValueOperations<String, String> valueOperations = mock(ValueOperations.class);
-        doReturn(List.of("order:reservation:" + orderId))
-                .when(redisTemplate).execute(any(RedisCallback.class));
+        doReturn(List.of(
+                "0".getBytes(StandardCharsets.UTF_8),
+                List.of(("order:reservation:" + orderId).getBytes(StandardCharsets.UTF_8))))
+                .when(redisTemplate).execute(
+                        any(RedisScript.class),
+                        anyList(),
+                        any(Object[].class));
         doReturn(valueOperations).when(redisTemplate).opsForValue();
         doReturn("{\"reservedAtEpochMillis\":1783934580000,\"orderId\":\"" + orderId
                 + "\",\"tradeId\":\"TEST-MARKET-43\"}")

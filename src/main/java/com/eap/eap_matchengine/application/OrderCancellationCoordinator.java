@@ -5,6 +5,9 @@ import com.eap.common.event.OrderCancellationResultEvent;
 import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.client.RedisException;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -32,6 +35,12 @@ public class OrderCancellationCoordinator {
 
     @Value("${eap.match-engine.order-cancellation.reconcile-lease-ms:30000}")
     private long reconcileLeaseMs = 30_000L;
+
+    @Value("${eap.match-engine.order-cancellation.max-technical-attempts:20}")
+    private int maxTechnicalAttempts = 20;
+
+    @Value("${eap.match-engine.order-cancellation.prerequisite-alert-after-attempts:40}")
+    private int prerequisiteAlertAfterAttempts = 40;
 
     @Autowired
     public OrderCancellationCoordinator(
@@ -121,54 +130,47 @@ public class OrderCancellationCoordinator {
                 decisions.claimRetryable(reconcileBatchSize, reconcileOwner, reconcileLeaseMs)) {
             try {
                 orderBook.recordCancellationIntent(decision.orderId(), decision.cancellationId());
-                resolve(decision);
-                OrderCancellationDecisionStore.Decision resolved = decisions.find(decision.cancellationId());
-                if (!resolved.complete()) {
-                    decisions.reschedule(
-                            resolved,
-                            reconcileOwner,
-                            null,
-                            retryDelayMs(resolved.attemptCount()));
+                Resolution resolution = resolve(decision);
+                if (resolution.waiting()) {
+                    reschedulePrerequisite(decision, resolution);
                 }
             } catch (RuntimeException e) {
                 log.warn("Pending cancellation reconciliation failed: cancellationId={}, orderId={}",
                         decision.cancellationId(), decision.orderId(), e);
                 try {
-                    decisions.reschedule(
-                            decision,
-                            reconcileOwner,
-                            e,
-                            retryDelayMs(decision.attemptCount()));
+                    handleFailure(decision, e);
                 } catch (RuntimeException rescheduleFailure) {
-                    log.error("Failed to reschedule pending cancellation: cancellationId={}",
+                    log.error("Failed to record pending cancellation failure: cancellationId={}",
                             decision.cancellationId(), rescheduleFailure);
                 }
             }
         }
     }
 
-    private void resolve(OrderCancellationDecisionStore.Decision pending) {
+    private Resolution resolve(OrderCancellationDecisionStore.Decision pending) {
         OrderBookRuntimeGuard.Snapshot runtime = requireRuntimeReady();
         OrderCancellationDecisionStore.Decision decision = decisions.find(pending.cancellationId());
         if (decision.complete()) {
-            return;
+            return Resolution.resolved();
         }
 
         OrderAssetReservationSucceededEvent visibleOrder = orderBook.findOpenOrder(decision.orderId());
         if (visibleOrder != null) {
             decision = decisions.refreshSnapshot(decision.cancellationId(), visibleOrder);
             if (completeFromRedisArbitration(decision, visibleOrder)) {
-                return;
+                return Resolution.resolved();
             }
         } else if (decision.snapshot() != null
                 && completeFromRedisArbitration(decision, decision.snapshot())) {
             // Replays the Lua arbitration so a Redis marker can heal a crash before
             // the PostgreSQL cancellation decision and outbox were committed.
-            return;
+            return Resolution.resolved();
         }
 
         if (processingStore.isReserved(decision.orderId())) {
-            return;
+            return Resolution.waiting(
+                    "PREREQUISITE_MATCH_RESERVATION",
+                    "Waiting for the active Match reservation to converge");
         }
 
         // Matching can release a partially filled remainder immediately after the
@@ -176,17 +178,24 @@ public class OrderCancellationCoordinator {
         visibleOrder = orderBook.findOpenOrder(decision.orderId());
         if (visibleOrder != null) {
             decision = decisions.refreshSnapshot(decision.cancellationId(), visibleOrder);
-            completeFromRedisArbitration(decision, visibleOrder);
-            return;
+            return completeFromRedisArbitration(decision, visibleOrder)
+                    ? Resolution.resolved()
+                    : Resolution.waiting(
+                            "PREREQUISITE_CANCELLATION_ARBITRATION",
+                            "Order is still participating in Match arbitration");
         }
         if (processingStore.isReserved(decision.orderId())) {
-            return;
+            return Resolution.waiting(
+                    "PREREQUISITE_MATCH_RESERVATION",
+                    "Waiting for the active Match reservation to converge");
         }
 
         IncomingOrderProcessingStore.State admissionState = processingStore.state(decision.orderId());
         if (admissionState != null
                 && admissionState.status() == IncomingOrderProcessingStore.Status.PROCESSING) {
-            return;
+            return Resolution.waiting(
+                    "PREREQUISITE_ORDER_ADMISSION",
+                    "Waiting for Match order admission to leave PROCESSING");
         }
 
         // A snapshot-free request may have been interrupted before the Redis intent.
@@ -198,22 +207,111 @@ public class OrderCancellationCoordinator {
                     decision,
                     OrderCancellationResultEvent.ALREADY_MATCHED,
                     "Order has already participated in a durable trade and has no open remainder");
-            return;
+            return Resolution.resolved();
         }
 
         OrderAssetReservationSucceededEvent snapshot = decision.snapshot();
         if (snapshot == null) {
-            return;
+            return Resolution.waiting(
+                    "PREREQUISITE_ORDER_SNAPSHOT",
+                    "Waiting for the asset-reservation order snapshot");
         }
         IncomingOrderProcessingStore.State state = processingStore.state(snapshot);
         if (state == null || state.status() == IncomingOrderProcessingStore.Status.PROCESSING) {
-            return;
+            return Resolution.waiting(
+                    "PREREQUISITE_ORDER_ADMISSION",
+                    "Waiting for Match order admission to become durably classifiable");
         }
         verifyRuntimeUnchanged(runtime);
         completeRejected(
                 decision,
                 OrderCancellationResultEvent.NOT_OPEN,
                 "Completed Match admission has no visible order or durable trade");
+        return Resolution.resolved();
+    }
+
+    private void reschedulePrerequisite(
+            OrderCancellationDecisionStore.Decision decision,
+            Resolution resolution) {
+        int nextWait = decision.prerequisiteWaitCount() + 1;
+        boolean updated = decisions.reschedulePrerequisite(
+                decision,
+                reconcileOwner,
+                resolution.errorType(),
+                resolution.detail(),
+                retryDelayMs(nextWait));
+        if (!updated) {
+            log.warn("Lost cancellation reconciliation lease while waiting for prerequisite: cancellationId={}",
+                    decision.cancellationId());
+            return;
+        }
+        int alertEvery = Math.max(1, prerequisiteAlertAfterAttempts);
+        if (nextWait == alertEvery || nextWait % alertEvery == 0) {
+            log.error("Cancellation prerequisite remains unresolved: cancellationId={}, orderId={}, type={}, waits={}",
+                    decision.cancellationId(), decision.orderId(), resolution.errorType(), nextWait);
+        }
+    }
+
+    private void handleFailure(
+            OrderCancellationDecisionStore.Decision decision,
+            RuntimeException failure) {
+        FailureClassification classification = classify(failure);
+        if (classification.prerequisite()) {
+            reschedulePrerequisite(decision, Resolution.waiting(
+                    classification.errorType(), failure.toString()));
+            return;
+        }
+
+        int nextTechnicalAttempt = decision.technicalAttemptCount() + 1;
+        boolean terminal = classification.permanent()
+                || nextTechnicalAttempt >= Math.max(1, maxTechnicalAttempts);
+        if (terminal) {
+            String terminalType = classification.permanent()
+                    ? classification.errorType()
+                    : "RETRY_EXHAUSTED_" + classification.errorType();
+            if (!decisions.markTerminal(
+                    decision, reconcileOwner, terminalType, failure)) {
+                log.warn("Lost cancellation reconciliation lease while marking terminal: cancellationId={}",
+                        decision.cancellationId());
+                return;
+            }
+            log.error("Cancellation reconciliation requires intervention: cancellationId={}, orderId={}, type={}, attempts={}",
+                    decision.cancellationId(), decision.orderId(), terminalType, nextTechnicalAttempt, failure);
+            return;
+        }
+
+        if (!decisions.rescheduleTechnical(
+                decision,
+                reconcileOwner,
+                classification.errorType(),
+                failure,
+                retryDelayMs(nextTechnicalAttempt))) {
+            log.warn("Lost cancellation reconciliation lease while scheduling technical retry: cancellationId={}",
+                    decision.cancellationId());
+        }
+    }
+
+    private FailureClassification classify(RuntimeException failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof OrderBookRuntimeUnavailableException) {
+                return new FailureClassification(true, false, "PREREQUISITE_ORDER_BOOK_NOT_READY");
+            }
+            if (current instanceof OrderBookDataInvariantException
+                    || current instanceof DataIntegrityViolationException
+                    || current instanceof IllegalArgumentException
+                    || current instanceof ArithmeticException) {
+                return new FailureClassification(false, true, "PERMANENT_CANCELLATION_INVARIANT");
+            }
+            if (current instanceof DataAccessException) {
+                return new FailureClassification(false, false, "TRANSIENT_DATA_STORE");
+            }
+            if (current instanceof RedisException) {
+                return new FailureClassification(false, false, "TRANSIENT_REDIS");
+            }
+            current = current.getCause();
+        }
+        return new FailureClassification(false, false, "UNKNOWN_RETRYABLE");
     }
 
     private boolean completeFromRedisArbitration(
@@ -303,6 +401,19 @@ public class OrderCancellationCoordinator {
     private record CancellationIntake(
             OrderCancellationDecisionStore.Decision decision,
             boolean resolveNow) {
+    }
+
+    private record Resolution(boolean waiting, String errorType, String detail) {
+        private static Resolution resolved() {
+            return new Resolution(false, null, null);
+        }
+
+        private static Resolution waiting(String errorType, String detail) {
+            return new Resolution(true, errorType, detail);
+        }
+    }
+
+    private record FailureClassification(boolean prerequisite, boolean permanent, String errorType) {
     }
 
     private long retryDelayMs(int attemptCount) {

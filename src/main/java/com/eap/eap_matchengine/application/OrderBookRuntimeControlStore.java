@@ -155,6 +155,7 @@ public class OrderBookRuntimeControlStore {
                   + (SELECT COUNT(*) FROM match_engine.order_cancellations)
                   + (SELECT COUNT(*) FROM match_engine.trade_outbox)
                   + (SELECT COUNT(*) FROM match_engine.reservation_cleanup_tasks)
+                  + (SELECT COUNT(*) FROM match_engine.reservation_reconciliation_issues)
                 """, Long.class);
         return count == null ? 0L : count;
     }

@@ -27,7 +27,9 @@ public class OrderCancellationDecisionStore {
     private static final String DECISION_COLUMNS = """
             cancellation_id, order_id, user_id, status, reason, market_id,
             order_type, market_sequence, limit_price, original_amount, cancelled_amount,
-            order_created_at, requested_at, decided_at, attempt_count
+            order_created_at, requested_at, decided_at, attempt_count,
+            prerequisite_wait_count, technical_attempt_count, error_type, last_error,
+            first_prerequisite_at, first_technical_failure_at, last_failure_at
             """;
     private static final String RETURNED_DECISION_COLUMNS = """
             cancellation.cancellation_id, cancellation.order_id, cancellation.user_id,
@@ -35,7 +37,11 @@ public class OrderCancellationDecisionStore {
             cancellation.order_type, cancellation.market_sequence, cancellation.limit_price,
             cancellation.original_amount, cancellation.cancelled_amount,
             cancellation.order_created_at, cancellation.requested_at,
-            cancellation.decided_at, cancellation.attempt_count
+            cancellation.decided_at, cancellation.attempt_count,
+            cancellation.prerequisite_wait_count, cancellation.technical_attempt_count,
+            cancellation.error_type, cancellation.last_error,
+            cancellation.first_prerequisite_at, cancellation.first_technical_failure_at,
+            cancellation.last_failure_at
             """;
 
     private final NamedParameterJdbcTemplate jdbc;
@@ -199,6 +205,7 @@ public class OrderCancellationDecisionStore {
                         decided_at = :decidedAt,
                         claimed_by = NULL,
                         claim_until = NULL,
+                        error_type = NULL,
                         last_error = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE cancellation_id = :cancellationId
@@ -222,18 +229,23 @@ public class OrderCancellationDecisionStore {
         return find(pending.cancellationId());
     }
 
-    public void reschedule(
+    public boolean reschedulePrerequisite(
             Decision decision,
             String owner,
-            RuntimeException failure,
+            String errorType,
+            String detail,
             long delayMs) {
-        jdbc.update("""
+        int updated = jdbc.update("""
                 UPDATE match_engine.order_cancellations
                 SET status = 'PENDING',
                     next_retry_at = CURRENT_TIMESTAMP + (:delayMs * INTERVAL '1 millisecond'),
                     claimed_by = NULL,
                     claim_until = NULL,
+                    prerequisite_wait_count = prerequisite_wait_count + 1,
+                    error_type = :errorType,
                     last_error = :lastError,
+                    first_prerequisite_at = COALESCE(first_prerequisite_at, CURRENT_TIMESTAMP),
+                    last_failure_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE cancellation_id = :cancellationId
                   AND status = 'IN_PROGRESS'
@@ -242,7 +254,68 @@ public class OrderCancellationDecisionStore {
                 .addValue("cancellationId", decision.cancellationId())
                 .addValue("owner", owner)
                 .addValue("delayMs", delayMs)
-                .addValue("lastError", failure == null ? null : truncate(failure.toString())));
+                .addValue("errorType", errorType)
+                .addValue("lastError", truncate(detail)));
+        return updated == 1;
+    }
+
+    public boolean rescheduleTechnical(
+            Decision decision,
+            String owner,
+            String errorType,
+            RuntimeException failure,
+            long delayMs) {
+        int updated = jdbc.update("""
+                UPDATE match_engine.order_cancellations
+                SET status = 'PENDING',
+                    next_retry_at = CURRENT_TIMESTAMP + (:delayMs * INTERVAL '1 millisecond'),
+                    claimed_by = NULL,
+                    claim_until = NULL,
+                    technical_attempt_count = technical_attempt_count + 1,
+                    error_type = :errorType,
+                    last_error = :lastError,
+                    first_technical_failure_at = COALESCE(
+                        first_technical_failure_at, CURRENT_TIMESTAMP),
+                    last_failure_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE cancellation_id = :cancellationId
+                  AND status = 'IN_PROGRESS'
+                  AND claimed_by = :owner
+                """, new MapSqlParameterSource()
+                .addValue("cancellationId", decision.cancellationId())
+                .addValue("owner", owner)
+                .addValue("delayMs", delayMs)
+                .addValue("errorType", errorType)
+                .addValue("lastError", truncate(failure.toString())));
+        return updated == 1;
+    }
+
+    public boolean markTerminal(
+            Decision decision,
+            String owner,
+            String errorType,
+            RuntimeException failure) {
+        int updated = jdbc.update("""
+                UPDATE match_engine.order_cancellations
+                SET status = 'FAILED_TERMINAL',
+                    claimed_by = NULL,
+                    claim_until = NULL,
+                    technical_attempt_count = technical_attempt_count + 1,
+                    error_type = :errorType,
+                    last_error = :lastError,
+                    first_technical_failure_at = COALESCE(
+                        first_technical_failure_at, CURRENT_TIMESTAMP),
+                    last_failure_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE cancellation_id = :cancellationId
+                  AND status = 'IN_PROGRESS'
+                  AND claimed_by = :owner
+                """, new MapSqlParameterSource()
+                .addValue("cancellationId", decision.cancellationId())
+                .addValue("owner", owner)
+                .addValue("errorType", errorType)
+                .addValue("lastError", truncate(failure.toString())));
+        return updated == 1;
     }
 
     private Decision refreshSnapshot(
@@ -267,6 +340,9 @@ public class OrderCancellationDecisionStore {
     }
 
     private String truncate(String value) {
+        if (value == null) {
+            return null;
+        }
         return value.length() <= 2_000 ? value : value.substring(0, 2_000);
     }
 
@@ -295,7 +371,14 @@ public class OrderCancellationDecisionStore {
                 rs.getObject("order_created_at", LocalDateTime.class),
                 rs.getObject("requested_at", LocalDateTime.class),
                 rs.getObject("decided_at", LocalDateTime.class),
-                rs.getInt("attempt_count"));
+                rs.getInt("attempt_count"),
+                rs.getInt("prerequisite_wait_count"),
+                rs.getInt("technical_attempt_count"),
+                rs.getString("error_type"),
+                rs.getString("last_error"),
+                rs.getObject("first_prerequisite_at", LocalDateTime.class),
+                rs.getObject("first_technical_failure_at", LocalDateTime.class),
+                rs.getObject("last_failure_at", LocalDateTime.class));
     }
 
     public record Decision(
@@ -313,12 +396,41 @@ public class OrderCancellationDecisionStore {
             LocalDateTime orderCreatedAt,
             LocalDateTime requestedAt,
             LocalDateTime decidedAt,
-            int attemptCount) {
+            int attemptCount,
+            int prerequisiteWaitCount,
+            int technicalAttemptCount,
+            String errorType,
+            String lastError,
+            LocalDateTime firstPrerequisiteAt,
+            LocalDateTime firstTechnicalFailureAt,
+            LocalDateTime lastFailureAt) {
+
+        public Decision(
+                UUID cancellationId,
+                UUID orderId,
+                UUID userId,
+                String status,
+                String reason,
+                String marketId,
+                String orderType,
+                Long marketSequence,
+                Integer limitPrice,
+                Integer originalAmount,
+                Integer cancelledAmount,
+                LocalDateTime orderCreatedAt,
+                LocalDateTime requestedAt,
+                LocalDateTime decidedAt,
+                int attemptCount) {
+            this(cancellationId, orderId, userId, status, reason, marketId, orderType,
+                    marketSequence, limitPrice, originalAmount, cancelledAmount, orderCreatedAt,
+                    requestedAt, decidedAt, attemptCount, 0, 0, null, null, null, null, null);
+        }
 
         public boolean complete() {
             return OrderCancellationResultEvent.CANCELLED.equals(status)
                     || OrderCancellationResultEvent.ALREADY_MATCHED.equals(status)
-                    || OrderCancellationResultEvent.NOT_OPEN.equals(status);
+                    || OrderCancellationResultEvent.NOT_OPEN.equals(status)
+                    || "FAILED_TERMINAL".equals(status);
         }
 
         public OrderAssetReservationSucceededEvent snapshot() {

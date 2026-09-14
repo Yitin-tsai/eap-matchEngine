@@ -36,6 +36,7 @@ public class ReservationCleanupWorker {
     private final long maxBackoffMs;
     private final long processingTimeoutSeconds;
     private final int leaseRenewalChunkSize;
+    private final String claimOwner = UUID.randomUUID().toString();
 
     @Autowired
     public ReservationCleanupWorker(
@@ -104,9 +105,9 @@ public class ReservationCleanupWorker {
         for (int start = 0; start < tasks.size(); start += leaseRenewalChunkSize) {
             int end = Math.min(start + leaseRenewalChunkSize, tasks.size());
             List<CleanupRow> chunk = tasks.subList(start, end);
-            renewLeases(chunk.stream().map(CleanupRow::id).toList());
+            renewLeases(chunk);
 
-            List<Long> completedTaskIds = new ArrayList<>(chunk.size());
+            List<CleanupRow> completedTasks = new ArrayList<>(chunk.size());
             for (CleanupRow task : chunk) {
                 Instant redisStartedAt = Instant.now();
                 ReservationCompletionOutcome outcome;
@@ -123,32 +124,41 @@ public class ReservationCleanupWorker {
                     metrics.recordRedisCleanup(Duration.between(redisStartedAt, Instant.now()));
                 }
                 if (outcome.successful()) {
-                    completedTaskIds.add(task.id());
+                    completedTasks.add(task);
                 } else {
                     recordPermanentFailure(task, outcome);
                 }
             }
-            markCompleted(completedTaskIds);
-            completedCount += completedTaskIds.size();
+            markCompleted(completedTasks);
+            completedCount += completedTasks.size();
         }
         metrics.completed(completedCount);
         metrics.recordBatch(Duration.between(batchStartedAt, Instant.now()));
         return tasks.size();
     }
 
-    void renewLeases(List<Long> ids) {
-        if (ids.isEmpty()) {
+    void renewLeases(List<CleanupRow> tasks) {
+        if (tasks.isEmpty()) {
             return;
         }
-        String placeholders = String.join(", ", Collections.nCopies(ids.size(), "?"));
+        UUID claimToken = sharedClaimToken(tasks);
+        String placeholders = String.join(", ", Collections.nCopies(tasks.size(), "?"));
+        List<Object> parameters = new ArrayList<>();
+        parameters.add(processingTimeoutSeconds);
+        parameters.addAll(tasks.stream().map(CleanupRow::id).toList());
+        parameters.add(claimOwner);
+        parameters.add(claimToken);
         int updated = jdbcTemplate.update("""
                 UPDATE match_engine.reservation_cleanup_tasks
-                SET updated_at = CURRENT_TIMESTAMP
+                SET claim_until = CURRENT_TIMESTAMP + (? * INTERVAL '1 second'),
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id IN (%s)
                   AND status = 'PROCESSING'
-                """.formatted(placeholders), ids.toArray());
-        if (updated != ids.size()) {
-            throw new IllegalStateException("Expected to renew " + ids.size()
+                  AND claim_owner = ?
+                  AND claim_token = ?
+                """.formatted(placeholders), parameters.toArray());
+        if (updated != tasks.size()) {
+            throw new IllegalStateException("Expected to renew " + tasks.size()
                     + " reservation cleanup leases, but updated " + updated);
         }
     }
@@ -156,32 +166,42 @@ public class ReservationCleanupWorker {
     private List<CleanupRow> claimTasks() {
         Instant startedAt = Instant.now();
         try {
+            UUID claimToken = UUID.randomUUID();
             List<CleanupRow> tasks = jdbcTemplate.query("""
                     WITH claimed AS (
                         SELECT id
                         FROM match_engine.reservation_cleanup_tasks
                         WHERE (status = 'PENDING' AND next_retry_at <= CURRENT_TIMESTAMP)
                            OR (status = 'PROCESSING'
-                               AND updated_at <= CURRENT_TIMESTAMP - (? * INTERVAL '1 second'))
+                               AND COALESCE(claim_until,
+                                   updated_at + (? * INTERVAL '1 second')) <= CURRENT_TIMESTAMP)
                         ORDER BY created_at, id
                         LIMIT ?
                         FOR UPDATE SKIP LOCKED
                     )
                     UPDATE match_engine.reservation_cleanup_tasks task
                     SET status = 'PROCESSING',
+                        claim_owner = ?,
+                        claim_token = ?,
+                        claim_until = CURRENT_TIMESTAMP + (? * INTERVAL '1 second'),
                         updated_at = CURRENT_TIMESTAMP
                     FROM claimed
                     WHERE task.id = claimed.id
-                    RETURNING task.id, task.trade_id, task.order_id, task.user_id, task.attempt_count
+                    RETURNING task.id, task.trade_id, task.order_id, task.user_id,
+                              task.attempt_count, task.claim_token
                     """,
                     (rs, rowNum) -> new CleanupRow(
                             rs.getLong("id"),
                             rs.getString("trade_id"),
                             rs.getObject("order_id", UUID.class),
                             rs.getObject("user_id", UUID.class),
-                            rs.getInt("attempt_count")),
+                            rs.getInt("attempt_count"),
+                            rs.getObject("claim_token", UUID.class)),
                     processingTimeoutSeconds,
-                    batchSize);
+                    batchSize,
+                    claimOwner,
+                    claimToken,
+                    processingTimeoutSeconds);
             metrics.claimed(tasks.size());
             return tasks;
         } finally {
@@ -189,23 +209,34 @@ public class ReservationCleanupWorker {
         }
     }
 
-    void markCompleted(List<Long> ids) {
-        if (ids.isEmpty()) {
+    void markCompleted(List<CleanupRow> tasks) {
+        if (tasks.isEmpty()) {
             return;
         }
         Instant startedAt = Instant.now();
         try {
-            String placeholders = String.join(", ", Collections.nCopies(ids.size(), "?"));
+            UUID claimToken = sharedClaimToken(tasks);
+            String placeholders = String.join(", ", Collections.nCopies(tasks.size(), "?"));
+            List<Object> parameters = new ArrayList<>();
+            parameters.addAll(tasks.stream().map(CleanupRow::id).toList());
+            parameters.add(claimOwner);
+            parameters.add(claimToken);
             int updated = jdbcTemplate.update("""
                     UPDATE match_engine.reservation_cleanup_tasks
                     SET status = 'COMPLETED',
                         last_error = NULL,
+                        error_type = NULL,
+                        claim_owner = NULL,
+                        claim_token = NULL,
+                        claim_until = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id IN (%s)
                       AND status = 'PROCESSING'
-                    """.formatted(placeholders), ids.toArray());
-            if (updated != ids.size()) {
-                throw new IllegalStateException("Expected to complete " + ids.size()
+                      AND claim_owner = ?
+                      AND claim_token = ?
+                    """.formatted(placeholders), parameters.toArray());
+            if (updated != tasks.size()) {
+                throw new IllegalStateException("Expected to complete " + tasks.size()
                         + " reservation cleanup tasks, but updated " + updated);
             }
         } finally {
@@ -222,30 +253,46 @@ public class ReservationCleanupWorker {
         LocalDateTime updatedAt = LocalDateTime.now();
 
         if (nextAttempt >= maxAttempts) {
-            jdbcTemplate.update("""
+            int updated = jdbcTemplate.update("""
                     UPDATE match_engine.reservation_cleanup_tasks
                     SET status = 'FAILED',
                         attempt_count = ?,
+                        error_type = 'RETRY_EXHAUSTED_TECHNICAL_FAILURE',
                         last_error = ?,
+                        claim_owner = NULL,
+                        claim_token = NULL,
+                        claim_until = NULL,
                         updated_at = ?
                     WHERE id = ?
                       AND status = 'PROCESSING'
-                    """, nextAttempt, truncatedError, updatedAt, task.id());
+                      AND claim_owner = ?
+                      AND claim_token = ?
+                    """, nextAttempt, truncatedError, updatedAt, task.id(),
+                    claimOwner, task.claimToken());
+            requireOwnedUpdate(task, updated, "fail permanently");
             return;
         }
 
         long backoffMs = calculateBackoffMs(nextAttempt);
         LocalDateTime nextRetryAt = updatedAt.plusNanos(TimeUnit.MILLISECONDS.toNanos(backoffMs));
-        jdbcTemplate.update("""
+        int updated = jdbcTemplate.update("""
                 UPDATE match_engine.reservation_cleanup_tasks
                 SET status = 'PENDING',
                     attempt_count = ?,
                     next_retry_at = ?,
+                    error_type = 'TRANSIENT_CLEANUP_FAILURE',
                     last_error = ?,
+                    claim_owner = NULL,
+                    claim_token = NULL,
+                    claim_until = NULL,
                     updated_at = ?
                 WHERE id = ?
                   AND status = 'PROCESSING'
-                """, nextAttempt, nextRetryAt, truncatedError, updatedAt, task.id());
+                  AND claim_owner = ?
+                  AND claim_token = ?
+                """, nextAttempt, nextRetryAt, truncatedError, updatedAt, task.id(),
+                claimOwner, task.claimToken());
+        requireOwnedUpdate(task, updated, "schedule retry for");
         metrics.retryScheduled();
     }
 
@@ -259,13 +306,20 @@ public class ReservationCleanupWorker {
         LocalDateTime updatedAt = LocalDateTime.now();
         int updated = jdbcTemplate.update("""
                 UPDATE match_engine.reservation_cleanup_tasks
-                SET status = 'FAILED',
-                    attempt_count = ?,
-                    last_error = ?,
-                    updated_at = ?
-                WHERE id = ?
-                  AND status = 'PROCESSING'
-                """, nextAttempt, error, updatedAt, task.id());
+                    SET status = 'FAILED',
+                        attempt_count = ?,
+                        error_type = 'RESERVATION_OWNERSHIP_CONFLICT',
+                        last_error = ?,
+                        claim_owner = NULL,
+                        claim_token = NULL,
+                        claim_until = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status = 'PROCESSING'
+                      AND claim_owner = ?
+                      AND claim_token = ?
+                """, nextAttempt, error, updatedAt, task.id(),
+                claimOwner, task.claimToken());
         if (updated != 1) {
             throw new IllegalStateException("Expected to fail reservation cleanup task "
                     + task.id() + ", but updated " + updated);
@@ -288,11 +342,35 @@ public class ReservationCleanupWorker {
                 .build();
     }
 
+    private UUID sharedClaimToken(List<CleanupRow> tasks) {
+        UUID claimToken = tasks.get(0).claimToken();
+        if (claimToken == null || tasks.stream().anyMatch(task -> !claimToken.equals(task.claimToken()))) {
+            throw new IllegalArgumentException("Reservation cleanup batch must have one non-null claim token");
+        }
+        return claimToken;
+    }
+
+    private void requireOwnedUpdate(CleanupRow task, int updated, String action) {
+        if (updated != 1) {
+            throw new IllegalStateException("Lost reservation cleanup lease while attempting to "
+                    + action + " task " + task.id());
+        }
+    }
+
+    String claimOwner() {
+        return claimOwner;
+    }
+
     record CleanupRow(
             long id,
             String tradeId,
             UUID orderId,
             UUID userId,
-            int attemptCount) {
+            int attemptCount,
+            UUID claimToken) {
+
+        CleanupRow(long id, String tradeId, UUID orderId, UUID userId, int attemptCount) {
+            this(id, tradeId, orderId, userId, attemptCount, new UUID(0L, 0L));
+        }
     }
 }

@@ -66,6 +66,7 @@ eap:
       batch-size: ${EAP_MATCH_RESERVATION_RECONCILER_BATCH_SIZE:500}
       poll-interval-ms: ${EAP_MATCH_RESERVATION_RECONCILER_POLL_INTERVAL_MS:1000}
       orphan-threshold-seconds: 30
+      max-attempts: 10
     reservation-cleanup:
       enabled: true
       batch-size: ${EAP_MATCH_RESERVATION_CLEANUP_BATCH_SIZE:1000}

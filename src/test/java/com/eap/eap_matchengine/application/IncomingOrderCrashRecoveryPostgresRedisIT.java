@@ -5,6 +5,7 @@ import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.common.event.OrderCancellationResultEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
+import com.eap.eap_matchengine.domain.entity.TradeExecutionEntity;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -15,6 +16,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -24,6 +26,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.LocalDateTime;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -96,6 +99,8 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     @Autowired
     private ReservationCleanupTaskStore cleanupTaskStore;
     @Autowired
+    private ReservationReconciliationIssueStore reservationIssueStore;
+    @Autowired
     private RedissonClient redissonClient;
     @Autowired
     private RedisTemplate<String, String> redisTemplate;
@@ -111,6 +116,8 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     private MatchOrderAdmissionProcessor matchOrderAdmissionProcessor;
     @Autowired
     private MatchOrderAdmissionInbox matchOrderAdmissionInbox;
+    @Autowired
+    private MatchOrderAdmissionInboxMetrics matchOrderAdmissionInboxMetrics;
     @Autowired
     private OrderBookRuntimeAdminService orderBookRuntimeAdmin;
     @Autowired
@@ -129,6 +136,7 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                     match_engine.order_admission_inbox,
                     match_engine.order_cancellations,
                     match_engine.reservation_cleanup_tasks,
+                    match_engine.reservation_reconciliation_issues,
                     match_engine.trade_outbox,
                     match_engine.trade_executions,
                     match_engine.order_book_runtime_control
@@ -138,6 +146,345 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
             connection.serverCommands().flushDb();
         }
         orderBookRuntimeAdmin.initializeEmpty("integration-test", "fresh test fixture");
+    }
+
+    @Test
+    void reservationIssueStore_shouldStopAfterBoundedFailuresAndPreserveDiagnostics() {
+        OrderAssetReservationSucceededEvent order = order("BUY", 501, 1L, 3);
+        RedisOrderBookService.ReservationSnapshot reservation =
+                RedisOrderBookService.ReservationSnapshot.valid(
+                        "order:reservation:" + order.getOrderId(),
+                        order,
+                        1L,
+                        "CRASH-RECOVERY-MARKET-501",
+                        "{\"diagnostic\":\"payload\"}");
+
+        ReservationReconciliationIssueStore.FailureRecord first =
+                reservationIssueStore.recordTransientFailure(
+                        reservation, "TRANSIENT_REDIS", new RuntimeException("redis down"), 2);
+        ReservationReconciliationIssueStore.FailureRecord second =
+                reservationIssueStore.recordTransientFailure(
+                        reservation, "TRANSIENT_REDIS", new RuntimeException("still down"), 2);
+
+        assertThat(first.terminal()).isFalse();
+        assertThat(second.terminal()).isTrue();
+        assertThat(second.attemptCount()).isEqualTo(2);
+        assertThat(reservationIssueStore.findTerminalIssueIds(Set.of(
+                reservationIssueStore.fingerprint(reservation))))
+                .containsExactly(reservationIssueStore.fingerprint(reservation));
+        assertThat(jdbc.queryForMap("""
+                SELECT status, error_type, attempt_count, payload, last_error
+                FROM match_engine.reservation_reconciliation_issues
+                WHERE reservation_key = ?
+                """, reservation.key()))
+                .containsEntry("status", "TERMINAL")
+                .containsEntry("error_type", "TRANSIENT_REDIS")
+                .containsEntry("attempt_count", 2)
+                .containsEntry("payload", "{\"diagnostic\":\"payload\"}")
+                .containsEntry("last_error", "RuntimeException: still down");
+
+        OrderAssetReservationSucceededEvent reappearingOrder = order("BUY", 502, 2L, 3);
+        RedisOrderBookService.ReservationSnapshot reappearing =
+                RedisOrderBookService.ReservationSnapshot.valid(
+                        "order:reservation:" + reappearingOrder.getOrderId(),
+                        reappearingOrder,
+                        2L,
+                        "CRASH-RECOVERY-MARKET-502",
+                        "{\"diagnostic\":\"reappearing\"}");
+        ReservationReconciliationIssueStore.FailureRecord initialRetryable =
+                reservationIssueStore.recordTransientFailure(
+                        reappearing, "TRANSIENT_REDIS", new RuntimeException("first failure"), 3);
+        String issueId = reservationIssueStore.fingerprint(reappearing);
+        reservationIssueStore.resolveAbsentRetryableIssues(Set.of(issueId));
+        ReservationReconciliationIssueStore.FailureRecord reappeared =
+                reservationIssueStore.recordTransientFailure(
+                        reappearing, "TRANSIENT_REDIS", new RuntimeException("failure after repair"), 3);
+
+        assertThat(initialRetryable.terminal()).isFalse();
+        assertThat(reappeared.terminal()).isFalse();
+        assertThat(reappeared.attemptCount()).isEqualTo(1);
+        assertThat(jdbc.queryForMap("""
+                SELECT status, attempt_count, resolved_at
+                FROM match_engine.reservation_reconciliation_issues
+                WHERE issue_id = ?
+                """, issueId))
+                .containsEntry("status", "RETRYABLE")
+                .containsEntry("attempt_count", 1)
+                .containsEntry("resolved_at", null);
+    }
+
+    @Test
+    void reservationScan_shouldRotateThroughBoundedPagesWithoutStarvation() {
+        redisTemplate.opsForValue().set("order:reservation:terminal-a", "{bad-a");
+        redisTemplate.opsForValue().set("order:reservation:actionable-b", "{bad-b");
+
+        Set<String> observed = new HashSet<>();
+        for (int poll = 0; poll < 10 && observed.size() < 2; poll++) {
+            List<RedisOrderBookService.ReservationSnapshot> page =
+                    orderBookService.scanReservations(1);
+            assertThat(page).hasSizeLessThanOrEqualTo(1);
+            page.stream()
+                    .map(RedisOrderBookService.ReservationSnapshot::key)
+                    .forEach(observed::add);
+        }
+
+        assertThat(observed).containsExactlyInAnyOrder(
+                        "order:reservation:terminal-a",
+                        "order:reservation:actionable-b");
+    }
+
+    @Test
+    void terminalOldReservation_shouldNotQuarantineNewTradeOnSameRedisKey() throws Exception {
+        OrderAssetReservationSucceededEvent resting = order("BUY", 671, 1L, 1);
+        OrderAssetReservationSucceededEvent firstIncoming = order("SELL", 672, 2L, 1);
+        OrderAssetReservationSucceededEvent secondIncoming = order("SELL", 673, 3L, 1);
+        orderBookService.addOrder(resting);
+
+        RedisOrderBookService.ReservedMatch first =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(firstIncoming).reservedMatch();
+        String firstTradeId = MARKET_ID + "-" + first.matchId();
+        RedisOrderBookService.ReservationSnapshot firstSnapshot =
+                orderBookService.scanReservations(10).get(0);
+        orderBookService.releaseReservedOrder(resting, firstTradeId);
+
+        RedisOrderBookService.ReservedMatch second =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(secondIncoming).reservedMatch();
+        String secondTradeId = MARKET_ID + "-" + second.matchId();
+        reservationIssueStore.recordTerminal(
+                firstSnapshot, "RESERVATION_OWNERSHIP_CONFLICT", "old trade owner");
+
+        assertThat(reservationReconciler().reconcileOnce()).isEqualTo(1);
+
+        assertThat(orderBookService.countActiveReservations()).isZero();
+        assertThat(orderBookService.findOpenOrder(resting.getOrderId())).isNotNull();
+        assertThat(jdbc.queryForObject("""
+                SELECT status
+                FROM match_engine.reservation_reconciliation_issues
+                WHERE issue_id = ?
+                """, String.class, reservationIssueStore.fingerprint(firstSnapshot)))
+                .isEqualTo("TERMINAL");
+        assertThat(secondTradeId).isNotEqualTo(firstTradeId);
+    }
+
+    @Test
+    void partialTradeReleaseFailure_shouldKeepStableIdentityAndReachTerminal() throws Exception {
+        OrderAssetReservationSucceededEvent resting = order("BUY", 675, 1L, 3);
+        OrderAssetReservationSucceededEvent incoming = order("SELL", 676, 2L, 1);
+        orderBookService.addOrder(resting);
+        RedisOrderBookService.ReservedMatch reserved =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming).reservedMatch();
+        String tradeId = MARKET_ID + "-" + reserved.matchId();
+        tradeExecutionRepository.saveAndFlush(new TradeExecutionEntity(
+                tradeId,
+                reserved.matchId(),
+                reserved.matchId(),
+                MARKET_ID,
+                resting.getUserId(),
+                incoming.getUserId(),
+                resting.getOrderId(),
+                incoming.getOrderId(),
+                resting.getMarketSequence(),
+                incoming.getMarketSequence(),
+                resting.getPrice(),
+                incoming.getPrice(),
+                resting.getPrice(),
+                1,
+                LocalDateTime.now()));
+        RedisOrderBookService failingOrderBook = org.mockito.Mockito.spy(orderBookService);
+        org.mockito.Mockito.doThrow(new IllegalStateException("simulated Redis release failure"))
+                .when(failingOrderBook)
+                .releaseReservedOrder(
+                        org.mockito.ArgumentMatchers.argThat(order -> order.getAmount() == 2),
+                        org.mockito.ArgumentMatchers.eq(tradeId));
+        ReservationReconciler reconciler = new ReservationReconciler(
+                failingOrderBook,
+                tradeExecutionRepository,
+                cleanupTaskStore,
+                reservationIssueStore,
+                reconcilerMetrics,
+                0,
+                100,
+                2);
+
+        assertThat(reconciler.reconcileOnce()).isZero();
+        assertThat(reconciler.reconcileOnce()).isZero();
+
+        assertThat(jdbc.queryForMap("""
+                SELECT status, attempt_count, error_type
+                FROM match_engine.reservation_reconciliation_issues
+                WHERE trade_id = ?
+                """, tradeId))
+                .containsEntry("status", "TERMINAL")
+                .containsEntry("attempt_count", 2)
+                .containsEntry("error_type", "TRANSIENT_DURABLE_TRADE_CONVERGENCE");
+        assertThat(orderBookService.readReservation(
+                "order:reservation:" + resting.getOrderId()).order().getAmount()).isEqualTo(3);
+        org.mockito.Mockito.verify(failingOrderBook, org.mockito.Mockito.times(2))
+                .releaseReservedOrder(org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.eq(tradeId));
+    }
+
+    @Test
+    void reservationWithMisboundDurableTrade_shouldBecomeTerminalWithoutRedisMutation() throws Exception {
+        OrderAssetReservationSucceededEvent resting = order("BUY", 681, 1L, 1);
+        OrderAssetReservationSucceededEvent incoming = order("SELL", 682, 2L, 1);
+        orderBookService.addOrder(resting);
+        RedisOrderBookService.ReservedMatch reserved =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming).reservedMatch();
+        String tradeId = MARKET_ID + "-" + reserved.matchId();
+        tradeExecutionRepository.saveAndFlush(new TradeExecutionEntity(
+                tradeId,
+                reserved.matchId(),
+                reserved.matchId(),
+                MARKET_ID,
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                999L,
+                1000L,
+                501,
+                500,
+                500,
+                1,
+                LocalDateTime.now()));
+
+        assertThat(reservationReconciler().reconcileOnce()).isZero();
+
+        assertThat(orderBookService.countActiveReservations()).isEqualTo(1);
+        assertThat(jdbc.queryForMap("""
+                SELECT status, error_type, trade_id, order_id, user_id
+                FROM match_engine.reservation_reconciliation_issues
+                WHERE reservation_key = ?
+                """, "order:reservation:" + resting.getOrderId()))
+                .containsEntry("status", "TERMINAL")
+                .containsEntry("error_type", "DURABLE_TRADE_IDENTITY_CONFLICT")
+                .containsEntry("trade_id", tradeId)
+                .containsEntry("order_id", resting.getOrderId())
+                .containsEntry("user_id", resting.getUserId());
+    }
+
+    @Test
+    void redisSuccessBeforeIssueResolutionCommit_shouldResolveByAbsentFingerprintSweep() throws Exception {
+        OrderAssetReservationSucceededEvent resting = order("BUY", 691, 1L, 1);
+        OrderAssetReservationSucceededEvent incoming = order("SELL", 692, 2L, 1);
+        orderBookService.addOrder(resting);
+        RedisOrderBookService.ReservedMatch reserved =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming).reservedMatch();
+        String tradeId = MARKET_ID + "-" + reserved.matchId();
+        ReservationReconciliationIssueStore failOnceStore = new ReservationReconciliationIssueStore(
+                new NamedParameterJdbcTemplate(jdbc), objectMapper) {
+            private boolean fail = true;
+
+            @Override
+            public void markResolved(String issueId) {
+                if (fail) {
+                    fail = false;
+                    throw new IllegalStateException("simulated DB failure after Redis success");
+                }
+                super.markResolved(issueId);
+            }
+        };
+        ReservationReconciler interrupted = new ReservationReconciler(
+                orderBookService,
+                tradeExecutionRepository,
+                cleanupTaskStore,
+                failOnceStore,
+                reconcilerMetrics,
+                0,
+                100,
+                3);
+
+        assertThat(interrupted.reconcileOnce()).isZero();
+        assertThat(orderBookService.countActiveReservations()).isZero();
+        assertThat(jdbc.queryForObject("""
+                SELECT status
+                FROM match_engine.reservation_reconciliation_issues
+                WHERE trade_id = ?
+                """, String.class, tradeId)).isEqualTo("RETRYABLE");
+
+        assertThat(reservationReconciler().reconcileOnce()).isZero();
+        assertThat(jdbc.queryForObject("""
+                SELECT status
+                FROM match_engine.reservation_reconciliation_issues
+                WHERE trade_id = ?
+                """, String.class, tradeId)).isEqualTo("RESOLVED");
+    }
+
+    @Test
+    void reservationCleanup_staleWorkerCannotOverwriteNewClaim() {
+        ReservationCleanupWorker staleWorker = cleanupWorker();
+        UUID orderId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID staleToken = UUID.randomUUID();
+        UUID newToken = UUID.randomUUID();
+        long taskId = jdbc.queryForObject("""
+                INSERT INTO match_engine.reservation_cleanup_tasks
+                    (trade_id, order_id, user_id, status, claim_owner, claim_token,
+                     claim_until, created_at, updated_at)
+                VALUES (?, ?, ?, 'PROCESSING', ?, ?, CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                RETURNING id
+                """, Long.class, "FENCING-TRADE-1", orderId, userId,
+                staleWorker.claimOwner(), staleToken);
+        ReservationCleanupWorker.CleanupRow staleClaim =
+                new ReservationCleanupWorker.CleanupRow(
+                        taskId, "FENCING-TRADE-1", orderId, userId, 0, staleToken);
+
+        jdbc.update("""
+                UPDATE match_engine.reservation_cleanup_tasks
+                SET claim_owner = 'new-worker', claim_token = ?, claim_until = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """, newToken, taskId);
+
+        assertThatThrownBy(() -> staleWorker.markCompleted(List.of(staleClaim)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("updated 0");
+        assertThat(jdbc.queryForMap("""
+                SELECT status, claim_owner, claim_token
+                FROM match_engine.reservation_cleanup_tasks
+                WHERE id = ?
+                """, taskId))
+                .containsEntry("status", "PROCESSING")
+                .containsEntry("claim_owner", "new-worker")
+                .containsEntry("claim_token", newToken);
+    }
+
+    @Test
+    void cancellationRetryState_shouldSeparatePrerequisiteWaitFromTerminalTechnicalFailure() {
+        OrderCancellationRequestedEvent request =
+                cancellationRequest(UUID.randomUUID(), UUID.randomUUID());
+        cancellationDecisions.begin(request, null);
+        OrderCancellationDecisionStore.Decision prerequisiteClaim =
+                cancellationDecisions.claimRetryable(1, "worker-a", 30_000).get(0);
+
+        assertThat(cancellationDecisions.reschedulePrerequisite(
+                prerequisiteClaim,
+                "worker-a",
+                "PREREQUISITE_ORDER_SNAPSHOT",
+                "waiting for order snapshot",
+                0)).isTrue();
+        OrderCancellationDecisionStore.Decision afterWait =
+                cancellationDecisions.find(request.getCancellationId());
+        assertThat(afterWait.prerequisiteWaitCount()).isEqualTo(1);
+        assertThat(afterWait.technicalAttemptCount()).isZero();
+
+        OrderCancellationDecisionStore.Decision technicalClaim =
+                cancellationDecisions.claimRetryable(1, "worker-b", 30_000).get(0);
+        assertThat(cancellationDecisions.markTerminal(
+                technicalClaim,
+                "worker-b",
+                "PERMANENT_CANCELLATION_INVARIANT",
+                new OrderBookDataInvariantException("invalid order identity"))).isTrue();
+
+        OrderCancellationDecisionStore.Decision terminal =
+                cancellationDecisions.find(request.getCancellationId());
+        assertThat(terminal.status()).isEqualTo("FAILED_TERMINAL");
+        assertThat(terminal.prerequisiteWaitCount()).isEqualTo(1);
+        assertThat(terminal.technicalAttemptCount()).isEqualTo(1);
+        assertThat(terminal.errorType()).isEqualTo("PERMANENT_CANCELLATION_INVARIANT");
+        assertThat(cancellationDecisions.claimRetryable(1, "worker-c", 30_000)).isEmpty();
     }
 
     @Test
@@ -1029,9 +1376,9 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         redisTemplate.opsForValue().set("order:" + malformedSell.getOrderId(), "{");
 
         assertThatThrownBy(() -> orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
-                .isInstanceOf(RuntimeException.class);
+                .isInstanceOf(OrderBookDataInvariantException.class);
         assertThatThrownBy(() -> orderBookService.reserveBestMatchOrderLua(incomingBuy))
-                .isInstanceOf(RuntimeException.class);
+                .isInstanceOf(OrderBookDataInvariantException.class);
         assertThat(redisTemplate.opsForZSet().score(
                 "orderbook:" + MARKET_ID + ":sell",
                 malformedSell.getOrderId().toString())).isNotNull();
@@ -1042,9 +1389,9 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         redisTemplate.opsForValue().set("order:" + malformedBuy.getOrderId(), "{");
 
         assertThatThrownBy(() -> orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingSell))
-                .isInstanceOf(RuntimeException.class);
+                .isInstanceOf(OrderBookDataInvariantException.class);
         assertThatThrownBy(() -> orderBookService.reserveBestMatchOrderLua(incomingSell))
-                .isInstanceOf(RuntimeException.class);
+                .isInstanceOf(OrderBookDataInvariantException.class);
         assertThat(redisTemplate.opsForZSet().score(
                 "orderbook:" + MARKET_ID + ":buy",
                 malformedBuy.getOrderId().toString())).isNotNull();
@@ -1064,12 +1411,44 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                         + "\",\"s\":1,\"p\":100,\"a\":1,\"t\":\"SELL\"}");
 
         assertThatThrownBy(() -> orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming))
-                .isInstanceOf(IllegalStateException.class)
+                .isInstanceOf(OrderBookDataInvariantException.class)
                 .hasMessageContaining("Redis orderbook owner missing")
                 .hasMessageContaining(malformedSell.getOrderId().toString());
 
         assertThat(processingStore.isReserved(malformedSell.getOrderId())).isFalse();
         assertThat(orderBookService.findOpenOrder(malformedSell.getOrderId())).isNotNull();
+    }
+
+    @Test
+    void malformedRestingOrder_shouldBecomePermanentAdmissionInboxDebt() throws Exception {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 2L, 1);
+        OrderAssetReservationSucceededEvent malformedSell = order("SELL", 764, 1L, 1);
+        orderBookService.addOrder(malformedSell);
+        redisTemplate.opsForValue().set("order:" + malformedSell.getOrderId(), "{");
+        assertThat(matchOrderAdmissionInbox.receive(incoming))
+                .isEqualTo(MatchOrderAdmissionInbox.ReceiveOutcome.ACCEPTED);
+        MatchOrderAdmissionReconciler reconciler = new MatchOrderAdmissionReconciler(
+                matchOrderAdmissionInbox,
+                matchOrderAdmissionProcessor,
+                new MatchOrderAdmissionErrorClassifier(),
+                matchOrderAdmissionInboxMetrics,
+                1,
+                30_000,
+                3,
+                1,
+                10,
+                delay -> delay);
+
+        reconciler.reconcile();
+
+        assertThat(jdbc.queryForMap("""
+                SELECT status, error_type
+                FROM match_engine.order_admission_inbox
+                WHERE order_id = ?
+                """, incoming.getOrderId()))
+                .containsEntry("status", "FAILED_PERMANENT")
+                .containsEntry("error_type", "PERMANENT_ORDER_BOOK_DATA_INVARIANT");
+        assertThat(orderBookService.countActiveReservations()).isZero();
     }
 
     @Test
@@ -1542,9 +1921,11 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                 orderBookService,
                 tradeExecutionRepository,
                 cleanupTaskStore,
+                reservationIssueStore,
                 reconcilerMetrics,
                 0,
-                100);
+                100,
+                3);
     }
 
     private void backdateIncomingClaim() {

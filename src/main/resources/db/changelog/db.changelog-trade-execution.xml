@@ -449,4 +449,67 @@
         </sql>
     </changeSet>
 
+    <changeSet id="match-trade-023" author="eap">
+        <comment>Bound Match recovery failures and fence reservation cleanup leases</comment>
+        <sql>
+            ALTER TABLE match_engine.reservation_cleanup_tasks
+                ADD COLUMN claim_owner VARCHAR(80),
+                ADD COLUMN claim_token UUID,
+                ADD COLUMN claim_until TIMESTAMP,
+                ADD COLUMN error_type VARCHAR(100);
+
+            ALTER TABLE match_engine.order_cancellations
+                ADD COLUMN prerequisite_wait_count INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN technical_attempt_count INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN error_type VARCHAR(100),
+                ADD COLUMN first_prerequisite_at TIMESTAMP,
+                ADD COLUMN first_technical_failure_at TIMESTAMP,
+                ADD COLUMN last_failure_at TIMESTAMP;
+
+            ALTER TABLE match_engine.order_cancellations
+                DROP CONSTRAINT ck_match_order_cancellation_status;
+            ALTER TABLE match_engine.order_cancellations
+                ADD CONSTRAINT ck_match_order_cancellation_status
+                    CHECK (status IN ('PENDING', 'IN_PROGRESS', 'CANCELLED',
+                                      'ALREADY_MATCHED', 'NOT_OPEN', 'FAILED_TERMINAL')),
+                ADD CONSTRAINT ck_match_order_cancellation_prerequisite_wait
+                    CHECK (prerequisite_wait_count &gt;= 0),
+                ADD CONSTRAINT ck_match_order_cancellation_technical_attempt
+                    CHECK (technical_attempt_count &gt;= 0);
+
+            CREATE TABLE match_engine.reservation_reconciliation_issues (
+                issue_id VARCHAR(64) PRIMARY KEY,
+                reservation_key VARCHAR(300) NOT NULL,
+                generation_identity VARCHAR(200),
+                trade_id VARCHAR(80),
+                order_id UUID,
+                user_id UUID,
+                status VARCHAR(20) NOT NULL,
+                error_type VARCHAR(100) NOT NULL,
+                payload TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_checked_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_error TEXT NOT NULL,
+                resolved_at TIMESTAMP,
+                CONSTRAINT ck_reservation_reconciliation_issue_status
+                    CHECK (status IN ('RETRYABLE', 'TERMINAL', 'RESOLVED')),
+                CONSTRAINT ck_reservation_reconciliation_issue_attempt
+                    CHECK (attempt_count &gt; 0)
+            );
+
+            CREATE INDEX idx_reservation_reconciliation_issues_open
+                ON match_engine.reservation_reconciliation_issues(status, last_seen_at, issue_id)
+                WHERE status IN ('RETRYABLE', 'TERMINAL');
+
+            CREATE INDEX idx_reservation_reconciliation_issues_key
+                ON match_engine.reservation_reconciliation_issues(reservation_key, last_seen_at);
+
+            CREATE INDEX idx_reservation_reconciliation_issues_retryable_check
+                ON match_engine.reservation_reconciliation_issues(last_checked_at, issue_id)
+                WHERE status = 'RETRYABLE';
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

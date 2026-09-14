@@ -17,6 +17,9 @@ public class MatchOrderAdmissionErrorClassifier {
             if (current instanceof OrderBookRuntimeUnavailableException) {
                 return new Classification(Category.PREREQUISITE, "PREREQUISITE_ORDER_BOOK_NOT_READY");
             }
+            if (current instanceof OrderBookDataInvariantException) {
+                return new Classification(Category.PERMANENT, "PERMANENT_ORDER_BOOK_DATA_INVARIANT");
+            }
             if (current instanceof DataIntegrityViolationException) {
                 return new Classification(Category.PERMANENT, "PERMANENT_DATA_INTEGRITY");
             }

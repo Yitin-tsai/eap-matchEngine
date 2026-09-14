@@ -203,7 +203,11 @@ class OrderCancellationCoordinatorTest {
 
         coordinator.reconcilePending();
 
-        verify(decisions).reschedule(eq(claimed), anyString(), isNull(), eq(250L));
+        verify(decisions).reschedulePrerequisite(
+                eq(claimed), anyString(),
+                eq("PREREQUISITE_ORDER_ADMISSION"),
+                org.mockito.ArgumentMatchers.contains("PROCESSING"),
+                eq(250L));
     }
 
     @Test
@@ -217,7 +221,60 @@ class OrderCancellationCoordinatorTest {
 
         coordinator.reconcilePending();
 
-        verify(decisions).reschedule(eq(claimed), anyString(), eq(failure), eq(500L));
+        verify(decisions).rescheduleTechnical(
+                eq(claimed), anyString(), eq("UNKNOWN_RETRYABLE"), eq(failure), eq(500L));
+    }
+
+    @Test
+    void reconciliation_whenTechnicalRetriesAreExhausted_shouldPersistTerminalFailure() {
+        OrderCancellationDecisionStore.Decision claimed = claimed(null, 20);
+        RuntimeException failure = new RuntimeException("redis unavailable");
+        when(decisions.claimRetryable(eq(50), anyString(), eq(30_000L)))
+                .thenReturn(List.of(claimed));
+        org.mockito.Mockito.doThrow(failure)
+                .when(orderBook).recordCancellationIntent(ORDER_ID, CANCELLATION_ID);
+
+        coordinator.reconcilePending();
+
+        verify(decisions).markTerminal(
+                eq(claimed), anyString(), eq("RETRY_EXHAUSTED_UNKNOWN_RETRYABLE"), eq(failure));
+        verify(decisions, never()).rescheduleTechnical(
+                eq(claimed), anyString(), anyString(), eq(failure), org.mockito.ArgumentMatchers.anyLong());
+    }
+
+    @Test
+    void reconciliation_whenOrderBookDataIsInvalid_shouldNotRetryPoisonState() {
+        OrderCancellationDecisionStore.Decision claimed = claimed(null, 1);
+        OrderBookDataInvariantException failure =
+                new OrderBookDataInvariantException("missing order detail");
+        when(decisions.claimRetryable(eq(50), anyString(), eq(30_000L)))
+                .thenReturn(List.of(claimed));
+        org.mockito.Mockito.doThrow(failure)
+                .when(orderBook).recordCancellationIntent(ORDER_ID, CANCELLATION_ID);
+
+        coordinator.reconcilePending();
+
+        verify(decisions).markTerminal(
+                eq(claimed), anyString(), eq("PERMANENT_CANCELLATION_INVARIANT"), eq(failure));
+    }
+
+    @Test
+    void reconciliation_whenRuntimeBecomesUnavailable_shouldWaitWithoutTechnicalAttempt() {
+        OrderCancellationDecisionStore.Decision claimed = claimed(null, 1);
+        OrderBookRuntimeUnavailableException failure =
+                new OrderBookRuntimeUnavailableException("generation recovering");
+        when(decisions.claimRetryable(eq(50), anyString(), eq(30_000L)))
+                .thenReturn(List.of(claimed));
+        org.mockito.Mockito.doThrow(failure)
+                .when(orderBook).recordCancellationIntent(ORDER_ID, CANCELLATION_ID);
+
+        coordinator.reconcilePending();
+
+        verify(decisions).reschedulePrerequisite(
+                eq(claimed), anyString(), eq("PREREQUISITE_ORDER_BOOK_NOT_READY"),
+                org.mockito.ArgumentMatchers.contains("generation recovering"), eq(250L));
+        verify(decisions, never()).rescheduleTechnical(
+                eq(claimed), anyString(), anyString(), eq(failure), org.mockito.ArgumentMatchers.anyLong());
     }
 
     @Test
@@ -394,7 +451,14 @@ class OrderCancellationCoordinatorTest {
                 pending.orderCreatedAt(),
                 pending.requestedAt(),
                 pending.decidedAt(),
-                attemptCount);
+                attemptCount,
+                0,
+                Math.max(0, attemptCount - 1),
+                null,
+                null,
+                null,
+                null,
+                null);
     }
 
 }

@@ -106,7 +106,10 @@ while not resting_order_id do
             redis.call('ZREM', buy_orderbook_key, candidate_id)
             return {'__MISSING_ORDER_DETAIL__:' .. candidate_id}
         end
-        local candidate = cjson.decode(candidate_json)
+        local decode_ok, candidate = pcall(cjson.decode, candidate_json)
+        if not decode_ok or type(candidate) ~= 'table' then
+            return {'__INVALID_ORDER_DETAIL__:' .. candidate_id}
+        end
         local candidate_user_id = candidate.u or candidate.userId
         if not candidate_user_id or candidate_user_id == cjson.null then
             return {'__INVALID_ORDER_DETAIL__:' .. candidate_id}

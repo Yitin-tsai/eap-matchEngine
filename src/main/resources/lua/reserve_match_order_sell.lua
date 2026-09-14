@@ -51,7 +51,13 @@ while not order_id do
             end
             return '__MISSING_ORDER_DETAIL__:' .. candidate_id
         end
-        local candidate = cjson.decode(candidate_json)
+        local decode_ok, candidate = pcall(cjson.decode, candidate_json)
+        if not decode_ok or type(candidate) ~= 'table' then
+            if sequence_key then
+                return {'__INVALID_ORDER_DETAIL__:' .. candidate_id}
+            end
+            return '__INVALID_ORDER_DETAIL__:' .. candidate_id
+        end
         local candidate_user_id = candidate.u or candidate.userId
         if not candidate_user_id or candidate_user_id == cjson.null then
             if sequence_key then

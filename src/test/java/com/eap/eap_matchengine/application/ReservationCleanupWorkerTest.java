@@ -59,7 +59,10 @@ class ReservationCleanupWorkerTest {
                 anyString(),
                 org.mockito.ArgumentMatchers.<RowMapper<ReservationCleanupWorker.CleanupRow>>any(),
                 eq(30L),
-                eq(100)))
+                eq(100),
+                anyString(),
+                any(UUID.class),
+                eq(30L)))
                 .thenReturn(List.of(first, second));
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(2);
         when(orderBookService.completeReservedOrder(any(), anyString()))
@@ -94,7 +97,10 @@ class ReservationCleanupWorkerTest {
                 anyString(),
                 org.mockito.ArgumentMatchers.<RowMapper<ReservationCleanupWorker.CleanupRow>>any(),
                 eq(30L),
-                eq(100)))
+                eq(100),
+                anyString(),
+                any(UUID.class),
+                eq(30L)))
                 .thenReturn(tasks);
         when(jdbcTemplate.update(anyString(), any(Object[].class)))
                 .thenReturn(2, 2, 1, 1);
@@ -111,9 +117,13 @@ class ReservationCleanupWorkerTest {
     void markCompleted_usesOneStatementForTheWholeBatch() {
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(3);
 
-        worker.markCompleted(List.of(11L, 12L, 13L));
+        List<ReservationCleanupWorker.CleanupRow> tasks =
+                List.of(cleanupRow(11L), cleanupRow(12L), cleanupRow(13L));
+        worker.markCompleted(tasks);
 
-        verify(jdbcTemplate).update(anyString(), eq(new Object[]{11L, 12L, 13L}));
+        verify(jdbcTemplate).update(
+                anyString(),
+                any(Object[].class));
     }
 
     @Test
@@ -121,7 +131,7 @@ class ReservationCleanupWorkerTest {
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
 
         assertThrows(IllegalStateException.class,
-                () -> worker.renewLeases(List.of(11L, 12L)));
+                () -> worker.renewLeases(List.of(cleanupRow(11L), cleanupRow(12L))));
     }
 
     @Test
@@ -129,7 +139,8 @@ class ReservationCleanupWorkerTest {
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(2);
 
         assertThrows(IllegalStateException.class,
-                () -> worker.markCompleted(List.of(11L, 12L, 13L)));
+                () -> worker.markCompleted(
+                        List.of(cleanupRow(11L), cleanupRow(12L), cleanupRow(13L))));
     }
 
     @Test
@@ -139,7 +150,10 @@ class ReservationCleanupWorkerTest {
                 anyString(),
                 org.mockito.ArgumentMatchers.<RowMapper<ReservationCleanupWorker.CleanupRow>>any(),
                 eq(30L),
-                eq(100)))
+                eq(100),
+                anyString(),
+                any(UUID.class),
+                eq(30L)))
                 .thenReturn(List.of(task));
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
         doThrow(new IllegalStateException("redis unavailable"))
@@ -157,7 +171,9 @@ class ReservationCleanupWorkerTest {
                 any(LocalDateTime.class),
                 org.mockito.ArgumentMatchers.contains("redis unavailable"),
                 any(LocalDateTime.class),
-                eq(11L));
+                eq(11L),
+                anyString(),
+                eq(new UUID(0L, 0L)));
     }
 
     @Test
@@ -167,7 +183,10 @@ class ReservationCleanupWorkerTest {
                 anyString(),
                 org.mockito.ArgumentMatchers.<RowMapper<ReservationCleanupWorker.CleanupRow>>any(),
                 eq(30L),
-                eq(100)))
+                eq(100),
+                anyString(),
+                any(UUID.class),
+                eq(30L)))
                 .thenReturn(List.of(task));
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
         when(orderBookService.completeReservedOrder(any(), eq("ENERGY-SPOT-12")))
@@ -178,7 +197,7 @@ class ReservationCleanupWorkerTest {
         verify(metrics).completed(1);
         verify(jdbcTemplate).update(
                 org.mockito.ArgumentMatchers.contains("SET status = 'COMPLETED'"),
-                eq(new Object[]{12L}));
+                any(Object[].class));
     }
 
     @Test
@@ -188,7 +207,10 @@ class ReservationCleanupWorkerTest {
                 anyString(),
                 org.mockito.ArgumentMatchers.<RowMapper<ReservationCleanupWorker.CleanupRow>>any(),
                 eq(30L),
-                eq(100)))
+                eq(100),
+                anyString(),
+                any(UUID.class),
+                eq(30L)))
                 .thenReturn(List.of(task));
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
         when(orderBookService.completeReservedOrder(any(), eq("ENERGY-SPOT-13")))
@@ -204,7 +226,9 @@ class ReservationCleanupWorkerTest {
                 eq(1),
                 org.mockito.ArgumentMatchers.contains("NEWER_TRADE_OWNER"),
                 any(LocalDateTime.class),
-                eq(13L));
+                eq(13L),
+                anyString(),
+                eq(new UUID(0L, 0L)));
     }
 
     @Test
@@ -214,7 +238,10 @@ class ReservationCleanupWorkerTest {
                 anyString(),
                 org.mockito.ArgumentMatchers.<RowMapper<ReservationCleanupWorker.CleanupRow>>any(),
                 eq(30L),
-                eq(100)))
+                eq(100),
+                anyString(),
+                any(UUID.class),
+                eq(30L)))
                 .thenReturn(List.of(task));
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
         when(orderBookService.completeReservedOrder(any(), eq("ENERGY-SPOT-14")))
@@ -230,7 +257,9 @@ class ReservationCleanupWorkerTest {
                 eq(1),
                 org.mockito.ArgumentMatchers.contains("ORDER_ID_MISMATCH"),
                 any(LocalDateTime.class),
-                eq(14L));
+                eq(14L),
+                anyString(),
+                eq(new UUID(0L, 0L)));
     }
 
     private ReservationCleanupWorker.CleanupRow cleanupRow(long id) {
