@@ -20,6 +20,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -31,6 +32,8 @@ class ReservationCleanupWorkerTest {
     private RedisOrderBookService orderBookService;
     @Mock
     private ReservationCleanupMetrics metrics;
+    @Mock
+    private OrderBookRuntimeGuard runtimeGuard;
 
     private ReservationCleanupWorker worker;
 
@@ -69,6 +72,18 @@ class ReservationCleanupWorkerTest {
         verify(orderBookService).completeReservedOrder(any(), eq("ENERGY-SPOT-2"));
         verify(jdbcTemplate, times(2)).update(anyString(), any(Object[].class));
         verify(metrics).completed(2);
+    }
+
+    @Test
+    void recoveringRuntime_shouldNotClaimCleanupTasksOrConsumeAttempt() {
+        worker = new ReservationCleanupWorker(
+                jdbcTemplate, orderBookService, metrics, runtimeGuard,
+                100, 10, 100, 30_000, 30, 2);
+        when(runtimeGuard.isReady()).thenReturn(false);
+
+        org.assertj.core.api.Assertions.assertThat(worker.cleanupOnce()).isZero();
+
+        verifyNoInteractions(jdbcTemplate, orderBookService);
     }
 
     @Test

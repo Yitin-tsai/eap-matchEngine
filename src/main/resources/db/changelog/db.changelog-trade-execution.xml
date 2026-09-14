@@ -421,4 +421,32 @@
         </sql>
     </changeSet>
 
+    <changeSet id="match-trade-022" author="eap">
+        <comment>Persist the authoritative CDA Redis order-book generation and recovery audit state</comment>
+        <sql>
+            CREATE TABLE match_engine.order_book_runtime_control (
+                shard_id VARCHAR(40) PRIMARY KEY,
+                state VARCHAR(20) NOT NULL,
+                fence_epoch BIGINT NOT NULL,
+                generation UUID NOT NULL,
+                redis_run_id VARCHAR(80),
+                version BIGINT NOT NULL DEFAULT 0,
+                transition_reason VARCHAR(500) NOT NULL,
+                verification_manifest_id VARCHAR(120),
+                verification_manifest TEXT,
+                verified_by VARCHAR(120),
+                transitioned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_order_book_runtime_state
+                    CHECK (state IN ('RECOVERING', 'READY')),
+                CONSTRAINT ck_order_book_runtime_epoch
+                    CHECK (fence_epoch &gt; 0),
+                CONSTRAINT ck_order_book_runtime_version
+                    CHECK (version &gt;= 0),
+                CONSTRAINT ck_order_book_runtime_ready_identity
+                    CHECK (state &lt;&gt; 'READY' OR redis_run_id IS NOT NULL)
+            );
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

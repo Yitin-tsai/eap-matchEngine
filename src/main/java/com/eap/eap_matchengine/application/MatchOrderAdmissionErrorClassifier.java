@@ -14,6 +14,9 @@ public class MatchOrderAdmissionErrorClassifier {
             if (current instanceof MatchOrderAdmissionPrerequisiteNotReadyException) {
                 return new Classification(Category.PREREQUISITE, "PREREQUISITE_RECOVERY_PENDING");
             }
+            if (current instanceof OrderBookRuntimeUnavailableException) {
+                return new Classification(Category.PREREQUISITE, "PREREQUISITE_ORDER_BOOK_NOT_READY");
+            }
             if (current instanceof DataIntegrityViolationException) {
                 return new Classification(Category.PERMANENT, "PERMANENT_DATA_INTEGRITY");
             }

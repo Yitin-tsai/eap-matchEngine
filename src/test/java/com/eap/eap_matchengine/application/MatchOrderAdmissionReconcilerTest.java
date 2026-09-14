@@ -24,6 +24,7 @@ class MatchOrderAdmissionReconcilerTest {
     @Mock MatchOrderAdmissionProcessor processor;
     @Mock MatchOrderAdmissionErrorClassifier classifier;
     @Mock MatchOrderAdmissionInboxMetrics metrics;
+    @Mock OrderBookRuntimeGuard runtimeGuard;
 
     private MatchOrderAdmissionReconciler reconciler;
 
@@ -46,6 +47,20 @@ class MatchOrderAdmissionReconcilerTest {
         verify(processor).process(entry.event());
         verify(inbox).markApplied(eq(entry), anyString());
         verify(metrics).applied();
+    }
+
+    @Test
+    void recoveringRuntime_shouldNotClaimInboxOrConsumeAttempt() {
+        reconciler = new MatchOrderAdmissionReconciler(
+                inbox, processor, classifier, metrics, runtimeGuard,
+                10, 30_000, 5, 250, 30_000, base -> base);
+        when(runtimeGuard.isReady()).thenReturn(false);
+
+        reconciler.reconcile();
+
+        verify(inbox, never()).claimRetryable(
+                org.mockito.ArgumentMatchers.anyInt(), anyString(), org.mockito.ArgumentMatchers.anyLong());
+        verify(processor, never()).process(org.mockito.ArgumentMatchers.any());
     }
 
     @Test
@@ -81,15 +96,15 @@ class MatchOrderAdmissionReconcilerTest {
         when(classifier.classify(failure)).thenReturn(new MatchOrderAdmissionErrorClassifier.Classification(
                 MatchOrderAdmissionErrorClassifier.Category.PREREQUISITE,
                 "PREREQUISITE_RECOVERY_PENDING"));
-        when(inbox.reschedule(
-                eq(entry), anyString(), eq("PENDING_PREREQUISITE"),
+        when(inbox.reschedulePrerequisite(
+                eq(entry), anyString(),
                 eq("PREREQUISITE_RECOVERY_PENDING"), eq(failure), eq(250L)))
                 .thenReturn(true);
 
         reconciler.reconcile();
 
-        verify(inbox).reschedule(
-                eq(entry), anyString(), eq("PENDING_PREREQUISITE"),
+        verify(inbox).reschedulePrerequisite(
+                eq(entry), anyString(),
                 eq("PREREQUISITE_RECOVERY_PENDING"), eq(failure), eq(250L));
         verify(metrics).prerequisiteScheduled();
         verify(inbox, never()).markPermanent(eq(entry), anyString(), anyString(), eq(failure));

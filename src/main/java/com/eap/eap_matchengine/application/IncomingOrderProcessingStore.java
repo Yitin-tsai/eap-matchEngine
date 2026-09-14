@@ -3,6 +3,7 @@ package com.eap.eap_matchengine.application;
 import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -42,15 +43,43 @@ public class IncomingOrderProcessingStore {
     private static final String ORDER_PREFIX = "order:";
     private static final String RESERVATION_PREFIX = "order:reservation:";
     private static final DefaultRedisScript<Long> MARK_COMPLETED_SCRIPT = new DefaultRedisScript<>("""
+            local expected_run_id = string.match(ARGV[3], '|([^|]+)$')
+            local actual_run_id = string.match(redis.call('INFO', 'server'), 'run_id:([^\\r\\n]+)')
+            if redis.call('GET', KEYS[3]) ~= ARGV[3] or actual_run_id ~= expected_run_id then
+                return -1
+            end
             redis.call('SETBIT', KEYS[1], ARGV[1], 1)
             redis.call('HDEL', KEYS[2], ARGV[2])
             return 1
             """, Long.class);
+    private static final DefaultRedisScript<Long> LEGACY_MARK_COMPLETED_SCRIPT = new DefaultRedisScript<>("""
+            redis.call('SETBIT', KEYS[1], ARGV[1], 1)
+            redis.call('HDEL', KEYS[2], ARGV[2])
+            return 1
+            """, Long.class);
+    private static final DefaultRedisScript<Long> REPLACE_WITH_CLAIM_SCRIPT = new DefaultRedisScript<>("""
+            local expected_run_id = string.match(ARGV[3], '|([^|]+)$')
+            local actual_run_id = string.match(redis.call('INFO', 'server'), 'run_id:([^\\r\\n]+)')
+            if redis.call('GET', KEYS[2]) ~= ARGV[3] or actual_run_id ~= expected_run_id then
+                return -1
+            end
+            redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+            return 1
+            """, Long.class);
 
     private final RedisTemplate<String, String> redisTemplate;
+    private final OrderBookRuntimeGuard runtimeGuard;
 
     public IncomingOrderProcessingStore(RedisTemplate<String, String> redisTemplate) {
+        this(redisTemplate, null);
+    }
+
+    @Autowired
+    public IncomingOrderProcessingStore(
+            RedisTemplate<String, String> redisTemplate,
+            OrderBookRuntimeGuard runtimeGuard) {
         this.redisTemplate = redisTemplate;
+        this.runtimeGuard = runtimeGuard;
     }
 
     State state(UUID orderId) {
@@ -98,18 +127,43 @@ public class IncomingOrderProcessingStore {
     }
 
     void replaceWithClaim(Claim claim) {
-        redisTemplate.opsForHash().put(
-                claim.stateHashKey(),
+        if (runtimeGuard == null) {
+            redisTemplate.opsForHash().put(
+                    claim.stateHashKey(),
+                    claim.orderIdField(),
+                    serializedProcessingState(claim, System.currentTimeMillis()));
+            return;
+        }
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeGuard.requireReady();
+        Long result = redisTemplate.execute(
+                REPLACE_WITH_CLAIM_SCRIPT,
+                List.of(claim.stateHashKey(), OrderBookRuntimeGuard.SENTINEL_KEY),
                 claim.orderIdField(),
-                serializedProcessingState(claim, System.currentTimeMillis()));
+                serializedProcessingState(claim, System.currentTimeMillis()),
+                runtime.expectedSentinel());
+        requireFenceAccepted(result, "replace incoming-order processing claim");
     }
 
     void markCompleted(OrderAssetReservationSucceededEvent order) {
-        redisTemplate.execute(
+        if (runtimeGuard == null) {
+            redisTemplate.execute(
+                    LEGACY_MARK_COMPLETED_SCRIPT,
+                    List.of(completedBitmapKey(order), stateHashKey(order.getOrderId())),
+                    String.valueOf(completedBitOffset(order)),
+                    order.getOrderId().toString());
+            return;
+        }
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeGuard.requireReady();
+        Long result = redisTemplate.execute(
                 MARK_COMPLETED_SCRIPT,
-                List.of(completedBitmapKey(order), stateHashKey(order.getOrderId())),
+                List.of(
+                        completedBitmapKey(order),
+                        stateHashKey(order.getOrderId()),
+                        OrderBookRuntimeGuard.SENTINEL_KEY),
                 String.valueOf(completedBitOffset(order)),
-                order.getOrderId().toString());
+                order.getOrderId().toString(),
+                runtime.expectedSentinel());
+        requireFenceAccepted(result, "complete incoming-order processing claim");
     }
 
     boolean isCompleted(OrderAssetReservationSucceededEvent order) {
@@ -153,5 +207,15 @@ public class IncomingOrderProcessingStore {
 
     private String serializedProcessingState(Claim claim, long startedAtEpochMillis) {
         return Status.PROCESSING.name() + ":" + claim.token() + ":" + startedAtEpochMillis;
+    }
+
+    private void requireFenceAccepted(Long result, String operation) {
+        if (!Long.valueOf(1L).equals(result)) {
+            if (runtimeGuard != null) {
+                runtimeGuard.refresh();
+            }
+            throw new OrderBookRuntimeUnavailableException(
+                    "CDA order-book generation rejected operation: " + operation);
+        }
     }
 }

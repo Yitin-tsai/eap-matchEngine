@@ -5,6 +5,7 @@ import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository
 import com.eap.eap_matchengine.domain.entity.TradeExecutionEntity;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -33,20 +34,40 @@ public class ReservationReconciler {
     private final TradeExecutionRepository tradeExecutionRepository;
     private final ReservationCleanupTaskStore cleanupTaskStore;
     private final ReservationReconcilerMetrics metrics;
+    private final OrderBookRuntimeGuard runtimeGuard;
     private final Duration orphanThreshold;
     private final int batchSize;
 
+    @Autowired
     public ReservationReconciler(
             RedisOrderBookService orderBookService,
             TradeExecutionRepository tradeExecutionRepository,
             ReservationCleanupTaskStore cleanupTaskStore,
             ReservationReconcilerMetrics metrics,
+            OrderBookRuntimeGuard runtimeGuard,
             @Value("${eap.match-engine.reservation-reconciler.orphan-threshold-seconds:30}") long orphanThresholdSeconds,
             @Value("${eap.match-engine.reservation-reconciler.batch-size:100}") int batchSize) {
         this.orderBookService = orderBookService;
         this.tradeExecutionRepository = tradeExecutionRepository;
         this.cleanupTaskStore = cleanupTaskStore;
         this.metrics = metrics;
+        this.runtimeGuard = runtimeGuard;
+        this.orphanThreshold = Duration.ofSeconds(orphanThresholdSeconds);
+        this.batchSize = batchSize;
+    }
+
+    ReservationReconciler(
+            RedisOrderBookService orderBookService,
+            TradeExecutionRepository tradeExecutionRepository,
+            ReservationCleanupTaskStore cleanupTaskStore,
+            ReservationReconcilerMetrics metrics,
+            long orphanThresholdSeconds,
+            int batchSize) {
+        this.orderBookService = orderBookService;
+        this.tradeExecutionRepository = tradeExecutionRepository;
+        this.cleanupTaskStore = cleanupTaskStore;
+        this.metrics = metrics;
+        this.runtimeGuard = null;
         this.orphanThreshold = Duration.ofSeconds(orphanThresholdSeconds);
         this.batchSize = batchSize;
     }
@@ -59,6 +80,9 @@ public class ReservationReconciler {
     }
 
     int reconcileOnce() {
+        if (runtimeGuard != null && !runtimeGuard.isReady()) {
+            return 0;
+        }
         List<RedisOrderBookService.ReservationSnapshot> reservations =
                 orderBookService.scanReservations(batchSize);
         List<RedisOrderBookService.ReservationSnapshot> readyReservations = new ArrayList<>();
@@ -109,6 +133,8 @@ public class ReservationReconciler {
             log.warn("Released orphan MatchEngine reservation without durable trade: orderId={}, key={}, amount={}",
                     reservedOrder.getOrderId(), reservation.key(), reservedOrder.getAmount());
             return 1;
+        } catch (OrderBookRuntimeUnavailableException unavailable) {
+            throw unavailable;
         } catch (Exception e) {
             metrics.failure();
             log.error("Failed to release orphan MatchEngine reservation: orderId={}, key={}",
@@ -142,6 +168,8 @@ public class ReservationReconciler {
                         trade.getTradeId(), reservedOrder.getOrderId());
             }
             return 1;
+        } catch (OrderBookRuntimeUnavailableException unavailable) {
+            throw unavailable;
         } catch (Exception e) {
             metrics.failure();
             log.error("Failed to converge MatchEngine reservation after durable trade: tradeId={}, orderId={}",

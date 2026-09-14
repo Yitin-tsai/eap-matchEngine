@@ -10,6 +10,7 @@
 -- KEYS[6]: incoming-order processing state Hash key (guarded processing only)
 -- KEYS[7]: incoming-order completed bitmap key (guarded processing only)
 -- KEYS[8]: incoming-order cancellation intent key
+-- KEYS[9]: CDA order-book generation sentinel
 --
 -- ARGV[1]: min composite score (sell order's price limit)
 -- ARGV[2]: reserved timestamp epoch millis
@@ -22,6 +23,7 @@
 -- ARGV[9]: completed bitmap bit offset (guarded processing only)
 -- ARGV[10]: market ID used to correlate the reservation with its durable trade
 -- ARGV[11]: incoming user ID (self-trade prevention)
+-- ARGV[12]: expected generation sentinel (empty only for isolated legacy tests)
 --
 -- Returns:
 --   {'__MATCH__', resting order JSON, match ID}
@@ -50,6 +52,12 @@ local incoming_score = tonumber(ARGV[4])
 local incoming_order_json = ARGV[5]
 local user_order_index_enabled = ARGV[6] ~= '0'
 local incoming_user_id = ARGV[11]
+
+local expected_run_id = string.match(ARGV[12], '|([^|]+)$')
+local actual_run_id = string.match(redis.call('INFO', 'server'), 'run_id:([^\r\n]+)')
+if ARGV[12] ~= '' and (redis.call('GET', KEYS[9]) ~= ARGV[12] or actual_run_id ~= expected_run_id) then
+    return {'__GENERATION_MISMATCH__'}
+end
 
 local guarded = ARGV[7] ~= ''
 if guarded then

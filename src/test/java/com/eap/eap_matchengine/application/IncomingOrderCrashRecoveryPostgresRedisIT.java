@@ -5,6 +5,7 @@ import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.common.event.OrderCancellationResultEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
@@ -23,8 +24,16 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -40,7 +49,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
                 "eap.match-engine.trade-checkpoint-relay.enabled=false",
                 "eap.match-engine.order-admission-inbox.enabled=false",
                 "eap.match-engine.reservation-reconciler.enabled=false",
-                "eap.match-engine.reservation-cleanup.enabled=false"
+                "eap.match-engine.reservation-cleanup.enabled=false",
+                "eap.match-engine.order-cancellation.reconcile-initial-delay-ms=3600000",
+                "eap.match-engine.orderbook-runtime.monitor-initial-delay-ms=3600000",
+                "eap.match-engine.orderbook-runtime.max-snapshot-age-ms=3600000"
         })
 @EnabledIfSystemProperty(named = "eap.integration.crash-recovery", matches = "true")
 class IncomingOrderCrashRecoveryPostgresRedisIT {
@@ -99,6 +111,16 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     private MatchOrderAdmissionProcessor matchOrderAdmissionProcessor;
     @Autowired
     private MatchOrderAdmissionInbox matchOrderAdmissionInbox;
+    @Autowired
+    private OrderBookRuntimeAdminService orderBookRuntimeAdmin;
+    @Autowired
+    private OrderBookRuntimeGuard orderBookRuntimeGuard;
+    @Autowired
+    private OrderBookRuntimeControlStore orderBookRuntimeControls;
+    @Autowired
+    private RedisOrderBookManifestVerifier orderBookManifestVerifier;
+    @Autowired
+    private ObjectMapper objectMapper;
 
     @BeforeEach
     void resetState() {
@@ -108,12 +130,674 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                     match_engine.order_cancellations,
                     match_engine.reservation_cleanup_tasks,
                     match_engine.trade_outbox,
-                    match_engine.trade_executions
+                    match_engine.trade_executions,
+                    match_engine.order_book_runtime_control
                 RESTART IDENTITY CASCADE
                 """);
         try (var connection = redisConnectionFactory.getConnection()) {
             connection.serverCommands().flushDb();
         }
+        orderBookRuntimeAdmin.initializeEmpty("integration-test", "fresh test fixture");
+    }
+
+    @Test
+    void generationMismatch_shouldFailClosedBeforeAnyOrderBookMutation() throws Exception {
+        OrderAssetReservationSucceededEvent order = order("BUY", 501, 1L, 3);
+        redisTemplate.opsForValue().set(OrderBookRuntimeGuard.SENTINEL_KEY, "tampered-generation");
+
+        assertThatThrownBy(() -> orderBookService.addOrder(order))
+                .isInstanceOf(OrderBookRuntimeUnavailableException.class)
+                .hasMessageContaining("generation");
+
+        assertThat(redisTemplate.hasKey("order:" + order.getOrderId())).isFalse();
+        assertThat(redisTemplate.opsForZSet().size("orderbook:" + MARKET_ID + ":buy")).isZero();
+        assertThat(orderBookRuntimeGuard.isReady()).isFalse();
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("RECOVERING");
+    }
+
+    @Test
+    void redisFullLoss_shouldKeepCancellationPendingAndContinueDurableInboxIntake() {
+        try (var connection = redisConnectionFactory.getConnection()) {
+            connection.serverCommands().flushDb();
+        }
+        orderBookRuntimeGuard.refresh();
+
+        OrderAssetReservationSucceededEvent order = order("BUY", 501, 1L, 3);
+        assertThat(matchOrderAdmissionInbox.receive(order))
+                .isEqualTo(MatchOrderAdmissionInbox.ReceiveOutcome.ACCEPTED);
+
+        UUID cancellationId = UUID.randomUUID();
+        cancellationCoordinator.request(OrderCancellationRequestedEvent.builder()
+                .cancellationId(cancellationId)
+                .orderId(order.getOrderId())
+                .userId(order.getUserId())
+                .originalAmount(order.getAmount())
+                .requestedAt(LocalDateTime.now())
+                .build());
+
+        assertThat(jdbc.queryForObject("""
+                SELECT status FROM match_engine.order_cancellations
+                WHERE cancellation_id = ?
+                """, String.class, cancellationId)).isEqualTo("PENDING");
+        assertThat(jdbc.queryForObject("""
+                SELECT status FROM match_engine.order_admission_inbox
+                WHERE order_id = ?
+                """, String.class, order.getOrderId())).isEqualTo("PENDING");
+        assertThat(redisTemplate.hasKey("order:cancellation-intent:" + order.getOrderId())).isFalse();
+    }
+
+    @Test
+    void redisRunIdMismatch_shouldPersistNewRecoveryGeneration() {
+        UUID readyGeneration = jdbc.queryForObject("""
+                SELECT generation FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, UUID.class);
+        jdbc.update("""
+                UPDATE match_engine.order_book_runtime_control
+                SET redis_run_id = 'stale-run-id'
+                WHERE shard_id = 'CDA_GLOBAL'
+                """);
+
+        orderBookRuntimeGuard.refresh();
+
+        assertThat(orderBookRuntimeGuard.isReady()).isFalse();
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("RECOVERING");
+        assertThat(jdbc.queryForObject("""
+                SELECT generation FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, UUID.class)).isNotEqualTo(readyGeneration);
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isFalse();
+    }
+
+    @Test
+    void runtimeStatus_afterRedisLoss_shouldSynchronouslyReportNotReady() {
+        assertThat(orderBookRuntimeAdmin.status()).containsEntry("localReady", true);
+        try (var connection = redisConnectionFactory.getConnection()) {
+            connection.serverCommands().flushDb();
+        }
+
+        assertThat(orderBookRuntimeAdmin.status()).containsEntry("localReady", false);
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("RECOVERING");
+    }
+
+    @Test
+    void runtimeManifestInspection_withUntrustedCompletedBitmap_shouldReportWithoutClosingRuntime() {
+        redisTemplate.opsForValue().setBit(
+                "match:incoming-order:completed:" + MARKET_ID + ":0", 0L, true);
+
+        Map<String, Object> status = orderBookRuntimeAdmin.inspectReadyManifest();
+
+        assertThat(status).containsEntry("localReady", true);
+        assertThat(status).containsKey("redisManifestError");
+        assertThat(status.get("redisManifestError").toString())
+                .contains("bitmap keys do not match");
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isTrue();
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("READY");
+    }
+
+    @Test
+    void runtimeStatus_withActiveReservationWindow_shouldRemainReadyWithoutFullInspection() throws Exception {
+        OrderAssetReservationSucceededEvent resting = order("SELL", 502, 1L, 1);
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 2L, 1);
+        orderBookService.addOrder(resting);
+        assertThat(orderBookService.reserveBestMatchOrderLua(incoming)).isNotNull();
+
+        Map<String, Object> status = orderBookRuntimeAdmin.status();
+
+        assertThat(status).containsEntry("localReady", true);
+        assertThat(status).doesNotContainKeys("redisManifest", "redisManifestError");
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isTrue();
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("READY");
+        assertThat(orderBookRuntimeAdmin.inspectReadyManifest())
+                .containsEntry("localReady", true)
+                .containsKey("redisManifestError");
+    }
+
+    @Test
+    void runtimeStatus_withCompletedBitmapBeforeInboxApplied_shouldRemainReady() {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 1L, 1);
+        matchOrderAdmissionInbox.receive(incoming);
+        redisTemplate.opsForValue().setBit(
+                "match:incoming-order:completed:" + MARKET_ID + ":0",
+                incoming.getMarketSequence() - 1,
+                true);
+
+        Map<String, Object> status = orderBookRuntimeAdmin.status();
+
+        assertThat(status).containsEntry("localReady", true);
+        assertThat(status).doesNotContainKeys("redisManifest", "redisManifestError");
+        assertThat(orderBookRuntimeAdmin.inspectReadyManifest())
+                .containsEntry("localReady", true)
+                .containsKey("redisManifestError");
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isTrue();
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("READY");
+    }
+
+    @Test
+    void recoveryActivation_withStrayCompletedBitmap_shouldRemainFailClosed() {
+        enterRecovery();
+        redisTemplate.opsForValue().setBit(
+                "match:incoming-order:completed:" + MARKET_ID + ":0", 0L, true);
+
+        assertThatThrownBy(() -> orderBookRuntimeAdmin.activateRebuilt(
+                activationRequest(
+                        "manifest-stray-completed-bit",
+                        0L,
+                        0L,
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        "integration-test",
+                        "reject unproven completed admission")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("bitmap keys do not match");
+
+        assertThat(orderBookRuntimeGuard.isReady()).isFalse();
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isFalse();
+    }
+
+    @Test
+    void recoveryActivation_withMissingCompletedBitmap_shouldRemainFailClosed() {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 1L, 7);
+        matchOrderAdmissionInbox.receive(incoming);
+        jdbc.update("""
+                UPDATE match_engine.order_admission_inbox
+                SET status = 'APPLIED', applied_at = CURRENT_TIMESTAMP
+                WHERE order_id = ?
+                """, incoming.getOrderId());
+        enterRecovery();
+
+        assertThatThrownBy(() -> orderBookRuntimeAdmin.activateRebuilt(
+                activationRequest(
+                        "manifest-missing-completed-bit",
+                        0L,
+                        0L,
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        "integration-test",
+                        "reject incomplete idempotency projection")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("bitmap keys do not match");
+
+        assertThat(orderBookRuntimeGuard.isReady()).isFalse();
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isFalse();
+    }
+
+    @Test
+    void recoveryActivation_withSameTokenConcurrently_shouldHaveOneWinner() throws Exception {
+        enterRecovery();
+        RedisOrderBookManifestVerifier.Manifest manifest =
+                orderBookManifestVerifier.inspect(Map.of());
+        OrderBookRuntimeAdminService.ActivationRequest request = activationRequest(
+                "manifest-concurrent",
+                manifest.openOrderCount(),
+                manifest.openQuantity(),
+                manifest.identityDigest(),
+                "integration-test",
+                "serialize concurrent activation");
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger successes = new AtomicInteger();
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+        var executor = Executors.newFixedThreadPool(2);
+        try {
+            var first = executor.submit(() -> activateAfter(start, request, successes, failures));
+            var second = executor.submit(() -> activateAfter(start, request, successes, failures));
+            start.countDown();
+            first.get(10, TimeUnit.SECONDS);
+            second.get(10, TimeUnit.SECONDS);
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertThat(successes.get()).isEqualTo(1);
+        assertThat(failures).hasSize(1);
+        assertThat(failures.get(0).getMessage())
+                .containsAnyOf("not RECOVERING", "Stale order-book recovery token");
+        assertThat(orderBookRuntimeGuard.isReady()).isTrue();
+    }
+
+    @Test
+    void recoveryActivation_shouldWaitForCancellationDurableIntakeAndRejectMissingIntent() throws Exception {
+        enterRecovery();
+        RedisOrderBookManifestVerifier.Manifest manifest = orderBookManifestVerifier.inspect(Map.of());
+        OrderBookRuntimeAdminService.ActivationRequest activation = activationRequest(
+                "manifest-cancellation-intake-race",
+                manifest.openOrderCount(),
+                manifest.openQuantity(),
+                manifest.identityDigest(),
+                "integration-test",
+                "serialize cancellation intake with activation");
+        OrderCancellationRequestedEvent cancellation = cancellationRequest(UUID.randomUUID(), UUID.randomUUID());
+        CountDownLatch cancellationCommitted = new CountDownLatch(1);
+        CountDownLatch releaseCancellationIntake = new CountDownLatch(1);
+        var executor = Executors.newFixedThreadPool(2);
+        try {
+            var intake = executor.submit(() -> orderBookRuntimeControls.withCancellationIntakeLock(() -> {
+                cancellationDecisions.begin(cancellation, null);
+                cancellationCommitted.countDown();
+                await(releaseCancellationIntake, "release cancellation intake");
+                return null;
+            }));
+            assertThat(cancellationCommitted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            var activationAttempt = executor.submit(() -> orderBookRuntimeAdmin.activateRebuilt(activation));
+            awaitAdvisoryLockWaiter();
+            assertThat(activationAttempt.isDone()).isFalse();
+
+            releaseCancellationIntake.countDown();
+            intake.get(5, TimeUnit.SECONDS);
+            assertThatThrownBy(() -> activationAttempt.get(5, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasRootCauseInstanceOf(IllegalStateException.class)
+                    .hasRootCauseMessage("Redis pending cancellation intent mismatch: orderId="
+                            + cancellation.getOrderId());
+        } finally {
+            releaseCancellationIntake.countDown();
+            executor.shutdownNow();
+        }
+
+        assertThat(orderBookRuntimeGuard.isReady()).isFalse();
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isFalse();
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("RECOVERING");
+    }
+
+    @Test
+    void manifest_shouldRequireIntentForPendingDurableFactEvenWithoutPendingSnapshot() {
+        enterRecovery();
+        OrderCancellationRequestedEvent cancellation = cancellationRequest(UUID.randomUUID(), UUID.randomUUID());
+        cancellationDecisions.begin(cancellation, null);
+
+        assertThatThrownBy(() -> orderBookManifestVerifier.inspect(
+                Map.of(),
+                List.of(),
+                orderBookRuntimeControls.cancellationFacts()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("Redis pending cancellation intent mismatch: orderId=" + cancellation.getOrderId());
+    }
+
+    @Test
+    void completedAdmissionBitmap_shouldExactlyMatchDurableAppliedInbox() {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 1L, 7);
+        matchOrderAdmissionInbox.receive(incoming);
+        MatchOrderAdmissionInbox.InboxEntry entry =
+                matchOrderAdmissionInbox.claimRetryable(1, "worker-a", 30_000).get(0);
+        matchOrderAdmissionProcessor.process(entry.event());
+        assertThat(matchOrderAdmissionInbox.markApplied(entry, "worker-a")).isTrue();
+
+        RedisOrderBookManifestVerifier.Manifest manifest = orderBookManifestVerifier.inspect(
+                Map.of(),
+                List.of(new OrderBookRuntimeControlStore.CompletedAdmission(
+                        MARKET_ID, incoming.getMarketSequence())));
+
+        assertThat(manifest.completedAdmissionCount()).isEqualTo(1);
+        assertThat(orderBookRuntimeAdmin.status()).containsEntry("localReady", true);
+    }
+
+    @Test
+    void cancellationMarker_withVisibleOrder_shouldFailStatusAndRecoveryActivation() throws Exception {
+        OrderAssetReservationSucceededEvent open = order("BUY", 501, 1L, 7);
+        orderBookService.addOrder(open);
+        UUID cancellationId = UUID.randomUUID();
+        cancellationCoordinator.request(OrderCancellationRequestedEvent.builder()
+                .cancellationId(cancellationId)
+                .orderId(open.getOrderId())
+                .userId(open.getUserId())
+                .originalAmount(open.getAmount())
+                .requestedAt(LocalDateTime.now())
+                .build());
+
+        assertThat(orderBookRuntimeAdmin.status()).containsEntry("localReady", true);
+
+        // Simulate a corrupt rebuild that restores an order already removed by the
+        // durable cancellation marker.
+        orderBookService.addOrder(open);
+        Map<String, Object> rejectedStatus = orderBookRuntimeAdmin.inspectReadyManifest();
+
+        assertThat(rejectedStatus).containsEntry("localReady", true);
+        assertThat(rejectedStatus.get("redisManifestError").toString())
+                .contains("cannot coexist with a visible order");
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("READY");
+
+        orderBookRuntimeGuard.rejectCurrentGeneration("integration-test recovery", null);
+
+        assertThatThrownBy(() -> orderBookRuntimeAdmin.activateRebuilt(
+                activationRequest(
+                        "manifest-marker-visible-order",
+                        1L,
+                        open.getAmount(),
+                        "not-reached-because-marker-is-invalid",
+                        "integration-test",
+                        "reject marker and visible order")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cannot coexist with a visible order");
+    }
+
+    @Test
+    void expiredCancellationMarker_withDurableCompletedDecisionAndVisibleOrder_shouldFailClosed() throws Exception {
+        OrderAssetReservationSucceededEvent open = order("BUY", 501, 1L, 7);
+        orderBookService.addOrder(open);
+        UUID cancellationId = UUID.randomUUID();
+        cancellationCoordinator.request(cancellationRequest(open, cancellationId));
+        assertThat(cancellationDecisions.find(cancellationId).status())
+                .isEqualTo(OrderCancellationResultEvent.CANCELLED);
+
+        // Model TTL expiry: Redis no longer has a marker to expose the conflict, so
+        // the durable completed decision itself must still fence a corrupt rebuild.
+        redisTemplate.delete("order:cancellation:" + open.getOrderId());
+        redisTemplate.delete("order:cancellation-intent:" + open.getOrderId());
+        orderBookService.addOrder(open);
+
+        Map<String, Object> status = orderBookRuntimeAdmin.inspectReadyManifest();
+
+        assertThat(status).containsEntry("localReady", true);
+        assertThat(status.get("redisManifestError").toString())
+                .contains("Durable completed cancellation cannot coexist with a visible order")
+                .contains(open.getOrderId().toString());
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isTrue();
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("READY");
+    }
+
+    @Test
+    void stalePreResetControl_shouldNotDemoteReinitializedGeneration() {
+        OrderBookRuntimeControlStore.Control stale = orderBookRuntimeControls.find();
+        jdbc.execute("TRUNCATE TABLE match_engine.order_book_runtime_control");
+        redisTemplate.delete(OrderBookRuntimeGuard.SENTINEL_KEY);
+
+        orderBookRuntimeAdmin.initializeEmpty(
+                "integration-test", "reinitialize after isolated load-test reset");
+        OrderBookRuntimeControlStore.Control reinitialized = orderBookRuntimeControls.find();
+        assertThat(reinitialized.version()).isEqualTo(stale.version());
+        assertThat(reinitialized.generation()).isNotEqualTo(stale.generation());
+
+        OrderBookRuntimeControlStore.Control afterStaleCas = orderBookRuntimeControls.beginRecovery(
+                stale, UUID.randomUUID(), "stale process observed an old Redis generation");
+
+        assertThat(afterStaleCas.state()).isEqualTo(OrderBookRuntimeControlStore.State.READY);
+        assertThat(afterStaleCas.generation()).isEqualTo(reinitialized.generation());
+        assertThat(afterStaleCas.version()).isEqualTo(reinitialized.version());
+        assertThat(orderBookRuntimeGuard.isReady()).isTrue();
+    }
+
+    @Test
+    void rebuildManifest_shouldRejectWrongMarketIndex() throws Exception {
+        enterRecovery();
+        OrderAssetReservationSucceededEvent rebuilt = order("SELL", 701, 7L, 4);
+        seedRebuiltOrder(rebuilt, "WRONG-MARKET", "sell", scoreFor(rebuilt), rebuilt);
+
+        assertThatThrownBy(() -> orderBookManifestVerifier.inspect(java.util.Map.of()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("wrong market/side");
+    }
+
+    @Test
+    void rebuildManifest_shouldRejectWrongSideIndex() throws Exception {
+        enterRecovery();
+        OrderAssetReservationSucceededEvent rebuilt = order("SELL", 701, 7L, 4);
+        seedRebuiltOrder(rebuilt, MARKET_ID, "buy", scoreFor(rebuilt), rebuilt);
+
+        assertThatThrownBy(() -> orderBookManifestVerifier.inspect(java.util.Map.of()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("wrong market/side");
+    }
+
+    @Test
+    void rebuildManifest_shouldRejectWrongCompositeScore() throws Exception {
+        enterRecovery();
+        OrderAssetReservationSucceededEvent rebuilt = order("BUY", 701, 7L, 4);
+        seedRebuiltOrder(rebuilt, MARKET_ID, "buy", scoreFor(rebuilt) + 1, rebuilt);
+
+        assertThatThrownBy(() -> orderBookManifestVerifier.inspect(java.util.Map.of()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("score mismatch");
+    }
+
+    @Test
+    void rebuildManifest_shouldRejectMemberAndDetailOrderIdMismatch() throws Exception {
+        enterRecovery();
+        OrderAssetReservationSucceededEvent member = order("SELL", 701, 7L, 4);
+        OrderAssetReservationSucceededEvent differentDetail = order("SELL", 702, 8L, 4);
+        seedRebuiltOrder(member, MARKET_ID, "sell", scoreFor(member), differentDetail);
+
+        assertThatThrownBy(() -> orderBookManifestVerifier.inspect(java.util.Map.of()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("identity mismatch");
+    }
+
+    @Test
+    void recoveryActivation_withUnverifiedManifest_shouldRemainFailClosed() {
+        try (var connection = redisConnectionFactory.getConnection()) {
+            connection.serverCommands().flushDb();
+        }
+        orderBookRuntimeGuard.refresh();
+
+        assertThatThrownBy(() -> orderBookRuntimeAdmin.activateRebuilt(
+                activationRequest(
+                        "manifest-stale",
+                        1L,
+                        3L,
+                        "not-the-empty-digest",
+                        "integration-test",
+                        "reject stale rebuild")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("manifest mismatch");
+
+        assertThat(orderBookRuntimeGuard.isReady()).isFalse();
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isFalse();
+        assertThat(jdbc.queryForObject("""
+                SELECT state FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("RECOVERING");
+    }
+
+    @Test
+    void recoveryActivation_withStaleOperatorToken_shouldRemainFailClosed() {
+        enterRecovery();
+        RedisOrderBookManifestVerifier.Manifest manifest =
+                orderBookManifestVerifier.inspect(java.util.Map.of());
+        OrderBookRuntimeAdminService.ActivationRequest stale = activationRequest(
+                "manifest-stale-token",
+                manifest.openOrderCount(),
+                manifest.openQuantity(),
+                manifest.identityDigest(),
+                "integration-test",
+                "stale token");
+        jdbc.update("""
+                UPDATE match_engine.order_book_runtime_control
+                SET version = version + 1
+                WHERE shard_id = 'CDA_GLOBAL'
+                """);
+
+        assertThatThrownBy(() -> orderBookRuntimeAdmin.activateRebuilt(stale))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Stale order-book recovery token");
+        assertThat(redisTemplate.hasKey(OrderBookRuntimeGuard.SENTINEL_KEY)).isFalse();
+    }
+
+    @Test
+    void verifiedRebuildActivation_shouldOpenOnlyTheNewGeneration() throws Exception {
+        try (var connection = redisConnectionFactory.getConnection()) {
+            connection.serverCommands().flushDb();
+        }
+        orderBookRuntimeGuard.refresh();
+
+        OrderAssetReservationSucceededEvent rebuilt = order("SELL", 701, 7L, 4);
+        redisTemplate.opsForValue().set(
+                "order:" + rebuilt.getOrderId(), objectMapper.writeValueAsString(rebuilt));
+        redisTemplate.opsForZSet().add(
+                "orderbook:" + MARKET_ID + ":sell",
+                rebuilt.getOrderId().toString(),
+                (100L * 1_000_000_000L) + rebuilt.getMarketSequence());
+        redisTemplate.opsForSet().add(
+                "user:" + rebuilt.getUserId() + ":orders", rebuilt.getOrderId().toString());
+        RedisOrderBookManifestVerifier.Manifest manifest = orderBookManifestVerifier.inspect(java.util.Map.of());
+
+        OrderBookRuntimeAdminService.Result result = orderBookRuntimeAdmin.activateRebuilt(
+                activationRequest(
+                        "manifest-verified-1",
+                        manifest.openOrderCount(),
+                        manifest.openQuantity(),
+                        manifest.identityDigest(),
+                        "integration-test",
+                        "verified manual rebuild"));
+
+        assertThat(result.ready()).isTrue();
+        assertThat(orderBookRuntimeGuard.isReady()).isTrue();
+        assertThat(jdbc.queryForObject("""
+                SELECT verification_manifest_id FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, String.class)).isEqualTo("manifest-verified-1");
+
+        OrderAssetReservationSucceededEvent admitted = order("BUY", 501, 8L, 1);
+        orderBookService.addOrder(admitted);
+        assertThat(redisTemplate.hasKey("order:" + admitted.getOrderId())).isTrue();
+    }
+
+    private OrderBookRuntimeAdminService.ActivationRequest activationRequest(
+            String manifestId,
+            long expectedOpenOrderCount,
+            long expectedOpenQuantity,
+            String expectedIdentityDigest,
+            String operator,
+            String reason) {
+        OrderBookRuntimeControlStore.Control control = jdbc.queryForObject("""
+                SELECT shard_id, state, fence_epoch, generation, redis_run_id, version,
+                       transition_reason, verification_manifest_id, verification_manifest,
+                       verified_by, transitioned_at, updated_at
+                FROM match_engine.order_book_runtime_control
+                WHERE shard_id = 'CDA_GLOBAL'
+                """, (rs, rowNum) -> new OrderBookRuntimeControlStore.Control(
+                rs.getString("shard_id"),
+                OrderBookRuntimeControlStore.State.valueOf(rs.getString("state")),
+                rs.getLong("fence_epoch"),
+                rs.getObject("generation", UUID.class),
+                rs.getString("redis_run_id"),
+                rs.getLong("version"),
+                rs.getString("transition_reason"),
+                rs.getString("verification_manifest_id"),
+                rs.getString("verification_manifest"),
+                rs.getString("verified_by"),
+                rs.getObject("transitioned_at", LocalDateTime.class),
+                rs.getObject("updated_at", LocalDateTime.class)));
+        return new OrderBookRuntimeAdminService.ActivationRequest(
+                manifestId,
+                control.fenceEpoch(),
+                control.generation(),
+                control.version(),
+                0L,
+                0L,
+                expectedOpenOrderCount,
+                expectedOpenQuantity,
+                expectedIdentityDigest,
+                operator,
+                reason);
+    }
+
+    private void activateAfter(
+            CountDownLatch start,
+            OrderBookRuntimeAdminService.ActivationRequest request,
+            AtomicInteger successes,
+            List<Throwable> failures) {
+        try {
+            if (!start.await(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("activation start barrier timed out");
+            }
+            orderBookRuntimeAdmin.activateRebuilt(request);
+            successes.incrementAndGet();
+        } catch (Throwable failure) {
+            failures.add(failure);
+        }
+    }
+
+    private void awaitAdvisoryLockWaiter() throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            Integer waiters = jdbc.queryForObject("""
+                    SELECT COUNT(*) FROM pg_locks
+                    WHERE locktype = 'advisory' AND granted = FALSE
+                    """, Integer.class);
+            if (waiters != null && waiters > 0) {
+                return;
+            }
+            Thread.sleep(10L);
+        }
+        throw new AssertionError("activation did not wait on the cancellation intake barrier");
+    }
+
+    private void await(CountDownLatch latch, String operation) {
+        try {
+            if (!latch.await(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException(operation + " timed out");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(operation + " was interrupted", interrupted);
+        }
+    }
+
+    private OrderCancellationRequestedEvent cancellationRequest(UUID cancellationId, UUID orderId) {
+        return OrderCancellationRequestedEvent.builder()
+                .cancellationId(cancellationId)
+                .orderId(orderId)
+                .userId(UUID.randomUUID())
+                .originalAmount(5)
+                .requestedAt(LocalDateTime.now())
+                .build();
+    }
+
+    private void enterRecovery() {
+        try (var connection = redisConnectionFactory.getConnection()) {
+            connection.serverCommands().flushDb();
+        }
+        orderBookRuntimeGuard.refresh();
+        assertThat(orderBookRuntimeGuard.isReady()).isFalse();
+    }
+
+    private void seedRebuiltOrder(
+            OrderAssetReservationSucceededEvent member,
+            String indexedMarket,
+            String indexedSide,
+            long score,
+            OrderAssetReservationSucceededEvent detail) throws Exception {
+        redisTemplate.opsForValue().set(
+                "order:" + member.getOrderId(), objectMapper.writeValueAsString(detail));
+        redisTemplate.opsForZSet().add(
+                "orderbook:" + indexedMarket + ":" + indexedSide,
+                member.getOrderId().toString(),
+                score);
+        redisTemplate.opsForSet().add(
+                "user:" + detail.getUserId() + ":orders", member.getOrderId().toString());
+    }
+
+    private long scoreFor(OrderAssetReservationSucceededEvent order) {
+        long sequence = Math.floorMod(order.getMarketSequence(), 1_000_000_000L);
+        if ("BUY".equalsIgnoreCase(order.getOrderType())) {
+            return ((long) order.getPrice() * 1_000_000_000L) + (1_000_000_000L - sequence);
+        }
+        return ((long) order.getPrice() * 1_000_000_000L) + sequence;
     }
 
     @Test

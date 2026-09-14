@@ -57,6 +57,10 @@ eap:
       poll-interval-ms: 100
     orderbook:
       user-open-order-index-enabled: ${EAP_MATCH_USER_OPEN_ORDER_INDEX_ENABLED:true}
+    orderbook-runtime:
+      admin-enabled: true
+      monitor-interval-ms: 100
+      max-snapshot-age-ms: 500
     reservation-reconciler:
       enabled: ${EAP_MATCH_RESERVATION_RECONCILER_ENABLED:true}
       batch-size: ${EAP_MATCH_RESERVATION_RECONCILER_BATCH_SIZE:500}

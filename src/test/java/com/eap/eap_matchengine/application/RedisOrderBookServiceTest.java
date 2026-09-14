@@ -275,15 +275,17 @@ class RedisOrderBookServiceTest {
                 new RedisOrderBookService(redisTemplate, objectMapper, null, false);
         doAnswer(invocation -> {
             Object[] arguments = invocation.getArguments();
-            byte[] userIndexArgument = (byte[]) arguments[arguments.length - 6];
-            byte[] marketIdArgument = (byte[]) arguments[arguments.length - 2];
-            byte[] incomingUserIdArgument = (byte[]) arguments[arguments.length - 1];
+            byte[] userIndexArgument = (byte[]) arguments[arguments.length - 7];
+            byte[] marketIdArgument = (byte[]) arguments[arguments.length - 3];
+            byte[] incomingUserIdArgument = (byte[]) arguments[arguments.length - 2];
+            byte[] generationArgument = (byte[]) arguments[arguments.length - 1];
             assertThat(new String(userIndexArgument, StandardCharsets.UTF_8)).isEqualTo("0");
             assertThat(new String(marketIdArgument, StandardCharsets.UTF_8)).isEqualTo("TEST-MARKET");
             assertThat(new String(incomingUserIdArgument, StandardCharsets.UTF_8))
                     .isEqualTo(incomingBuyOrder().getUserId().toString());
+            assertThat(new String(generationArgument, StandardCharsets.UTF_8)).isEmpty();
             return List.of("__ADDED__".getBytes(StandardCharsets.UTF_8));
-        }).when(connection).evalSha(nullable(String.class), eq(ReturnType.MULTI), eq(8), any(byte[][].class));
+        }).when(connection).evalSha(nullable(String.class), eq(ReturnType.MULTI), eq(9), any(byte[][].class));
         doAnswer(invocation -> {
             RedisCallback<?> callback = invocation.getArgument(0);
             return callback.doInRedis(connection);

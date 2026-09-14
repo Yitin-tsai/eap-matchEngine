@@ -146,6 +146,28 @@ public class MatchOrderAdmissionInbox {
                 .addValue("lastError", truncate(failure.toString()))) == 1;
     }
 
+    public boolean reschedulePrerequisite(
+            InboxEntry entry,
+            String owner,
+            String errorType,
+            Exception failure,
+            long delayMs) {
+        return jdbc.update("""
+                UPDATE match_engine.order_admission_inbox
+                SET status = 'PENDING_PREREQUISITE',
+                    next_retry_at = CURRENT_TIMESTAMP + (:delayMs * INTERVAL '1 millisecond'),
+                    attempt_count = GREATEST(attempt_count - 1, 0),
+                    claimed_by = NULL, claim_until = NULL,
+                    error_type = :errorType, last_error = :lastError,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE order_id = :orderId
+                  AND status = 'IN_PROGRESS' AND claimed_by = :owner
+                """, claimParams(entry, owner)
+                .addValue("delayMs", delayMs)
+                .addValue("errorType", errorType)
+                .addValue("lastError", truncate(failure.toString()))) == 1;
+    }
+
     public boolean markPermanent(
             InboxEntry entry,
             String owner,

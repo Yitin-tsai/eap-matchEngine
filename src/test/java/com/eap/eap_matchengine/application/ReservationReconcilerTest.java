@@ -28,6 +28,24 @@ class ReservationReconcilerTest {
     private final TradeExecutionRepository tradeExecutionRepository = mock(TradeExecutionRepository.class);
     private final ReservationCleanupTaskStore cleanupTaskStore = mock(ReservationCleanupTaskStore.class);
     private final ReservationReconcilerMetrics metrics = mock(ReservationReconcilerMetrics.class);
+    private final OrderBookRuntimeGuard runtimeGuard = mock(OrderBookRuntimeGuard.class);
+
+    @Test
+    void recoveringRuntime_shouldNotScanOrMutateReservations() {
+        when(runtimeGuard.isReady()).thenReturn(false);
+
+        int actions = new ReservationReconciler(
+                orderBookService,
+                tradeExecutionRepository,
+                cleanupTaskStore,
+                metrics,
+                runtimeGuard,
+                30,
+                100).reconcileOnce();
+
+        org.assertj.core.api.Assertions.assertThat(actions).isZero();
+        verifyNoInteractions(orderBookService, tradeExecutionRepository, cleanupTaskStore, metrics);
+    }
 
     @Test
     void reconcileOnce_whenReservationHasNoDurableTradeAndIsOld_shouldReleaseOrder() throws Exception {

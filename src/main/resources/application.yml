@@ -82,6 +82,11 @@ eap:
       max-attempts: 20
       initial-backoff-ms: 250
       max-backoff-ms: 30000
+    orderbook-runtime:
+      admin-enabled: false
+      monitor-interval-ms: 250
+      monitor-initial-delay-ms: 0
+      max-snapshot-age-ms: 1000
     trade-persistence:
       enabled: true
     trade-outbox:
@@ -114,7 +119,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,metrics,prometheus,matchOrderAdmissionInbox
+        include: health,metrics,prometheus,matchOrderAdmissionInbox,orderBookRuntime,orderBookRuntimeManifest
   metrics:
     tags:
       application: eap-matchEngine

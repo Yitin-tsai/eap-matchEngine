@@ -4,19 +4,33 @@
 --
 -- KEYS[1]: buy orderbook ZSet key
 -- KEYS[2]: optional match-id sequence key
+-- KEYS[last]: CDA order-book generation sentinel
 -- ARGV[1]: min composite score (sell order's price limit)
 --
 -- ARGV[2]: reserved timestamp epoch millis
 -- ARGV[3]: incoming user ID (self-trade prevention)
+-- ARGV[4]: expected generation sentinel (empty only for isolated legacy tests)
 --
 -- Returns: order JSON string, [order JSON string, match ID] when KEYS[2] is present,
 --          or nil if no match found
 
 local orderbook_key = KEYS[1]
-local sequence_key = KEYS[2]
+local sequence_key = nil
+if #KEYS == 3 then
+    sequence_key = KEYS[2]
+end
 local min_score = tonumber(ARGV[1])
 local reserved_at = tonumber(ARGV[2])
 local incoming_user_id = ARGV[3]
+
+local expected_run_id = string.match(ARGV[4], '|([^|]+)$')
+local actual_run_id = string.match(redis.call('INFO', 'server'), 'run_id:([^\r\n]+)')
+if ARGV[4] ~= '' and (redis.call('GET', KEYS[#KEYS]) ~= ARGV[4] or actual_run_id ~= expected_run_id) then
+    if sequence_key then
+        return {'__GENERATION_MISMATCH__'}
+    end
+    return '__GENERATION_MISMATCH__'
+end
 
 local order_id = nil
 local order_json = nil

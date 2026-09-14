@@ -24,6 +24,7 @@ import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StreamUtils;
@@ -48,9 +49,34 @@ public class RedisOrderBookService {
     private static final String INVALID_ORDER_DETAIL_PREFIX = "__INVALID_ORDER_DETAIL__:";
     private static final String RESERVATION_EXISTS_PREFIX = "__RESERVATION_EXISTS__:";
     private static final String RESERVATION_KEY_PATTERN = "order:reservation:*";
+    private static final DefaultRedisScript<Long> UNLINK_USER_ORDER_SCRIPT = new DefaultRedisScript<>("""
+            local expected_run_id = string.match(ARGV[2], '|([^|]+)$')
+            local actual_run_id = string.match(redis.call('INFO', 'server'), 'run_id:([^\\r\\n]+)')
+            if ARGV[2] ~= '' and (redis.call('GET', KEYS[2]) ~= ARGV[2] or actual_run_id ~= expected_run_id) then
+                return -99
+            end
+            return redis.call('SREM', KEYS[1], ARGV[1])
+            """, Long.class);
+    private static final DefaultRedisScript<Long> RECORD_CANCELLATION_INTENT_SCRIPT = new DefaultRedisScript<>("""
+            local expected_run_id = string.match(ARGV[3], '|([^|]+)$')
+            local actual_run_id = string.match(redis.call('INFO', 'server'), 'run_id:([^\\r\\n]+)')
+            if ARGV[3] ~= '' and (redis.call('GET', KEYS[2]) ~= ARGV[3] or actual_run_id ~= expected_run_id) then
+                return -99
+            end
+            local existing = redis.call('GET', KEYS[1])
+            if not existing then
+                redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+                return 1
+            end
+            if existing == ARGV[1] then
+                return 0
+            end
+            return -1
+            """, Long.class);
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
     private final MatchingEngineMetrics metrics;
+    private final OrderBookRuntimeGuard runtimeGuard;
     private final boolean userOpenOrderIndexEnabled;
 
     // Lua scripts loaded from classpath
@@ -74,7 +100,7 @@ public class RedisOrderBookService {
     private String cancelOrderRequestLuaSha;
 
     public RedisOrderBookService(RedisTemplate<String, String> redisTemplate, ObjectMapper objectMapper) {
-        this(redisTemplate, objectMapper, null, true);
+        this(redisTemplate, objectMapper, null, null, true);
     }
 
     @Autowired
@@ -82,11 +108,13 @@ public class RedisOrderBookService {
             RedisTemplate<String, String> redisTemplate,
             ObjectMapper objectMapper,
             MatchingEngineMetrics metrics,
+            OrderBookRuntimeGuard runtimeGuard,
             @Value("${eap.match-engine.orderbook.user-open-order-index-enabled:true}")
             boolean userOpenOrderIndexEnabled) {
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
         this.metrics = metrics;
+        this.runtimeGuard = runtimeGuard;
         this.userOpenOrderIndexEnabled = userOpenOrderIndexEnabled;
     }
 
@@ -94,7 +122,15 @@ public class RedisOrderBookService {
             RedisTemplate<String, String> redisTemplate,
             ObjectMapper objectMapper,
             MatchingEngineMetrics metrics) {
-        this(redisTemplate, objectMapper, metrics, true);
+        this(redisTemplate, objectMapper, metrics, null, true);
+    }
+
+    RedisOrderBookService(
+            RedisTemplate<String, String> redisTemplate,
+            ObjectMapper objectMapper,
+            MatchingEngineMetrics metrics,
+            boolean userOpenOrderIndexEnabled) {
+        this(redisTemplate, objectMapper, metrics, null, userOpenOrderIndexEnabled);
     }
 
     /**
@@ -167,6 +203,22 @@ public class RedisOrderBookService {
         return false;
     }
 
+    private OrderBookRuntimeGuard.Snapshot runtimeSnapshot() {
+        return runtimeGuard == null ? null : runtimeGuard.requireReady();
+    }
+
+    private String expectedSentinel(OrderBookRuntimeGuard.Snapshot runtime) {
+        return runtime == null ? "" : runtime.expectedSentinel();
+    }
+
+    private void rejectGenerationMismatch(String operation) {
+        if (runtimeGuard != null) {
+            runtimeGuard.refresh();
+        }
+        throw new OrderBookRuntimeUnavailableException(
+                "CDA order-book generation rejected Redis operation: " + operation);
+    }
+
     private String serializeRedisOrder(OrderAssetReservationSucceededEvent event) throws JsonProcessingException {
         return objectMapper.writeValueAsString(RedisOrderEntry.from(event));
     }
@@ -193,18 +245,21 @@ public class RedisOrderBookService {
      * @throws JsonProcessingException if the order cannot be serialized to JSON
      */
     public void addOrder(OrderAssetReservationSucceededEvent event) throws JsonProcessingException {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
         String orderJson = serializeRedisOrder(event);
         double orderScore = scoreFor(event);
 
-        List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey);
+        List<String> keys = List.of(
+                orderbookKey, orderIdKey, userOrdersKey, OrderBookRuntimeGuard.SENTINEL_KEY);
         List<String> args = List.of(
             event.getOrderId().toString(),
             String.valueOf(orderScore),
             orderJson,
-            userOpenOrderIndexEnabledArg()
+            userOpenOrderIndexEnabledArg(),
+            expectedSentinel(runtime)
         );
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -228,6 +283,9 @@ public class RedisOrderBookService {
             return res != null ? (Long) res : 0L;
         });
 
+        if (result != null && result == -99L) {
+            rejectGenerationMismatch("add order");
+        }
         if (result != null && result == 1L) {
             log.debug("Successfully added order {} to orderbook atomically", event.getOrderId());
         } else {
@@ -246,12 +304,15 @@ public class RedisOrderBookService {
      * @param event The order event to be removed
      */
     public void removeOrder(OrderAssetReservationSucceededEvent event) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
 
-        List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey);
-        List<String> args = List.of(event.getOrderId().toString(), userOpenOrderIndexEnabledArg());
+        List<String> keys = List.of(
+                orderbookKey, orderIdKey, userOrdersKey, OrderBookRuntimeGuard.SENTINEL_KEY);
+        List<String> args = List.of(
+                event.getOrderId().toString(), userOpenOrderIndexEnabledArg(), expectedSentinel(runtime));
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
             // Flatten keys and args into single byte[] varargs array
@@ -274,6 +335,9 @@ public class RedisOrderBookService {
             return res != null ? (Long) res : 0L;
         });
 
+        if (result != null && result == -99L) {
+            rejectGenerationMismatch("remove order");
+        }
         if (result != null && result == 1L) {
             log.debug("Successfully removed order {} from orderbook atomically", event.getOrderId());
         } else {
@@ -293,8 +357,16 @@ public class RedisOrderBookService {
         if (!userOpenOrderIndexEnabled) {
             return;
         }
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
-        Long removed = redisTemplate.opsForSet().remove(userOrdersKey, event.getOrderId().toString());
+        Long removed = redisTemplate.execute(
+                UNLINK_USER_ORDER_SCRIPT,
+                List.of(userOrdersKey, OrderBookRuntimeGuard.SENTINEL_KEY),
+                event.getOrderId().toString(),
+                expectedSentinel(runtime));
+        if (removed != null && removed == -99L) {
+            rejectGenerationMismatch("unlink user order");
+        }
         if (removed != null && removed > 0) {
             log.debug("Successfully unlinked order {} from user open orders", event.getOrderId());
         } else {
@@ -311,6 +383,7 @@ public class RedisOrderBookService {
      * released back to the orderbook with the original amount.
      */
     public OrderAssetReservationSucceededEvent reserveBestMatchOrderLua(OrderAssetReservationSucceededEvent incomingOrder) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
         String orderbookKey = isBuy
                 ? orderbookKey(marketId(incomingOrder), "sell")
@@ -320,11 +393,12 @@ public class RedisOrderBookService {
                 ? maxSellScore(incomingOrder.getPrice())
                 : minBuyScore(incomingOrder.getPrice());
 
-        List<String> keys = List.of(orderbookKey);
+        List<String> keys = List.of(orderbookKey, OrderBookRuntimeGuard.SENTINEL_KEY);
         List<String> args = List.of(
                 String.valueOf(priceBoundary),
                 String.valueOf(Instant.now().toEpochMilli()),
-                incomingOrder.getUserId().toString());
+                incomingOrder.getUserId().toString(),
+                expectedSentinel(runtime));
 
         String orderJson = redisTemplate.execute((RedisCallback<String>) connection -> {
             byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
@@ -347,6 +421,9 @@ public class RedisOrderBookService {
         if (orderJson == null) {
             log.debug("No matching order found for price {}, isBuy={}", incomingOrder.getPrice(), isBuy);
             return null;
+        }
+        if ("__GENERATION_MISMATCH__".equals(orderJson)) {
+            rejectGenerationMismatch("reserve best match");
         }
         if (orderJson.startsWith(MISSING_ORDER_DETAIL_PREFIX)) {
             String missingOrderId = orderJson.substring(MISSING_ORDER_DETAIL_PREFIX.length());
@@ -382,6 +459,7 @@ public class RedisOrderBookService {
      * created. No-match orders do not consume a sequence value.
      */
     public ReservedMatch reserveBestMatchOrderWithSequenceLua(OrderAssetReservationSucceededEvent incomingOrder) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
         String orderbookKey = isBuy
                 ? orderbookKey(marketId(incomingOrder), "sell")
@@ -391,11 +469,12 @@ public class RedisOrderBookService {
                 ? maxSellScore(incomingOrder.getPrice())
                 : minBuyScore(incomingOrder.getPrice());
 
-        List<String> keys = List.of(orderbookKey, MATCH_ID_KEY);
+        List<String> keys = List.of(orderbookKey, MATCH_ID_KEY, OrderBookRuntimeGuard.SENTINEL_KEY);
         List<String> args = List.of(
                 String.valueOf(priceBoundary),
                 String.valueOf(Instant.now().toEpochMilli()),
-                incomingOrder.getUserId().toString());
+                incomingOrder.getUserId().toString(),
+                expectedSentinel(runtime));
 
         @SuppressWarnings("unchecked")
         List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
@@ -422,6 +501,9 @@ public class RedisOrderBookService {
         }
 
         String orderJson = new String(rawResult.get(0), StandardCharsets.UTF_8);
+        if ("__GENERATION_MISMATCH__".equals(orderJson)) {
+            rejectGenerationMismatch("reserve best match with sequence");
+        }
         if (orderJson.startsWith(MISSING_ORDER_DETAIL_PREFIX)) {
             String missingOrderId = orderJson.substring(MISSING_ORDER_DETAIL_PREFIX.length());
             log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
@@ -468,6 +550,7 @@ public class RedisOrderBookService {
     MatchOrAddResult reserveBestMatchOrAddOrderWithSequenceLua(
             OrderAssetReservationSucceededEvent incomingOrder,
             IncomingOrderProcessingStore.Claim processingClaim) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         Instant prepareStartedAt = Instant.now();
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
         String oppositeOrderbookKey = isBuy
@@ -522,6 +605,8 @@ public class RedisOrderBookService {
         keys.add(cancellationIntentKey(incomingOrder.getOrderId()));
         args.add(marketId(incomingOrder));
         args.add(incomingOrder.getUserId().toString());
+        keys.add(OrderBookRuntimeGuard.SENTINEL_KEY);
+        args.add(expectedSentinel(runtime));
 
         @SuppressWarnings("unchecked")
         List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
@@ -555,6 +640,9 @@ public class RedisOrderBookService {
         }
 
         String status = new String(rawResult.get(0), StandardCharsets.UTF_8);
+        if ("__GENERATION_MISMATCH__".equals(status)) {
+            rejectGenerationMismatch("reserve or add incoming order");
+        }
         if ("__ADDED__".equals(status)) {
             log.debug("No matching order found; added incoming order {} to orderbook", incomingOrder.getOrderId());
             return MatchOrAddResult.added();
@@ -657,6 +745,7 @@ public class RedisOrderBookService {
      */
     public void releaseReservedOrder(OrderAssetReservationSucceededEvent event, String expectedTradeId)
             throws JsonProcessingException {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         String orderbookKey = orderbookKey(event);
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
@@ -664,13 +753,16 @@ public class RedisOrderBookService {
         String orderJson = serializeRedisOrder(event);
         double orderScore = scoreFor(event);
 
-        List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey, reservationKey);
+        List<String> keys = List.of(
+                orderbookKey, orderIdKey, userOrdersKey, reservationKey,
+                OrderBookRuntimeGuard.SENTINEL_KEY);
         List<String> args = List.of(
                 event.getOrderId().toString(),
                 String.valueOf(orderScore),
                 orderJson,
                 userOpenOrderIndexEnabledArg(),
-                expectedTradeId == null ? "" : expectedTradeId
+                expectedTradeId == null ? "" : expectedTradeId,
+                expectedSentinel(runtime)
         );
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -691,6 +783,9 @@ public class RedisOrderBookService {
             return res != null ? (Long) res : 0L;
         });
 
+        if (result != null && result == -99L) {
+            rejectGenerationMismatch("release reserved order");
+        }
         if (result != null && result == 1L) {
             log.debug("Successfully released reserved order {} back to orderbook", event.getOrderId());
         } else {
@@ -706,16 +801,19 @@ public class RedisOrderBookService {
     public ReservationCompletionOutcome completeReservedOrder(
             OrderAssetReservationSucceededEvent event,
             String expectedTradeId) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         Instant prepareStartedAt = Instant.now();
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
         String reservationKey = reservationKey(event);
 
-        List<String> keys = List.of(orderIdKey, userOrdersKey, reservationKey);
+        List<String> keys = List.of(
+                orderIdKey, userOrdersKey, reservationKey, OrderBookRuntimeGuard.SENTINEL_KEY);
         List<String> args = List.of(
                 event.getOrderId().toString(),
                 userOpenOrderIndexEnabledArg(),
-                expectedTradeId == null ? "" : expectedTradeId);
+                expectedTradeId == null ? "" : expectedTradeId,
+                expectedSentinel(runtime));
         recordCompleteReservationPrepare(Duration.between(prepareStartedAt, Instant.now()));
 
         Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -747,6 +845,9 @@ public class RedisOrderBookService {
             if (result == null) {
                 throw new IllegalStateException("Redis returned no reservation completion result for order "
                         + event.getOrderId());
+            }
+            if (result == -99L) {
+                rejectGenerationMismatch("complete reserved order");
             }
             ReservationCompletionOutcome outcome = ReservationCompletionOutcome.fromRedisCode(result);
             if (outcome == ReservationCompletionOutcome.COMPLETED) {
@@ -838,6 +939,7 @@ public class RedisOrderBookService {
     }
 
     public List<ReservationSnapshot> scanReservations(int limit) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         List<String> keys = redisTemplate.execute((RedisCallback<List<String>>) connection -> {
             List<String> scanned = new ArrayList<>();
             ScanOptions options = ScanOptions.scanOptions()
@@ -863,6 +965,9 @@ public class RedisOrderBookService {
             if (snapshot != null) {
                 snapshots.add(snapshot);
             }
+        }
+        if (runtime != null) {
+            runtimeGuard.verifyUnchanged(runtime);
         }
         return snapshots;
     }
@@ -903,7 +1008,11 @@ public class RedisOrderBookService {
     }
 
     public OrderAssetReservationSucceededEvent findOpenOrder(UUID orderId) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         String orderJson = redisTemplate.opsForValue().get("order:" + orderId);
+        if (runtime != null) {
+            runtimeGuard.verifyUnchanged(runtime);
+        }
         if (orderJson == null) {
             return null;
         }
@@ -915,7 +1024,27 @@ public class RedisOrderBookService {
     }
 
     public void recordCancellationIntent(UUID orderId, UUID cancellationId) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         String key = cancellationIntentKey(orderId);
+        if (runtime != null) {
+            Long result = redisTemplate.execute(
+                    RECORD_CANCELLATION_INTENT_SCRIPT,
+                    List.of(key, OrderBookRuntimeGuard.SENTINEL_KEY),
+                    cancellationId.toString(),
+                    Long.toString(Duration.ofDays(7).toSeconds()),
+                    runtime.expectedSentinel());
+            if (result != null && result == -99L) {
+                rejectGenerationMismatch("record cancellation intent");
+            }
+            if (result != null && result == -1L) {
+                throw new IllegalStateException(
+                        "Order already has another cancellation intent: orderId=" + orderId);
+            }
+            if (result == null) {
+                throw new IllegalStateException("Redis cancellation intent script returned no result");
+            }
+            return;
+        }
         Boolean inserted = redisTemplate.opsForValue().setIfAbsent(
                 key, cancellationId.toString(), Duration.ofDays(7));
         if (Boolean.TRUE.equals(inserted)) {
@@ -930,15 +1059,19 @@ public class RedisOrderBookService {
     public CancellationArbitration arbitrateCancellation(
             OrderAssetReservationSucceededEvent order,
             UUID cancellationId) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         String orderbookKey = orderbookKey(order);
         String orderIdKey = "order:" + order.getOrderId();
         String userOrdersKey = "user:" + order.getUserId() + ":orders";
         String markerKey = "order:cancellation:" + order.getOrderId();
-        List<String> keys = List.of(orderbookKey, orderIdKey, userOrdersKey, markerKey);
+        List<String> keys = List.of(
+                orderbookKey, orderIdKey, userOrdersKey, markerKey,
+                OrderBookRuntimeGuard.SENTINEL_KEY);
         List<String> args = List.of(
                 order.getOrderId().toString(),
                 userOpenOrderIndexEnabledArg(),
-                cancellationId.toString());
+                cancellationId.toString(),
+                expectedSentinel(runtime));
 
         @SuppressWarnings("unchecked")
         List<byte[]> result = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
@@ -966,6 +1099,9 @@ public class RedisOrderBookService {
                     + order.getOrderId());
         }
         String status = new String(result.get(0), StandardCharsets.UTF_8);
+        if ("__GENERATION_MISMATCH__".equals(status)) {
+            rejectGenerationMismatch("arbitrate cancellation");
+        }
         if ("__NOT_OPEN__".equals(status)) {
             return CancellationArbitration.notOpen();
         }
@@ -1019,15 +1155,18 @@ public class RedisOrderBookService {
      * @return List of orders for the user
      */
     public List<OrderAssetReservationSucceededEvent> getOrderByUserId(UUID userId) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         if (!userOpenOrderIndexEnabled) {
+            verifyRuntimeUnchanged(runtime);
             return List.of();
         }
         String userOrdersKey = "user:" + userId + ":orders";
         Set<String> orderIds = redisTemplate.opsForSet().members(userOrdersKey);
         if (orderIds == null || orderIds.isEmpty()) {
+            verifyRuntimeUnchanged(runtime);
             return List.of();
         }
-        return orderIds.stream()
+        List<OrderAssetReservationSucceededEvent> orders = orderIds.stream()
                 .map(orderId -> {
                     String orderJson = redisTemplate.opsForValue().get("order:" + orderId);
                     if (orderJson != null) {
@@ -1041,6 +1180,10 @@ public class RedisOrderBookService {
                 })
                 .filter(o -> o != null)
                 .collect(Collectors.toList());
+        if (runtime != null) {
+            runtimeGuard.verifyUnchanged(runtime);
+        }
+        return orders;
     }
 
     /**
@@ -1054,6 +1197,7 @@ public class RedisOrderBookService {
      * @return List of matching orders sorted by best price (lowest for sells, highest for buys)
      */
     public List<OrderAssetReservationSucceededEvent> getMatchableOrders(OrderAssetReservationSucceededEvent incomingOrder) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeSnapshot();
         boolean isBuy = incomingOrder.getOrderType().equalsIgnoreCase("BUY");
         String oppositeKey = isBuy
                 ? orderbookKey(marketId(incomingOrder), "sell")
@@ -1069,10 +1213,11 @@ public class RedisOrderBookService {
         }
 
         if (results == null || results.isEmpty()) {
+            verifyRuntimeUnchanged(runtime);
             return List.of();
         }
 
-        return results.stream()
+        List<OrderAssetReservationSucceededEvent> orders = results.stream()
                 .map(orderIdStr -> {
                     try {
                         String orderJson = redisTemplate.opsForValue().get("order:" + orderIdStr);
@@ -1086,11 +1231,21 @@ public class RedisOrderBookService {
                 })
                 .filter(event -> event != null)
                 .collect(Collectors.toList());
+        if (runtime != null) {
+            runtimeGuard.verifyUnchanged(runtime);
+        }
+        return orders;
     }
 
     private String orderbookKey(OrderAssetReservationSucceededEvent event) {
         String side = event.getOrderType().equalsIgnoreCase("BUY") ? "buy" : "sell";
         return orderbookKey(marketId(event), side);
+    }
+
+    private void verifyRuntimeUnchanged(OrderBookRuntimeGuard.Snapshot runtime) {
+        if (runtime != null) {
+            runtimeGuard.verifyUnchanged(runtime);
+        }
     }
 
     private String orderbookKey(String marketId, String side) {

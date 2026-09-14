@@ -4,8 +4,8 @@ import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.common.event.OrderCancellationResultEvent;
 import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -16,7 +16,6 @@ import java.util.Objects;
 import java.util.UUID;
 
 @Component
-@RequiredArgsConstructor
 @Slf4j
 public class OrderCancellationCoordinator {
 
@@ -24,6 +23,8 @@ public class OrderCancellationCoordinator {
     private final IncomingOrderProcessingStore processingStore;
     private final OrderCancellationDecisionStore decisions;
     private final TradeExecutionRepository trades;
+    private final OrderBookRuntimeGuard runtimeGuard;
+    private final OrderBookRuntimeControlStore runtimeControls;
     private final String reconcileOwner = UUID.randomUUID().toString();
 
     @Value("${eap.match-engine.order-cancellation.reconcile-batch-size:50}")
@@ -32,19 +33,59 @@ public class OrderCancellationCoordinator {
     @Value("${eap.match-engine.order-cancellation.reconcile-lease-ms:30000}")
     private long reconcileLeaseMs = 30_000L;
 
+    @Autowired
+    public OrderCancellationCoordinator(
+            RedisOrderBookService orderBook,
+            IncomingOrderProcessingStore processingStore,
+            OrderCancellationDecisionStore decisions,
+            TradeExecutionRepository trades,
+            OrderBookRuntimeGuard runtimeGuard,
+            OrderBookRuntimeControlStore runtimeControls) {
+        this.orderBook = orderBook;
+        this.processingStore = processingStore;
+        this.decisions = decisions;
+        this.trades = trades;
+        this.runtimeGuard = runtimeGuard;
+        this.runtimeControls = runtimeControls;
+    }
+
+    OrderCancellationCoordinator(
+            RedisOrderBookService orderBook,
+            IncomingOrderProcessingStore processingStore,
+            OrderCancellationDecisionStore decisions,
+            TradeExecutionRepository trades) {
+        this(orderBook, processingStore, decisions, trades, null, null);
+    }
+
     public void request(OrderCancellationRequestedEvent request) {
         validate(request);
-        // PENDING makes an interruption recoverable; the following Redis operation
-        // is what participates in admission and matching arbitration.
+        CancellationIntake intake = runtimeControls == null
+                ? intake(request)
+                : runtimeControls.withCancellationIntakeLock(() -> intake(request));
+        if (intake.resolveNow()) {
+            resolve(intake.decision());
+        }
+    }
+
+    private CancellationIntake intake(OrderCancellationRequestedEvent request) {
+        // PENDING makes an interruption recoverable. The shared PostgreSQL advisory
+        // lock prevents activation from validating an earlier snapshot while this
+        // durable fact and its READY-generation Redis intent are being established.
         OrderCancellationDecisionStore.Decision decision = decisions.begin(request, null);
         if (decision.complete()) {
-            return;
+            return new CancellationIntake(decision, false);
+        }
+        if (!runtimeReady()) {
+            log.warn("Cancellation persisted but deferred while CDA order book is unavailable: cancellationId={}, orderId={}",
+                    request.getCancellationId(), request.getOrderId());
+            return new CancellationIntake(decision, false);
         }
         orderBook.recordCancellationIntent(request.getOrderId(), request.getCancellationId());
-        resolve(decision);
+        return new CancellationIntake(decision, true);
     }
 
     public void resolveAdmissionBlockedByCancellationIntent(OrderAssetReservationSucceededEvent order) {
+        requireRuntimeReady();
         OrderCancellationDecisionStore.Decision decision = decisions.findByOrderId(order.getOrderId());
         if (decision == null) {
             throw new IllegalStateException("Redis reported cancellation intent without a pending decision: orderId="
@@ -73,6 +114,9 @@ public class OrderCancellationCoordinator {
             fixedDelayString = "${eap.match-engine.order-cancellation.reconcile-delay-ms:250}",
             initialDelayString = "${eap.match-engine.order-cancellation.reconcile-initial-delay-ms:1000}")
     public void reconcilePending() {
+        if (!runtimeReady()) {
+            return;
+        }
         for (OrderCancellationDecisionStore.Decision decision :
                 decisions.claimRetryable(reconcileBatchSize, reconcileOwner, reconcileLeaseMs)) {
             try {
@@ -104,6 +148,7 @@ public class OrderCancellationCoordinator {
     }
 
     private void resolve(OrderCancellationDecisionStore.Decision pending) {
+        OrderBookRuntimeGuard.Snapshot runtime = requireRuntimeReady();
         OrderCancellationDecisionStore.Decision decision = decisions.find(pending.cancellationId());
         if (decision.complete()) {
             return;
@@ -148,6 +193,7 @@ public class OrderCancellationCoordinator {
         // Durable trade facts can classify it only after admission is no longer active.
         long matchedQuantity = durableMatchedQuantity(decision);
         if (matchedQuantity > 0) {
+            verifyRuntimeUnchanged(runtime);
             completeRejected(
                     decision,
                     OrderCancellationResultEvent.ALREADY_MATCHED,
@@ -163,6 +209,7 @@ public class OrderCancellationCoordinator {
         if (state == null || state.status() == IncomingOrderProcessingStore.Status.PROCESSING) {
             return;
         }
+        verifyRuntimeUnchanged(runtime);
         completeRejected(
                 decision,
                 OrderCancellationResultEvent.NOT_OPEN,
@@ -253,8 +300,27 @@ public class OrderCancellationCoordinator {
                 + trades.sumQuantityBySellerOrderId(decision.orderId());
     }
 
+    private record CancellationIntake(
+            OrderCancellationDecisionStore.Decision decision,
+            boolean resolveNow) {
+    }
+
     private long retryDelayMs(int attemptCount) {
         int exponent = Math.min(Math.max(attemptCount - 1, 0), 7);
         return Math.min(30_000L, 250L << exponent);
+    }
+
+    private boolean runtimeReady() {
+        return runtimeGuard == null || runtimeGuard.isReady();
+    }
+
+    private OrderBookRuntimeGuard.Snapshot requireRuntimeReady() {
+        return runtimeGuard == null ? null : runtimeGuard.requireReady();
+    }
+
+    private void verifyRuntimeUnchanged(OrderBookRuntimeGuard.Snapshot runtime) {
+        if (runtimeGuard != null) {
+            runtimeGuard.verifyUnchanged(runtime);
+        }
     }
 }

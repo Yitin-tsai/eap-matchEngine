@@ -30,6 +30,7 @@ public class MatchOrderAdmissionReconciler {
     private final MatchOrderAdmissionProcessor processor;
     private final MatchOrderAdmissionErrorClassifier classifier;
     private final MatchOrderAdmissionInboxMetrics metrics;
+    private final OrderBookRuntimeGuard runtimeGuard;
     private final String owner;
     private final int batchSize;
     private final long leaseMs;
@@ -47,13 +48,14 @@ public class MatchOrderAdmissionReconciler {
             MatchOrderAdmissionProcessor processor,
             MatchOrderAdmissionErrorClassifier classifier,
             MatchOrderAdmissionInboxMetrics metrics,
+            OrderBookRuntimeGuard runtimeGuard,
             @Value("${eap.match-engine.order-admission-inbox.batch-size:100}") int batchSize,
             @Value("${eap.match-engine.order-admission-inbox.lease-ms:30000}") long leaseMs,
             @Value("${eap.match-engine.order-admission-inbox.max-attempts:20}") int maxAttempts,
             @Value("${eap.match-engine.order-admission-inbox.initial-backoff-ms:250}") long initialBackoffMs,
             @Value("${eap.match-engine.order-admission-inbox.max-backoff-ms:30000}") long maxBackoffMs,
             @Value("${eap.match-engine.order-admission-inbox.worker-concurrency:16}") int workerConcurrency) {
-        this(inbox, processor, classifier, metrics,
+        this(inbox, processor, classifier, metrics, runtimeGuard,
                 batchSize, leaseMs, maxAttempts, initialBackoffMs, maxBackoffMs,
                 base -> ThreadLocalRandom.current().nextLong(
                         Math.max(1, base / 2), Math.max(2, base + 1)),
@@ -71,7 +73,24 @@ public class MatchOrderAdmissionReconciler {
             long initialBackoffMs,
             long maxBackoffMs,
             LongUnaryOperator jitter) {
-        this(inbox, processor, classifier, metrics,
+        this(inbox, processor, classifier, metrics, null,
+                batchSize, leaseMs, maxAttempts, initialBackoffMs, maxBackoffMs,
+                jitter, Runnable::run, null, 1);
+    }
+
+    MatchOrderAdmissionReconciler(
+            MatchOrderAdmissionInbox inbox,
+            MatchOrderAdmissionProcessor processor,
+            MatchOrderAdmissionErrorClassifier classifier,
+            MatchOrderAdmissionInboxMetrics metrics,
+            OrderBookRuntimeGuard runtimeGuard,
+            int batchSize,
+            long leaseMs,
+            int maxAttempts,
+            long initialBackoffMs,
+            long maxBackoffMs,
+            LongUnaryOperator jitter) {
+        this(inbox, processor, classifier, metrics, runtimeGuard,
                 batchSize, leaseMs, maxAttempts, initialBackoffMs, maxBackoffMs,
                 jitter, Runnable::run, null, 1);
     }
@@ -81,6 +100,7 @@ public class MatchOrderAdmissionReconciler {
             MatchOrderAdmissionProcessor processor,
             MatchOrderAdmissionErrorClassifier classifier,
             MatchOrderAdmissionInboxMetrics metrics,
+            OrderBookRuntimeGuard runtimeGuard,
             int batchSize,
             long leaseMs,
             int maxAttempts,
@@ -88,7 +108,7 @@ public class MatchOrderAdmissionReconciler {
             long maxBackoffMs,
             LongUnaryOperator jitter,
             WorkerPool workerPool) {
-        this(inbox, processor, classifier, metrics,
+        this(inbox, processor, classifier, metrics, runtimeGuard,
                 batchSize, leaseMs, maxAttempts, initialBackoffMs, maxBackoffMs,
                 jitter, workerPool.executor(), workerPool.executor(), workerPool.concurrency());
     }
@@ -98,6 +118,7 @@ public class MatchOrderAdmissionReconciler {
             MatchOrderAdmissionProcessor processor,
             MatchOrderAdmissionErrorClassifier classifier,
             MatchOrderAdmissionInboxMetrics metrics,
+            OrderBookRuntimeGuard runtimeGuard,
             int batchSize,
             long leaseMs,
             int maxAttempts,
@@ -111,6 +132,7 @@ public class MatchOrderAdmissionReconciler {
         this.processor = processor;
         this.classifier = classifier;
         this.metrics = metrics;
+        this.runtimeGuard = runtimeGuard;
         this.owner = UUID.randomUUID().toString();
         this.batchSize = Math.max(1, batchSize);
         this.leaseMs = Math.max(1, leaseMs);
@@ -127,6 +149,9 @@ public class MatchOrderAdmissionReconciler {
             fixedDelayString = "${eap.match-engine.order-admission-inbox.poll-interval-ms:100}",
             initialDelayString = "${eap.match-engine.order-admission-inbox.initial-delay-ms:500}")
     public void reconcile() {
+        if (runtimeGuard != null && !runtimeGuard.isReady()) {
+            return;
+        }
         int availableWorkers = workerCapacity.availablePermits();
         if (availableWorkers == 0) {
             return;
@@ -178,22 +203,25 @@ public class MatchOrderAdmissionReconciler {
 
     private void handleFailure(MatchOrderAdmissionInbox.InboxEntry entry, Exception failure) {
         MatchOrderAdmissionErrorClassifier.Classification classification = classifier.classify(failure);
+        if (classification.category() == MatchOrderAdmissionErrorClassifier.Category.PREREQUISITE) {
+            long delayMs = retryDelayMs(entry.attemptCount());
+            if (!inbox.reschedulePrerequisite(
+                    entry, owner, classification.errorType(), failure, delayMs)) {
+                log.warn("Lost Match admission lease while waiting for prerequisite: orderId={}",
+                        entry.orderId());
+                return;
+            }
+            metrics.prerequisiteScheduled();
+            return;
+        }
         if (classification.retryable() && entry.attemptCount() < maxAttempts) {
             long delayMs = retryDelayMs(entry.attemptCount());
-            String status = classification.category()
-                    == MatchOrderAdmissionErrorClassifier.Category.PREREQUISITE
-                    ? "PENDING_PREREQUISITE"
-                    : "FAILED_RETRYABLE";
             if (!inbox.reschedule(
-                    entry, owner, status, classification.errorType(), failure, delayMs)) {
+                    entry, owner, "FAILED_RETRYABLE", classification.errorType(), failure, delayMs)) {
                 log.warn("Lost Match admission lease while rescheduling: orderId={}", entry.orderId());
                 return;
             }
-            if (classification.category() == MatchOrderAdmissionErrorClassifier.Category.PREREQUISITE) {
-                metrics.prerequisiteScheduled();
-            } else {
-                metrics.retryScheduled();
-            }
+            metrics.retryScheduled();
             return;
         }
 

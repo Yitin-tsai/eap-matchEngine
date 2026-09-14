@@ -2,6 +2,7 @@ package com.eap.eap_matchengine.application;
 
 import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -28,6 +29,7 @@ public class ReservationCleanupWorker {
     private final JdbcTemplate jdbcTemplate;
     private final RedisOrderBookService orderBookService;
     private final ReservationCleanupMetrics metrics;
+    private final OrderBookRuntimeGuard runtimeGuard;
     private final int batchSize;
     private final int maxAttempts;
     private final long initialBackoffMs;
@@ -35,10 +37,12 @@ public class ReservationCleanupWorker {
     private final long processingTimeoutSeconds;
     private final int leaseRenewalChunkSize;
 
+    @Autowired
     public ReservationCleanupWorker(
             JdbcTemplate jdbcTemplate,
             RedisOrderBookService orderBookService,
             ReservationCleanupMetrics metrics,
+            OrderBookRuntimeGuard runtimeGuard,
             @Value("${eap.match-engine.reservation-cleanup.batch-size:500}") int batchSize,
             @Value("${eap.match-engine.reservation-cleanup.max-attempts:10}") int maxAttempts,
             @Value("${eap.match-engine.reservation-cleanup.initial-backoff-ms:1000}") long initialBackoffMs,
@@ -48,6 +52,29 @@ public class ReservationCleanupWorker {
         this.jdbcTemplate = jdbcTemplate;
         this.orderBookService = orderBookService;
         this.metrics = metrics;
+        this.runtimeGuard = runtimeGuard;
+        this.batchSize = batchSize;
+        this.maxAttempts = maxAttempts;
+        this.initialBackoffMs = initialBackoffMs;
+        this.maxBackoffMs = maxBackoffMs;
+        this.processingTimeoutSeconds = processingTimeoutSeconds;
+        this.leaseRenewalChunkSize = Math.max(1, leaseRenewalChunkSize);
+    }
+
+    ReservationCleanupWorker(
+            JdbcTemplate jdbcTemplate,
+            RedisOrderBookService orderBookService,
+            ReservationCleanupMetrics metrics,
+            int batchSize,
+            int maxAttempts,
+            long initialBackoffMs,
+            long maxBackoffMs,
+            long processingTimeoutSeconds,
+            int leaseRenewalChunkSize) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.orderBookService = orderBookService;
+        this.metrics = metrics;
+        this.runtimeGuard = null;
         this.batchSize = batchSize;
         this.maxAttempts = maxAttempts;
         this.initialBackoffMs = initialBackoffMs;
@@ -64,6 +91,9 @@ public class ReservationCleanupWorker {
     }
 
     int cleanupOnce() {
+        if (runtimeGuard != null && !runtimeGuard.isReady()) {
+            return 0;
+        }
         Instant batchStartedAt = Instant.now();
         List<CleanupRow> tasks = claimTasks();
         if (tasks.isEmpty()) {
@@ -82,6 +112,10 @@ public class ReservationCleanupWorker {
                 ReservationCompletionOutcome outcome;
                 try {
                     outcome = orderBookService.completeReservedOrder(toOrder(task), task.tradeId());
+                } catch (OrderBookRuntimeUnavailableException unavailable) {
+                    // Leave this batch leased. Lease expiry will make it retryable after a
+                    // verified generation is activated, without consuming technical attempts.
+                    return 0;
                 } catch (Exception e) {
                     recordFailure(task, e);
                     continue;

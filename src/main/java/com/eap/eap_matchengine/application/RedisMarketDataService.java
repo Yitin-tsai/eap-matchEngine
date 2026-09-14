@@ -24,6 +24,7 @@ public class RedisMarketDataService {
     
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
+    private final OrderBookRuntimeGuard runtimeGuard;
     
     private static final String BUY_ORDERBOOK_KEY = "orderbook:buy";
     private static final String SELL_ORDERBOOK_KEY = "orderbook:sell";
@@ -34,15 +35,20 @@ public class RedisMarketDataService {
      * @return 訂單簿響應DTO
      */
     public OrderBookResponseDto getOrderBookData(int depth) {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeGuard.requireReady();
         try {
             List<OrderBookResponseDto.OrderBookLevel> bids = getBuyOrderBookLevels(depth);
             List<OrderBookResponseDto.OrderBookLevel> asks = getSellOrderBookLevels(depth);
             
-            return OrderBookResponseDto.builder()
+            OrderBookResponseDto result = OrderBookResponseDto.builder()
                     .bids(bids)
                     .asks(asks)
                     .build();
+            runtimeGuard.verifyUnchanged(runtime);
+            return result;
                     
+        } catch (OrderBookRuntimeUnavailableException unavailable) {
+            throw unavailable;
         } catch (Exception e) {
             log.error("獲取訂單簿數據失敗: {}", e.getMessage());
             return OrderBookResponseDto.builder()
@@ -131,6 +137,7 @@ public class RedisMarketDataService {
      * @return 包含最佳買價、最佳賣價等基本信息
      */
     public MarketSummaryDto getMarketSummary() {
+        OrderBookRuntimeGuard.Snapshot runtime = runtimeGuard.requireReady();
         try {
             // 獲取最佳買價（最高買價）
             Set<String> topBuyOrder = redisTemplate.opsForZSet().reverseRange(BUY_ORDERBOOK_KEY, 0, 0);
@@ -151,8 +158,11 @@ public class RedisMarketDataService {
             MarketSummaryDto summary = new MarketSummaryDto();
             summary.setBestBidPrice(bestBidPrice);
             summary.setBestAskPrice(bestAskPrice);
+            runtimeGuard.verifyUnchanged(runtime);
             return summary;
             
+        } catch (OrderBookRuntimeUnavailableException unavailable) {
+            throw unavailable;
         } catch (Exception e) {
             log.error("獲取市場簡要統計失敗: {}", e.getMessage());
             MarketSummaryDto summary = new MarketSummaryDto();
