@@ -21,12 +21,14 @@
 -- ARGV[8]: this processing attempt's token (guarded processing only)
 -- ARGV[9]: completed bitmap bit offset (guarded processing only)
 -- ARGV[10]: market ID used to correlate the reservation with its durable trade
+-- ARGV[11]: incoming user ID (self-trade prevention)
 --
 -- Returns:
 --   {'__MATCH__', resting order JSON, match ID}
 --   {'__ADDED__'}
 --   {'__ADDED_COMPLETED__'} when guarded processing completes with the add
 --   {'__MISSING_ORDER_DETAIL__:<orderId>'}
+--   {'__INVALID_ORDER_DETAIL__:<orderId>'}
 --   {'__RESERVATION_EXISTS__:<orderId>'}
 --   {'__DUPLICATE__'}
 --   {'__IN_PROGRESS__'}
@@ -47,6 +49,7 @@ local incoming_order_id = ARGV[3]
 local incoming_score = tonumber(ARGV[4])
 local incoming_order_json = ARGV[5]
 local user_order_index_enabled = ARGV[6] ~= '0'
+local incoming_user_id = ARGV[11]
 
 local guarded = ARGV[7] ~= ''
 if guarded then
@@ -79,9 +82,42 @@ if not guarded and redis.call('GET', cancellation_intent_key) then
     return {'__CANCELLATION_PENDING__'}
 end
 
-local orders = redis.call('ZREVRANGEBYSCORE', buy_orderbook_key, '+inf', min_score, 'LIMIT', 0, 1)
+local resting_order_id = nil
+local resting_order_json = nil
+local offset = 0
+local scan_batch_size = 32
+while not resting_order_id do
+    local orders = redis.call('ZREVRANGEBYSCORE', buy_orderbook_key, '+inf', min_score,
+        'LIMIT', offset, scan_batch_size)
+    if #orders == 0 then
+        break
+    end
+    for _, candidate_id in ipairs(orders) do
+        local candidate_json = redis.call('GET', 'order:' .. candidate_id)
+        if not candidate_json then
+            redis.call('ZREM', buy_orderbook_key, candidate_id)
+            return {'__MISSING_ORDER_DETAIL__:' .. candidate_id}
+        end
+        local candidate = cjson.decode(candidate_json)
+        local candidate_user_id = candidate.u or candidate.userId
+        if not candidate_user_id or candidate_user_id == cjson.null then
+            return {'__INVALID_ORDER_DETAIL__:' .. candidate_id}
+        end
+        if tostring(candidate_user_id) ~= incoming_user_id then
+            resting_order_id = candidate_id
+            resting_order_json = candidate_json
+            break
+        end
+    end
+    if not resting_order_id then
+        if #orders < scan_batch_size then
+            break
+        end
+        offset = offset + #orders
+    end
+end
 
-if #orders == 0 then
+if not resting_order_id then
     redis.call('ZADD', sell_orderbook_key, incoming_score, incoming_order_id)
     redis.call('SET', incoming_order_id_key, incoming_order_json)
     if user_order_index_enabled then
@@ -95,15 +131,7 @@ if #orders == 0 then
     return {'__ADDED__'}
 end
 
-local resting_order_id = orders[1]
-local resting_order_id_key = 'order:' .. resting_order_id
 local reservation_key = 'order:reservation:' .. resting_order_id
-
-local resting_order_json = redis.call('GET', resting_order_id_key)
-if not resting_order_json then
-    redis.call('ZREM', buy_orderbook_key, resting_order_id)
-    return {'__MISSING_ORDER_DETAIL__:' .. resting_order_id}
-end
 
 local match_id = redis.call('INCR', sequence_key)
 

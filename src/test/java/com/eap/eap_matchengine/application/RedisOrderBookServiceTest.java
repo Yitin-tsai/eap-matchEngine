@@ -112,6 +112,20 @@ class RedisOrderBookServiceTest {
     }
 
     @Test
+    void reserveBestMatchOrderLua_whenOrderbookOwnerIsMissing_shouldFailClosed() {
+        UUID invalidOrderId = UUID.fromString("00000000-0000-0000-0000-000000000002");
+        doReturn("__INVALID_ORDER_DETAIL__:" + invalidOrderId)
+                .when(redisTemplate).execute(any(RedisCallback.class));
+
+        assertThatThrownBy(() -> service.reserveBestMatchOrderLua(incomingBuyOrder()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Redis orderbook owner missing")
+                .hasMessageContaining(invalidOrderId.toString());
+
+        verify(redisTemplate).execute(any(RedisCallback.class));
+    }
+
+    @Test
     void reserveBestMatchOrderLua_whenReservationAlreadyExists_shouldFailFast() {
         UUID orderId = UUID.fromString("00000000-0000-0000-0000-000000000004");
         doReturn("__RESERVATION_EXISTS__:" + orderId)
@@ -241,16 +255,33 @@ class RedisOrderBookServiceTest {
     }
 
     @Test
+    void reserveBestMatchOrAddOrderWithSequenceLua_whenOrderbookOwnerIsMissing_shouldFailClosed() {
+        UUID invalidOrderId = UUID.fromString("00000000-0000-0000-0000-000000000003");
+        doReturn(List.of(("__INVALID_ORDER_DETAIL__:" + invalidOrderId).getBytes(StandardCharsets.UTF_8)))
+                .when(redisTemplate).execute(any(RedisCallback.class));
+
+        assertThatThrownBy(() -> service.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuyOrder()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Redis orderbook owner missing")
+                .hasMessageContaining(invalidOrderId.toString());
+
+        verify(redisTemplate).execute(any(RedisCallback.class));
+    }
+
+    @Test
     void reserveBestMatchOrAddOrderWithSequenceLua_whenUserIndexDisabled_shouldPassDisabledFlagToLua() {
         RedisConnection connection = mock(RedisConnection.class);
         RedisOrderBookService serviceWithoutUserIndex =
                 new RedisOrderBookService(redisTemplate, objectMapper, null, false);
         doAnswer(invocation -> {
             Object[] arguments = invocation.getArguments();
-            byte[] userIndexArgument = (byte[]) arguments[arguments.length - 5];
-            byte[] marketIdArgument = (byte[]) arguments[arguments.length - 1];
+            byte[] userIndexArgument = (byte[]) arguments[arguments.length - 6];
+            byte[] marketIdArgument = (byte[]) arguments[arguments.length - 2];
+            byte[] incomingUserIdArgument = (byte[]) arguments[arguments.length - 1];
             assertThat(new String(userIndexArgument, StandardCharsets.UTF_8)).isEqualTo("0");
             assertThat(new String(marketIdArgument, StandardCharsets.UTF_8)).isEqualTo("TEST-MARKET");
+            assertThat(new String(incomingUserIdArgument, StandardCharsets.UTF_8))
+                    .isEqualTo(incomingBuyOrder().getUserId().toString());
             return List.of("__ADDED__".getBytes(StandardCharsets.UTF_8));
         }).when(connection).evalSha(nullable(String.class), eq(ReturnType.MULTI), eq(8), any(byte[][].class));
         doAnswer(invocation -> {
@@ -340,10 +371,41 @@ class RedisOrderBookServiceTest {
         RedisOrderBookService serviceWithMetrics = new RedisOrderBookService(redisTemplate, objectMapper, metrics);
         doReturn(1L).when(redisTemplate).execute(any(RedisCallback.class));
 
-        serviceWithMetrics.completeReservedOrder(incomingBuyOrder(), "TEST-MARKET-42");
+        assertThat(serviceWithMetrics.completeReservedOrder(incomingBuyOrder(), "TEST-MARKET-42"))
+                .isEqualTo(ReservationCompletionOutcome.COMPLETED);
 
         verify(metrics).recordCompleteReservationPrepare(any(Duration.class));
         verify(metrics).recordCompleteReservationResult(any(Duration.class));
+    }
+
+    @Test
+    void completeReservedOrder_shouldMapIdempotentAndOwnershipOutcomes() {
+        doReturn(0L, -1L, -2L).when(redisTemplate).execute(any(RedisCallback.class));
+
+        assertThat(service.completeReservedOrder(incomingBuyOrder(), "TEST-MARKET-42"))
+                .isEqualTo(ReservationCompletionOutcome.ALREADY_COMPLETED);
+        assertThat(service.completeReservedOrder(incomingBuyOrder(), "TEST-MARKET-42"))
+                .isEqualTo(ReservationCompletionOutcome.ORDER_ID_MISMATCH);
+        assertThat(service.completeReservedOrder(incomingBuyOrder(), "TEST-MARKET-42"))
+                .isEqualTo(ReservationCompletionOutcome.NEWER_TRADE_OWNER);
+    }
+
+    @Test
+    void completeReservedOrder_whenRedisReturnsNoResult_shouldFailClosed() {
+        doReturn(null).when(redisTemplate).execute(any(RedisCallback.class));
+
+        assertThatThrownBy(() -> service.completeReservedOrder(incomingBuyOrder(), "TEST-MARKET-42"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("no reservation completion result");
+    }
+
+    @Test
+    void completeReservedOrder_whenRedisReturnsUnknownCode_shouldFailClosed() {
+        doReturn(99L).when(redisTemplate).execute(any(RedisCallback.class));
+
+        assertThatThrownBy(() -> service.completeReservedOrder(incomingBuyOrder(), "TEST-MARKET-42"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Unexpected reservation completion result: 99");
     }
 
     @Test

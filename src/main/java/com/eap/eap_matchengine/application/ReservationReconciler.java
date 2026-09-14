@@ -130,7 +130,13 @@ public class ReservationReconciler {
                 log.warn("Released remaining partial MatchEngine reservation after durable trade: tradeId={}, orderId={}, remainingAmount={}",
                         trade.getTradeId(), reservedOrder.getOrderId(), remainingAmount);
             } else {
-                orderBookService.completeReservedOrder(reservedOrder, reservation.tradeId());
+                ReservationCompletionOutcome outcome =
+                        orderBookService.completeReservedOrder(reservedOrder, reservation.tradeId());
+                if (!outcome.successful()) {
+                    throw new IllegalStateException("Reservation completion ownership conflict: orderId="
+                            + reservedOrder.getOrderId() + ", tradeId=" + reservation.tradeId()
+                            + ", outcome=" + outcome);
+                }
                 metrics.completed();
                 log.warn("Completed MatchEngine reservation after durable trade: tradeId={}, orderId={}",
                         trade.getTradeId(), reservedOrder.getOrderId());

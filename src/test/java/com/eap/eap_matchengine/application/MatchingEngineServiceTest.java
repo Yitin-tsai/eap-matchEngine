@@ -49,6 +49,8 @@ class MatchingEngineServiceTest {
         when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
                 .thenReturn(RedisOrderBookService.MatchOrAddResult.matched(
                         new RedisOrderBookService.ReservedMatch(restingSell, 42L)));
+        when(orderBookService.completeReservedOrder(restingSell, "TEST-MARKET-42"))
+                .thenReturn(ReservationCompletionOutcome.COMPLETED);
 
         service.tryMatch(incomingBuy);
 
@@ -65,6 +67,34 @@ class MatchingEngineServiceTest {
         verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
         assertThat(incomingBuy.getAmount()).isZero();
         assertThat(restingSell.getAmount()).isZero();
+    }
+
+    @Test
+    void tryMatch_whenImmediateCleanupFindsNewerOwner_shouldFailWithoutReportingCompletion() throws Exception {
+        OrderAssetReservationSucceededEvent incomingBuy = order(
+                "BUY",
+                "00000000-0000-0000-0000-000000000031",
+                "00000000-0000-0000-0000-000000000032",
+                301L,
+                1);
+        OrderAssetReservationSucceededEvent restingSell = order(
+                "SELL",
+                "00000000-0000-0000-0000-000000000033",
+                "00000000-0000-0000-0000-000000000034",
+                300L,
+                1);
+        when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
+                .thenReturn(RedisOrderBookService.MatchOrAddResult.matched(
+                        new RedisOrderBookService.ReservedMatch(restingSell, 45L)));
+        when(orderBookService.completeReservedOrder(restingSell, "TEST-MARKET-45"))
+                .thenReturn(ReservationCompletionOutcome.NEWER_TRADE_OWNER);
+
+        assertThatThrownBy(() -> service.tryMatch(incomingBuy))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Reservation completion ownership conflict")
+                .hasMessageContaining("NEWER_TRADE_OWNER");
+
+        verify(matchingEngineMetrics, never()).reservationCompleted();
     }
 
     @Test
@@ -130,6 +160,76 @@ class MatchingEngineServiceTest {
                         && order.getAmount() == 1
                         && order.getOrderType().equals("SELL")), eq("TEST-MARKET-42"));
         verify(orderBookService, never()).completeReservedOrder(any(), anyString());
+        assertThat(incomingBuy.getAmount()).isEqualTo(1);
+        assertThat(restingSell.getAmount()).isEqualTo(1);
+    }
+
+    @Test
+    void tryMatch_whenLongTradeIdCannotBePersisted_shouldStillReleaseUsingExactReservationId() throws Exception {
+        OrderAssetReservationSucceededEvent incomingBuy = order(
+                "BUY",
+                "00000000-0000-0000-0000-000000000005",
+                "00000000-0000-0000-0000-000000000006",
+                102L,
+                1);
+        incomingBuy.setMarketId("M".repeat(80));
+        OrderAssetReservationSucceededEvent restingSell = order(
+                "SELL",
+                "00000000-0000-0000-0000-000000000007",
+                "00000000-0000-0000-0000-000000000008",
+                100L,
+                1);
+        String expectedTradeId = incomingBuy.getMarketId() + "-42";
+
+        when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
+                .thenReturn(RedisOrderBookService.MatchOrAddResult.matched(
+                        new RedisOrderBookService.ReservedMatch(restingSell, 42L)));
+        doThrow(new IllegalStateException("trade persistence rejected identifier"))
+                .when(tradeExecutionRecorder).record(any(TradeExecutedEvent.class), any(ReservationCleanupTask.class));
+
+        assertThatThrownBy(() -> service.tryMatch(incomingBuy))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("trade persistence rejected identifier");
+
+        verify(tradeExecutionRecorder).record(
+                argThat(trade -> trade.getTradeId().equals(expectedTradeId)),
+                any(ReservationCleanupTask.class));
+        verify(orderBookService).releaseReservedOrder(
+                argThat(order -> order.getOrderId().equals(restingSell.getOrderId()) && order.getAmount() == 1),
+                eq(expectedTradeId));
+        assertThat(incomingBuy.getAmount()).isEqualTo(1);
+        assertThat(restingSell.getAmount()).isEqualTo(1);
+    }
+
+    @Test
+    void tryMatch_whenImmediateReleaseAlsoFails_shouldPreservePersistenceFailureForInboxRetry() throws Exception {
+        OrderAssetReservationSucceededEvent incomingBuy = order(
+                "BUY",
+                "00000000-0000-0000-0000-000000000009",
+                "00000000-0000-0000-0000-000000000010",
+                103L,
+                1);
+        OrderAssetReservationSucceededEvent restingSell = order(
+                "SELL",
+                "00000000-0000-0000-0000-000000000011",
+                "00000000-0000-0000-0000-000000000012",
+                100L,
+                1);
+        IllegalStateException persistenceFailure = new IllegalStateException("db unavailable");
+        IllegalStateException releaseFailure = new IllegalStateException("redis unavailable");
+
+        when(orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
+                .thenReturn(RedisOrderBookService.MatchOrAddResult.matched(
+                        new RedisOrderBookService.ReservedMatch(restingSell, 44L)));
+        doThrow(persistenceFailure)
+                .when(tradeExecutionRecorder).record(any(TradeExecutedEvent.class), any(ReservationCleanupTask.class));
+        doThrow(releaseFailure).when(orderBookService).releaseReservedOrder(restingSell, "TEST-MARKET-44");
+
+        assertThatThrownBy(() -> service.tryMatch(incomingBuy))
+                .isSameAs(persistenceFailure)
+                .satisfies(failure -> assertThat(failure.getSuppressed()).containsExactly(releaseFailure));
+
+        verify(orderBookService).releaseReservedOrder(restingSell, "TEST-MARKET-44");
         assertThat(incomingBuy.getAmount()).isEqualTo(1);
         assertThat(restingSell.getAmount()).isEqualTo(1);
     }

@@ -7,6 +7,7 @@
 -- ARGV[1]: min composite score (sell order's price limit)
 --
 -- ARGV[2]: reserved timestamp epoch millis
+-- ARGV[3]: incoming user ID (self-trade prevention)
 --
 -- Returns: order JSON string, [order JSON string, match ID] when KEYS[2] is present,
 --          or nil if no match found
@@ -15,26 +16,50 @@ local orderbook_key = KEYS[1]
 local sequence_key = KEYS[2]
 local min_score = tonumber(ARGV[1])
 local reserved_at = tonumber(ARGV[2])
+local incoming_user_id = ARGV[3]
 
-local orders = redis.call('ZREVRANGEBYSCORE', orderbook_key, '+inf', min_score, 'LIMIT', 0, 1)
-
-if #orders == 0 then
-    return nil
-end
-
-local order_id = orders[1]
-local order_id_key = 'order:' .. order_id
-local reservation_key = 'order:reservation:' .. order_id
-
-local order_json = redis.call('GET', order_id_key)
-
-if not order_json then
-    redis.call('ZREM', orderbook_key, order_id)
-    if sequence_key then
-        return {'__MISSING_ORDER_DETAIL__:' .. order_id}
+local order_id = nil
+local order_json = nil
+local offset = 0
+local scan_batch_size = 32
+while not order_id do
+    local orders = redis.call('ZREVRANGEBYSCORE', orderbook_key, '+inf', min_score,
+        'LIMIT', offset, scan_batch_size)
+    if #orders == 0 then
+        return nil
     end
-    return '__MISSING_ORDER_DETAIL__:' .. order_id
+    for _, candidate_id in ipairs(orders) do
+        local candidate_json = redis.call('GET', 'order:' .. candidate_id)
+        if not candidate_json then
+            redis.call('ZREM', orderbook_key, candidate_id)
+            if sequence_key then
+                return {'__MISSING_ORDER_DETAIL__:' .. candidate_id}
+            end
+            return '__MISSING_ORDER_DETAIL__:' .. candidate_id
+        end
+        local candidate = cjson.decode(candidate_json)
+        local candidate_user_id = candidate.u or candidate.userId
+        if not candidate_user_id or candidate_user_id == cjson.null then
+            if sequence_key then
+                return {'__INVALID_ORDER_DETAIL__:' .. candidate_id}
+            end
+            return '__INVALID_ORDER_DETAIL__:' .. candidate_id
+        end
+        if tostring(candidate_user_id) ~= incoming_user_id then
+            order_id = candidate_id
+            order_json = candidate_json
+            break
+        end
+    end
+    if not order_id then
+        if #orders < scan_batch_size then
+            return nil
+        end
+        offset = offset + #orders
+    end
 end
+
+local reservation_key = 'order:reservation:' .. order_id
 
 local match_id = nil
 if sequence_key then

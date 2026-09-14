@@ -18,6 +18,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -58,6 +59,8 @@ class ReservationCleanupWorkerTest {
                 eq(100)))
                 .thenReturn(List.of(first, second));
         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(2);
+        when(orderBookService.completeReservedOrder(any(), anyString()))
+                .thenReturn(ReservationCompletionOutcome.COMPLETED);
 
         int claimed = worker.cleanupOnce();
 
@@ -80,6 +83,8 @@ class ReservationCleanupWorkerTest {
                 .thenReturn(tasks);
         when(jdbcTemplate.update(anyString(), any(Object[].class)))
                 .thenReturn(2, 2, 1, 1);
+        when(orderBookService.completeReservedOrder(any(), anyString()))
+                .thenReturn(ReservationCompletionOutcome.COMPLETED);
 
         worker.cleanupOnce();
 
@@ -138,6 +143,79 @@ class ReservationCleanupWorkerTest {
                 org.mockito.ArgumentMatchers.contains("redis unavailable"),
                 any(LocalDateTime.class),
                 eq(11L));
+    }
+
+    @Test
+    void cleanupOnce_whenReservationWasAlreadyCompleted_shouldMarkTaskCompleted() {
+        ReservationCleanupWorker.CleanupRow task = cleanupRow(12L);
+        when(jdbcTemplate.query(
+                anyString(),
+                org.mockito.ArgumentMatchers.<RowMapper<ReservationCleanupWorker.CleanupRow>>any(),
+                eq(30L),
+                eq(100)))
+                .thenReturn(List.of(task));
+        when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
+        when(orderBookService.completeReservedOrder(any(), eq("ENERGY-SPOT-12")))
+                .thenReturn(ReservationCompletionOutcome.ALREADY_COMPLETED);
+
+        worker.cleanupOnce();
+
+        verify(metrics).completed(1);
+        verify(jdbcTemplate).update(
+                org.mockito.ArgumentMatchers.contains("SET status = 'COMPLETED'"),
+                eq(new Object[]{12L}));
+    }
+
+    @Test
+    void cleanupOnce_whenNewerTradeOwnsReservation_shouldFailPermanentlyWithoutRetry() {
+        ReservationCleanupWorker.CleanupRow task = cleanupRow(13L);
+        when(jdbcTemplate.query(
+                anyString(),
+                org.mockito.ArgumentMatchers.<RowMapper<ReservationCleanupWorker.CleanupRow>>any(),
+                eq(30L),
+                eq(100)))
+                .thenReturn(List.of(task));
+        when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
+        when(orderBookService.completeReservedOrder(any(), eq("ENERGY-SPOT-13")))
+                .thenReturn(ReservationCompletionOutcome.NEWER_TRADE_OWNER);
+
+        worker.cleanupOnce();
+
+        verify(metrics).failed();
+        verify(metrics, never()).retryScheduled();
+        verify(metrics).completed(0);
+        verify(jdbcTemplate).update(
+                org.mockito.ArgumentMatchers.contains("SET status = 'FAILED'"),
+                eq(1),
+                org.mockito.ArgumentMatchers.contains("NEWER_TRADE_OWNER"),
+                any(LocalDateTime.class),
+                eq(13L));
+    }
+
+    @Test
+    void cleanupOnce_whenReservationOrderDoesNotMatch_shouldFailPermanentlyWithoutRetry() {
+        ReservationCleanupWorker.CleanupRow task = cleanupRow(14L);
+        when(jdbcTemplate.query(
+                anyString(),
+                org.mockito.ArgumentMatchers.<RowMapper<ReservationCleanupWorker.CleanupRow>>any(),
+                eq(30L),
+                eq(100)))
+                .thenReturn(List.of(task));
+        when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
+        when(orderBookService.completeReservedOrder(any(), eq("ENERGY-SPOT-14")))
+                .thenReturn(ReservationCompletionOutcome.ORDER_ID_MISMATCH);
+
+        worker.cleanupOnce();
+
+        verify(metrics).failed();
+        verify(metrics, never()).retryScheduled();
+        verify(metrics).completed(0);
+        verify(jdbcTemplate).update(
+                org.mockito.ArgumentMatchers.contains("SET status = 'FAILED'"),
+                eq(1),
+                org.mockito.ArgumentMatchers.contains("ORDER_ID_MISMATCH"),
+                any(LocalDateTime.class),
+                eq(14L));
     }
 
     private ReservationCleanupWorker.CleanupRow cleanupRow(long id) {

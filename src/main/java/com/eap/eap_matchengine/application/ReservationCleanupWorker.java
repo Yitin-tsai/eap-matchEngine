@@ -79,13 +79,19 @@ public class ReservationCleanupWorker {
             List<Long> completedTaskIds = new ArrayList<>(chunk.size());
             for (CleanupRow task : chunk) {
                 Instant redisStartedAt = Instant.now();
+                ReservationCompletionOutcome outcome;
                 try {
-                    orderBookService.completeReservedOrder(toOrder(task), task.tradeId());
-                    completedTaskIds.add(task.id());
+                    outcome = orderBookService.completeReservedOrder(toOrder(task), task.tradeId());
                 } catch (Exception e) {
                     recordFailure(task, e);
+                    continue;
                 } finally {
                     metrics.recordRedisCleanup(Duration.between(redisStartedAt, Instant.now()));
+                }
+                if (outcome.successful()) {
+                    completedTaskIds.add(task.id());
+                } else {
+                    recordPermanentFailure(task, outcome);
                 }
             }
             markCompleted(completedTaskIds);
@@ -207,6 +213,29 @@ public class ReservationCleanupWorker {
                   AND status = 'PROCESSING'
                 """, nextAttempt, nextRetryAt, truncatedError, updatedAt, task.id());
         metrics.retryScheduled();
+    }
+
+    private void recordPermanentFailure(CleanupRow task, ReservationCompletionOutcome outcome) {
+        metrics.failed();
+        int nextAttempt = task.attemptCount() + 1;
+        String error = "Reservation ownership conflict: outcome=" + outcome
+                + ", redisCode=" + outcome.redisCode()
+                + ", orderId=" + task.orderId()
+                + ", expectedTradeId=" + task.tradeId();
+        LocalDateTime updatedAt = LocalDateTime.now();
+        int updated = jdbcTemplate.update("""
+                UPDATE match_engine.reservation_cleanup_tasks
+                SET status = 'FAILED',
+                    attempt_count = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'PROCESSING'
+                """, nextAttempt, error, updatedAt, task.id());
+        if (updated != 1) {
+            throw new IllegalStateException("Expected to fail reservation cleanup task "
+                    + task.id() + ", but updated " + updated);
+        }
     }
 
     private long calculateBackoffMs(int attemptCount) {

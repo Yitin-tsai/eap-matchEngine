@@ -233,6 +233,162 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     }
 
     @Test
+    void incomingBuy_shouldSkipOwnBestSellAndReserveNextEligibleSeller() throws Exception {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 3L, 1);
+        OrderAssetReservationSucceededEvent ownBestSell = order("SELL", 502, 1L, 1);
+        ownBestSell.setUserId(incoming.getUserId());
+        OrderAssetReservationSucceededEvent eligibleSell = order("SELL", 503, 2L, 1);
+        orderBookService.addOrder(ownBestSell);
+        orderBookService.addOrder(eligibleSell);
+
+        RedisOrderBookService.MatchOrAddResult result =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming);
+
+        assertThat(result.reservedMatch().order().getOrderId()).isEqualTo(eligibleSell.getOrderId());
+        assertThat(result.reservedMatch().order().getUserId()).isNotEqualTo(incoming.getUserId());
+        assertThat(orderBookService.findOpenOrder(ownBestSell.getOrderId())).isNotNull();
+        assertThat(processingStore.isReserved(ownBestSell.getOrderId())).isFalse();
+    }
+
+    @Test
+    void incomingSell_withOnlyOwnCompatibleBuy_shouldEnterBookWithoutTrade() throws Exception {
+        OrderAssetReservationSucceededEvent incoming = order("SELL", 501, 2L, 1);
+        OrderAssetReservationSucceededEvent ownBuy = order("BUY", 502, 1L, 1);
+        ownBuy.setUserId(incoming.getUserId());
+        orderBookService.addOrder(ownBuy);
+
+        RedisOrderBookService.MatchOrAddResult result =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming);
+
+        assertThat(result.orderAdded()).isTrue();
+        assertThat(result.reservedMatch()).isNull();
+        assertThat(orderBookService.findOpenOrder(ownBuy.getOrderId())).isNotNull();
+        assertThat(orderBookService.findOpenOrder(incoming.getOrderId())).isNotNull();
+        assertThat(tradeCount()).isZero();
+    }
+
+    @Test
+    void incomingSell_shouldScanPastFullPageOfOwnOrdersAndReserveNextEligibleBuyer() throws Exception {
+        OrderAssetReservationSucceededEvent incoming = order("SELL", 501, 100L, 1);
+        for (int index = 0; index < 32; index++) {
+            OrderAssetReservationSucceededEvent ownBuy = order("BUY", 600 + index, index + 1L, 1);
+            ownBuy.setUserId(incoming.getUserId());
+            orderBookService.addOrder(ownBuy);
+        }
+        OrderAssetReservationSucceededEvent eligibleBuy = order("BUY", 632, 33L, 1);
+        orderBookService.addOrder(eligibleBuy);
+
+        RedisOrderBookService.MatchOrAddResult result =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming);
+
+        assertThat(result.reservedMatch().order().getOrderId()).isEqualTo(eligibleBuy.getOrderId());
+        assertThat(result.reservedMatch().order().getUserId()).isNotEqualTo(incoming.getUserId());
+        assertThat(processingStore.isReserved(eligibleBuy.getOrderId())).isTrue();
+    }
+
+    @Test
+    void incomingBuy_shouldScanPastFullPageOfOwnOrdersAndReserveNextEligibleSeller() throws Exception {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 100L, 1);
+        for (int index = 0; index < 32; index++) {
+            OrderAssetReservationSucceededEvent ownSell = order("SELL", 700 + index, index + 1L, 1);
+            ownSell.setUserId(incoming.getUserId());
+            orderBookService.addOrder(ownSell);
+        }
+        OrderAssetReservationSucceededEvent eligibleSell = order("SELL", 732, 33L, 1);
+        orderBookService.addOrder(eligibleSell);
+
+        RedisOrderBookService.MatchOrAddResult result =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming);
+
+        assertThat(result.reservedMatch().order().getOrderId()).isEqualTo(eligibleSell.getOrderId());
+        assertThat(result.reservedMatch().order().getUserId()).isNotEqualTo(incoming.getUserId());
+        assertThat(processingStore.isReserved(eligibleSell.getOrderId())).isTrue();
+    }
+
+    @Test
+    void legacyIncomingBuy_shouldSkipOwnBestSellAndReserveEligibleSeller() throws Exception {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 3L, 1);
+        OrderAssetReservationSucceededEvent ownSell = order("SELL", 741, 1L, 1);
+        ownSell.setUserId(incoming.getUserId());
+        OrderAssetReservationSucceededEvent eligibleSell = order("SELL", 742, 2L, 1);
+        orderBookService.addOrder(ownSell);
+        orderBookService.addOrder(eligibleSell);
+
+        OrderAssetReservationSucceededEvent reserved = orderBookService.reserveBestMatchOrderLua(incoming);
+
+        assertThat(reserved.getOrderId()).isEqualTo(eligibleSell.getOrderId());
+        assertThat(orderBookService.findOpenOrder(ownSell.getOrderId())).isNotNull();
+        assertThat(processingStore.isReserved(eligibleSell.getOrderId())).isTrue();
+    }
+
+    @Test
+    void legacyIncomingSell_shouldSkipOwnBestBuyAndReserveEligibleBuyer() throws Exception {
+        OrderAssetReservationSucceededEvent incoming = order("SELL", 501, 3L, 1);
+        OrderAssetReservationSucceededEvent ownBuy = order("BUY", 751, 1L, 1);
+        ownBuy.setUserId(incoming.getUserId());
+        OrderAssetReservationSucceededEvent eligibleBuy = order("BUY", 752, 2L, 1);
+        orderBookService.addOrder(ownBuy);
+        orderBookService.addOrder(eligibleBuy);
+
+        OrderAssetReservationSucceededEvent reserved = orderBookService.reserveBestMatchOrderLua(incoming);
+
+        assertThat(reserved.getOrderId()).isEqualTo(eligibleBuy.getOrderId());
+        assertThat(orderBookService.findOpenOrder(ownBuy.getOrderId())).isNotNull();
+        assertThat(processingStore.isReserved(eligibleBuy.getOrderId())).isTrue();
+    }
+
+    @Test
+    void malformedJson_shouldFailClosedInAllReservationScriptFamilies() throws Exception {
+        OrderAssetReservationSucceededEvent incomingBuy = order("BUY", 501, 3L, 1);
+        OrderAssetReservationSucceededEvent malformedSell = order("SELL", 761, 1L, 1);
+        orderBookService.addOrder(malformedSell);
+        redisTemplate.opsForValue().set("order:" + malformedSell.getOrderId(), "{");
+
+        assertThatThrownBy(() -> orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingBuy))
+                .isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> orderBookService.reserveBestMatchOrderLua(incomingBuy))
+                .isInstanceOf(RuntimeException.class);
+        assertThat(redisTemplate.opsForZSet().score(
+                "orderbook:" + MARKET_ID + ":sell",
+                malformedSell.getOrderId().toString())).isNotNull();
+
+        OrderAssetReservationSucceededEvent incomingSell = order("SELL", 502, 3L, 1);
+        OrderAssetReservationSucceededEvent malformedBuy = order("BUY", 762, 1L, 1);
+        orderBookService.addOrder(malformedBuy);
+        redisTemplate.opsForValue().set("order:" + malformedBuy.getOrderId(), "{");
+
+        assertThatThrownBy(() -> orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incomingSell))
+                .isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> orderBookService.reserveBestMatchOrderLua(incomingSell))
+                .isInstanceOf(RuntimeException.class);
+        assertThat(redisTemplate.opsForZSet().score(
+                "orderbook:" + MARKET_ID + ":buy",
+                malformedBuy.getOrderId().toString())).isNotNull();
+        assertThat(orderBookService.countActiveReservations()).isZero();
+        assertThat(tradeCount()).isZero();
+    }
+
+    @Test
+    void malformedRestingOrderWithoutOwner_shouldFailClosedWithoutReservation() throws Exception {
+        OrderAssetReservationSucceededEvent incoming = order("BUY", 501, 2L, 1);
+        OrderAssetReservationSucceededEvent malformedSell = order("SELL", 502, 1L, 1);
+        orderBookService.addOrder(malformedSell);
+        redisTemplate.opsForValue().set(
+                "order:" + malformedSell.getOrderId(),
+                "{\"i\":\"" + malformedSell.getOrderId()
+                        + "\",\"m\":\"" + MARKET_ID
+                        + "\",\"s\":1,\"p\":100,\"a\":1,\"t\":\"SELL\"}");
+
+        assertThatThrownBy(() -> orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Redis orderbook owner missing")
+                .hasMessageContaining(malformedSell.getOrderId().toString());
+
+        assertThat(processingStore.isReserved(malformedSell.getOrderId())).isFalse();
+        assertThat(orderBookService.findOpenOrder(malformedSell.getOrderId())).isNotNull();
+    }
+
+    @Test
     void cancellationBeforeOrderConfirmed_shouldPersistDecisionAndPreventAdmission() {
         OrderAssetReservationSucceededEvent order = order("BUY", 501, 1L, 7);
         UUID cancellationId = UUID.randomUUID();
@@ -399,13 +555,91 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
         assertThat(secondTradeId).isNotEqualTo(firstTradeId);
         assertThat(orderBookService.scanReservations(10).get(0).tradeId()).isEqualTo(secondTradeId);
 
-        orderBookService.completeReservedOrder(resting, firstTradeId);
+        assertThat(orderBookService.completeReservedOrder(resting, firstTradeId))
+                .isEqualTo(ReservationCompletionOutcome.NEWER_TRADE_OWNER);
 
         assertThat(orderBookService.countActiveReservations()).isEqualTo(1);
         assertThat(orderBookService.scanReservations(10).get(0).tradeId()).isEqualTo(secondTradeId);
 
-        orderBookService.completeReservedOrder(resting, secondTradeId);
+        assertThat(orderBookService.completeReservedOrder(resting, secondTradeId))
+                .isEqualTo(ReservationCompletionOutcome.COMPLETED);
         assertThat(orderBookService.countActiveReservations()).isZero();
+        assertThat(orderBookService.completeReservedOrder(resting, secondTradeId))
+                .isEqualTo(ReservationCompletionOutcome.ALREADY_COMPLETED);
+    }
+
+    @Test
+    void cleanupWorker_whenNewerTradeOwnsReservation_shouldFailTaskWithoutDeletingReservation() throws Exception {
+        OrderAssetReservationSucceededEvent resting = order("BUY", 621, 1L, 1);
+        OrderAssetReservationSucceededEvent firstIncoming = order("SELL", 622, 2L, 1);
+        OrderAssetReservationSucceededEvent secondIncoming = order("SELL", 623, 3L, 1);
+        orderBookService.addOrder(resting);
+
+        RedisOrderBookService.ReservedMatch firstReservation =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(firstIncoming).reservedMatch();
+        String firstTradeId = MARKET_ID + "-" + firstReservation.matchId();
+        orderBookService.releaseReservedOrder(resting, firstTradeId);
+
+        RedisOrderBookService.ReservedMatch secondReservation =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(secondIncoming).reservedMatch();
+        String secondTradeId = MARKET_ID + "-" + secondReservation.matchId();
+        jdbc.update("""
+                INSERT INTO match_engine.reservation_cleanup_tasks (
+                    trade_id, order_id, user_id, status, attempt_count, next_retry_at)
+                VALUES (?, ?, ?, 'PENDING', 0, CURRENT_TIMESTAMP)
+                """, firstTradeId, resting.getOrderId(), resting.getUserId());
+
+        assertThat(cleanupWorker().cleanupOnce()).isEqualTo(1);
+
+        assertThat(jdbc.queryForObject("""
+                SELECT status
+                FROM match_engine.reservation_cleanup_tasks
+                WHERE trade_id = ?
+                """, String.class, firstTradeId)).isEqualTo("FAILED");
+        assertThat(jdbc.queryForObject("""
+                SELECT attempt_count
+                FROM match_engine.reservation_cleanup_tasks
+                WHERE trade_id = ?
+                """, Integer.class, firstTradeId)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("""
+                SELECT last_error
+                FROM match_engine.reservation_cleanup_tasks
+                WHERE trade_id = ?
+                """, String.class, firstTradeId))
+                .contains("NEWER_TRADE_OWNER")
+                .contains(firstTradeId)
+                .contains(resting.getOrderId().toString());
+        assertThat(orderBookService.countActiveReservations()).isEqualTo(1);
+        assertThat(orderBookService.scanReservations(10).get(0).tradeId()).isEqualTo(secondTradeId);
+    }
+
+    @Test
+    void completeReservation_whenStoredOrderIdentityDiffers_shouldFailWithoutMutatingRedis() throws Exception {
+        OrderAssetReservationSucceededEvent resting = order("BUY", 631, 1L, 1);
+        OrderAssetReservationSucceededEvent incoming = order("SELL", 632, 2L, 1);
+        orderBookService.addOrder(resting);
+        RedisOrderBookService.ReservedMatch reservation =
+                orderBookService.reserveBestMatchOrAddOrderWithSequenceLua(incoming).reservedMatch();
+        String tradeId = MARKET_ID + "-" + reservation.matchId();
+        String reservationKey = "order:reservation:" + resting.getOrderId();
+        String orderKey = "order:" + resting.getOrderId();
+        String userOrdersKey = "user:" + resting.getUserId() + ":orders";
+        String originalReservation = redisTemplate.opsForValue().get(reservationKey);
+        String originalOrderDetail = redisTemplate.opsForValue().get(orderKey);
+        UUID differentOrderId = UUID.fromString("00000000-0000-0000-0000-000000009999");
+        String corruptedReservation = originalReservation.replace(
+                resting.getOrderId().toString(),
+                differentOrderId.toString());
+        redisTemplate.opsForValue().set(reservationKey, corruptedReservation);
+
+        assertThat(orderBookService.completeReservedOrder(resting, tradeId))
+                .isEqualTo(ReservationCompletionOutcome.ORDER_ID_MISMATCH);
+
+        assertThat(redisTemplate.opsForValue().get(reservationKey)).isEqualTo(corruptedReservation);
+        assertThat(redisTemplate.opsForValue().get(orderKey)).isEqualTo(originalOrderDetail);
+        assertThat(redisTemplate.opsForSet().isMember(
+                userOrdersKey,
+                resting.getOrderId().toString())).isTrue();
     }
 
     @Test

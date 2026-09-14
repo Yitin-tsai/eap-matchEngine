@@ -45,6 +45,7 @@ public class RedisOrderBookService {
     private static final long SCORE_FACTOR = 1_000_000_000L;
     private static final String MATCH_ID_KEY = "match:id:sequence";
     private static final String MISSING_ORDER_DETAIL_PREFIX = "__MISSING_ORDER_DETAIL__:";
+    private static final String INVALID_ORDER_DETAIL_PREFIX = "__INVALID_ORDER_DETAIL__:";
     private static final String RESERVATION_EXISTS_PREFIX = "__RESERVATION_EXISTS__:";
     private static final String RESERVATION_KEY_PATTERN = "order:reservation:*";
     private final RedisTemplate<String, String> redisTemplate;
@@ -322,7 +323,8 @@ public class RedisOrderBookService {
         List<String> keys = List.of(orderbookKey);
         List<String> args = List.of(
                 String.valueOf(priceBoundary),
-                String.valueOf(Instant.now().toEpochMilli()));
+                String.valueOf(Instant.now().toEpochMilli()),
+                incomingOrder.getUserId().toString());
 
         String orderJson = redisTemplate.execute((RedisCallback<String>) connection -> {
             byte[][] keysBytes = keys.stream().map(k -> k.getBytes(StandardCharsets.UTF_8)).toArray(byte[][]::new);
@@ -351,6 +353,11 @@ public class RedisOrderBookService {
             log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
                     missingOrderId);
             throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+        }
+        if (orderJson.startsWith(INVALID_ORDER_DETAIL_PREFIX)) {
+            String invalidOrderId = orderJson.substring(INVALID_ORDER_DETAIL_PREFIX.length());
+            log.error("Redis orderbook is inconsistent: order {} has no owner", invalidOrderId);
+            throw new IllegalStateException("Redis orderbook owner missing for order " + invalidOrderId);
         }
         if (orderJson.startsWith(RESERVATION_EXISTS_PREFIX)) {
             String orderId = orderJson.substring(RESERVATION_EXISTS_PREFIX.length());
@@ -387,7 +394,8 @@ public class RedisOrderBookService {
         List<String> keys = List.of(orderbookKey, MATCH_ID_KEY);
         List<String> args = List.of(
                 String.valueOf(priceBoundary),
-                String.valueOf(Instant.now().toEpochMilli()));
+                String.valueOf(Instant.now().toEpochMilli()),
+                incomingOrder.getUserId().toString());
 
         @SuppressWarnings("unchecked")
         List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
@@ -419,6 +427,11 @@ public class RedisOrderBookService {
             log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
                     missingOrderId);
             throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+        }
+        if (orderJson.startsWith(INVALID_ORDER_DETAIL_PREFIX)) {
+            String invalidOrderId = orderJson.substring(INVALID_ORDER_DETAIL_PREFIX.length());
+            log.error("Redis orderbook is inconsistent: order {} has no owner", invalidOrderId);
+            throw new IllegalStateException("Redis orderbook owner missing for order " + invalidOrderId);
         }
         if (orderJson.startsWith(RESERVATION_EXISTS_PREFIX)) {
             String orderId = orderJson.substring(RESERVATION_EXISTS_PREFIX.length());
@@ -508,6 +521,7 @@ public class RedisOrderBookService {
         }
         keys.add(cancellationIntentKey(incomingOrder.getOrderId()));
         args.add(marketId(incomingOrder));
+        args.add(incomingOrder.getUserId().toString());
 
         @SuppressWarnings("unchecked")
         List<byte[]> rawResult = redisTemplate.execute((RedisCallback<List<byte[]>>) connection -> {
@@ -563,6 +577,11 @@ public class RedisOrderBookService {
             log.error("Redis orderbook is inconsistent: orderbook entry {} exists but order detail is missing",
                     missingOrderId);
             throw new IllegalStateException("Redis orderbook detail missing for order " + missingOrderId);
+        }
+        if (status.startsWith(INVALID_ORDER_DETAIL_PREFIX)) {
+            String invalidOrderId = status.substring(INVALID_ORDER_DETAIL_PREFIX.length());
+            log.error("Redis orderbook is inconsistent: order {} has no owner", invalidOrderId);
+            throw new IllegalStateException("Redis orderbook owner missing for order " + invalidOrderId);
         }
         if (status.startsWith(RESERVATION_EXISTS_PREFIX)) {
             String orderId = status.substring(RESERVATION_EXISTS_PREFIX.length());
@@ -684,7 +703,9 @@ public class RedisOrderBookService {
     /**
      * Completes a reserved order after its corresponding TradeExecuted fact is durable.
      */
-    public void completeReservedOrder(OrderAssetReservationSucceededEvent event, String expectedTradeId) {
+    public ReservationCompletionOutcome completeReservedOrder(
+            OrderAssetReservationSucceededEvent event,
+            String expectedTradeId) {
         Instant prepareStartedAt = Instant.now();
         String orderIdKey = "order:" + event.getOrderId();
         String userOrdersKey = "user:" + event.getUserId() + ":orders";
@@ -718,20 +739,29 @@ public class RedisOrderBookService {
             } finally {
                 recordCompleteReservationRedisEval(Duration.between(redisEvalStartedAt, Instant.now()));
             }
-            return res != null ? (Long) res : 0L;
+            return res == null ? null : ((Number) res).longValue();
         });
 
         Instant resultStartedAt = Instant.now();
-        if (result != null && result == 1L) {
-            log.debug("Successfully completed reserved order {}", event.getOrderId());
-        } else if (result != null && result == 0L) {
-            log.debug("Reserved order {} was already completed for trade {}",
-                    event.getOrderId(), expectedTradeId);
-        } else {
-            log.warn("Reserved order {} could not be completed for trade {}, result={}",
-                    event.getOrderId(), expectedTradeId, result);
+        try {
+            if (result == null) {
+                throw new IllegalStateException("Redis returned no reservation completion result for order "
+                        + event.getOrderId());
+            }
+            ReservationCompletionOutcome outcome = ReservationCompletionOutcome.fromRedisCode(result);
+            if (outcome == ReservationCompletionOutcome.COMPLETED) {
+                log.debug("Successfully completed reserved order {}", event.getOrderId());
+            } else if (outcome == ReservationCompletionOutcome.ALREADY_COMPLETED) {
+                log.debug("Reserved order {} was already completed for trade {}",
+                        event.getOrderId(), expectedTradeId);
+            } else {
+                log.error("Reservation completion ownership conflict: orderId={}, expectedTradeId={}, outcome={}, redisCode={}",
+                        event.getOrderId(), expectedTradeId, outcome, outcome.redisCode());
+            }
+            return outcome;
+        } finally {
+            recordCompleteReservationResult(Duration.between(resultStartedAt, Instant.now()));
         }
-        recordCompleteReservationResult(Duration.between(resultStartedAt, Instant.now()));
     }
 
     private void recordCompleteReservationPrepare(Duration duration) {

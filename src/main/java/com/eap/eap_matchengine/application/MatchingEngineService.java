@@ -238,7 +238,11 @@ public class MatchingEngineService {
   private void completeReservedOrder(OrderAssetReservationSucceededEvent matchOrder, String tradeId) {
     Instant startedAt = Instant.now();
     try {
-      orderBookService.completeReservedOrder(matchOrder, tradeId);
+      ReservationCompletionOutcome outcome = orderBookService.completeReservedOrder(matchOrder, tradeId);
+      if (!outcome.successful()) {
+        throw new IllegalStateException("Reservation completion ownership conflict: orderId="
+            + matchOrder.getOrderId() + ", tradeId=" + tradeId + ", outcome=" + outcome);
+      }
       metrics.reservationCompleted();
     } finally {
       metrics.recordCompleteReservation(Duration.between(startedAt, Instant.now()));
@@ -266,7 +270,7 @@ public class MatchingEngineService {
       releaseReservedOrder(matchOrder, tradeId);
       log.warn("Released reserved resting order after trade persistence failure: orderId={}, amount={}",
           matchOrder.getOrderId(), originalAmount, cause);
-    } catch (JsonProcessingException compensationFailure) {
+    } catch (Exception compensationFailure) {
       cause.addSuppressed(compensationFailure);
       log.error("Failed to release reserved resting order after trade persistence failure: orderId={}",
           matchOrder.getOrderId(), compensationFailure);
@@ -274,6 +278,8 @@ public class MatchingEngineService {
   }
 
   private String tradeId(OrderAssetReservationSucceededEvent incomingOrder, Long matchId) {
+    // This is a deterministic market-scoped Redis sequence, not a UUID. Keep this function
+    // total because it is also needed to release a Redis reservation after persistence fails.
     return (incomingOrder.getMarketId() == null ? "UNKNOWN" : incomingOrder.getMarketId())
         + "-" + matchId;
   }
@@ -287,7 +293,7 @@ public class MatchingEngineService {
     Long sequence = matchId;
     String marketId = incomingOrder.getMarketId() == null ? "UNKNOWN" : incomingOrder.getMarketId();
     return TradeExecutedEvent.builder()
-        .tradeId(marketId + "-" + sequence)
+        .tradeId(tradeId(incomingOrder, matchId))
         .sequence(sequence)
         .legacyMatchId(matchId.intValue())
         .marketId(marketId)

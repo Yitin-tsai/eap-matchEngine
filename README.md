@@ -16,7 +16,7 @@ OrderAssetReservationSucceededEvent
   -> ReservationCleanupWorker finalizes the matched resting order in Redis
 ```
 
-If no trade is found, the confirmed order remains in the Redis order book. A reservation reconciler repairs stale Redis reservations after crashes by comparing them with durable trade facts.
+If no trade is found, the confirmed order remains in the Redis order book. A reservation reconciler repairs stale Redis reservations after crashes by comparing them with durable trade facts. The atomic Redis candidate selection excludes resting orders owned by the incoming user: it preserves those orders, scans to the next price-time eligible counterparty, and does not create a `TradeExecuted` fact when only self-owned liquidity is available.
 
 Cancellation is an asynchronous MatchEngine-owned decision. PostgreSQL keeps its
 recoverable decision state, while Redis owns the atomic arbitration boundary. An intent
@@ -58,10 +58,11 @@ Order and Wallet consume `TradeExecutedEvent` directly and preserve their own du
 
 - The PostgreSQL order-admission inbox keeps ACKed work durable, classifies failures, and reclaims expired worker leases.
 - Redis Lua keeps match/reserve operations atomic within the order book.
+- Self-trade prevention is enforced inside the same Lua candidate-selection boundary; Wallet also rejects an invalid self-trade fact defensively.
 - `trade_executions`, `trade_outbox`, and the cleanup task share one database transaction.
 - `trade_id` makes repeated trade recording idempotent.
 - Trade outbox publication uses publisher confirms and persisted retry state.
-- Deferred cleanup has persisted tasks, leases, retry/backoff, and orphan reconciliation. The reconciler defers to active cleanup tasks and only takes over stale reservations without a normal-path owner.
+- Deferred cleanup has persisted tasks, leases, bounded retry/backoff, and orphan reconciliation. Lua validates the exact order and trade owner before mutation; idempotent absence completes the task, while identity or newer-owner conflicts fail terminally with durable diagnostics. The reconciler defers to active cleanup tasks and only takes over stale reservations without a normal-path owner.
 - Cancellation intent, order admission, and visible-order removal share Redis atomic boundaries; the durable result is published through the existing outbox relay.
 - A future Redis-generation readiness gate must pause admission and cancellation consumers before rebuilding volatile matching state. Automatic full-book rebuild is not implemented in the current scope.
 - The TDA scheduler's direct event publication remains a documented reliability gap.

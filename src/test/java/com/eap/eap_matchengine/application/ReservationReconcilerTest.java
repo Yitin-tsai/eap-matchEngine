@@ -58,12 +58,34 @@ class ReservationReconcilerTest {
                         1L,
                         TRADE_ID)));
         when(tradeExecutionRepository.findByTradeId(TRADE_ID)).thenReturn(Optional.of(trade));
+        when(orderBookService.completeReservedOrder(order, TRADE_ID))
+                .thenReturn(ReservationCompletionOutcome.COMPLETED);
 
         reconciler(30).reconcileOnce();
 
         verify(orderBookService).completeReservedOrder(order, TRADE_ID);
         verify(orderBookService, never()).releaseReservedOrder(any(), anyString());
         verify(metrics).completed();
+    }
+
+    @Test
+    void reconcileOnce_whenReservationCompletionOwnershipConflicts_shouldNotReportCompletion() throws Exception {
+        OrderAssetReservationSucceededEvent order = order(1);
+        TradeExecutionEntity trade = trade(order, 1);
+        when(orderBookService.scanReservations(100))
+                .thenReturn(List.of(RedisOrderBookService.ReservationSnapshot.valid(
+                        "order:reservation:" + order.getOrderId(),
+                        order,
+                        1L,
+                        TRADE_ID)));
+        when(tradeExecutionRepository.findByTradeId(TRADE_ID)).thenReturn(Optional.of(trade));
+        when(orderBookService.completeReservedOrder(order, TRADE_ID))
+                .thenReturn(ReservationCompletionOutcome.NEWER_TRADE_OWNER);
+
+        reconciler(30).reconcileOnce();
+
+        verify(metrics).failure();
+        verify(metrics, never()).completed();
     }
 
     @Test

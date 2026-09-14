@@ -25,12 +25,17 @@ if not reservation_json then
     return 0
 end
 
-if not string.find(reservation_json, order_id, 1, true) then
+local reservation = cjson.decode(reservation_json)
+if not reservation.orderId
+        or reservation.orderId == cjson.null
+        or tostring(reservation.orderId) ~= order_id then
     return -1
 end
 
-local reservation = cjson.decode(reservation_json)
-if expected_trade_id ~= '' and reservation.tradeId and reservation.tradeId ~= expected_trade_id then
+if expected_trade_id ~= ''
+        and (not reservation.tradeId
+            or reservation.tradeId == cjson.null
+            or tostring(reservation.tradeId) ~= expected_trade_id) then
     return -2
 end
 
