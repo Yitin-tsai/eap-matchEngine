@@ -31,6 +31,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.assertj.core.api.Assertions.assertThat;
 
 class TradeOutboxRelayTest {
 
@@ -86,6 +87,8 @@ class TradeOutboxRelayTest {
             RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
             RabbitOperations operations = mock(RabbitOperations.class);
             doAnswer(sendInvocation -> {
+                Message message = sendInvocation.getArgument(2);
+                assertThat(message.getMessageProperties().getTimestamp()).isNotNull();
                 CorrelationData correlationData = sendInvocation.getArgument(3);
                 correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
                 return null;

@@ -9,6 +9,7 @@ public class MatchEngineSchedulerConfig {
 
     public static final String TRADE_OUTBOX_SCHEDULER = "tradeOutboxTaskScheduler";
     public static final String RESERVATION_MAINTENANCE_SCHEDULER = "reservationMaintenanceTaskScheduler";
+    public static final String DURABLE_DEBT_SCHEDULER = "durableDebtTaskScheduler";
     public static final String DEFAULT_SCHEDULER = "taskScheduler";
 
     @Bean(name = DEFAULT_SCHEDULER)
@@ -24,6 +25,11 @@ public class MatchEngineSchedulerConfig {
     @Bean(name = RESERVATION_MAINTENANCE_SCHEDULER)
     ThreadPoolTaskScheduler reservationMaintenanceTaskScheduler() {
         return singleThreadScheduler("match-reservation-maintenance-");
+    }
+
+    @Bean(name = DURABLE_DEBT_SCHEDULER)
+    ThreadPoolTaskScheduler durableDebtTaskScheduler() {
+        return singleThreadScheduler("match-durable-debt-");
     }
 
     private ThreadPoolTaskScheduler singleThreadScheduler(String threadNamePrefix) {

@@ -4,7 +4,9 @@ import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.common.event.OrderCancellationResultEvent;
 import com.eap.common.event.TradeExecutedEvent;
+import com.eap.common.observability.DurableDebtSnapshot;
 import com.eap.eap_matchengine.configuration.repository.TradeExecutionRepository;
+import com.eap.eap_matchengine.configuration.observability.MatchDurableDebtSnapshotProvider;
 import com.eap.eap_matchengine.domain.entity.TradeExecutionEntity;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -19,6 +21,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -37,6 +40,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -128,6 +132,8 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
     private RedisOrderBookManifestVerifier orderBookManifestVerifier;
     @Autowired
     private ObjectMapper objectMapper;
+    @Autowired
+    private MatchDurableDebtSnapshotProvider durableDebt;
 
     @BeforeEach
     void resetState() {
@@ -211,6 +217,109 @@ class IncomingOrderCrashRecoveryPostgresRedisIT {
                 .containsEntry("status", "RETRYABLE")
                 .containsEntry("attempt_count", 1)
                 .containsEntry("resolved_at", null);
+    }
+
+    @Test
+    void durableDebt_shouldExposeTerminalReservationReconciliationIssue() {
+        OrderAssetReservationSucceededEvent order = order("BUY", 991, 1L, 3);
+        RedisOrderBookService.ReservationSnapshot reservation =
+                RedisOrderBookService.ReservationSnapshot.valid(
+                        "order:reservation:" + order.getOrderId(),
+                        order,
+                        1L,
+                        "CRASH-RECOVERY-MARKET-991",
+                        "{\"diagnostic\":\"payload\"}");
+        reservationIssueStore.recordTerminal(
+                reservation,
+                "PERMANENT_TEST_INVARIANT",
+                "test invariant");
+        jdbc.update("""
+                UPDATE match_engine.reservation_reconciliation_issues
+                SET first_seen_at = CURRENT_TIMESTAMP - INTERVAL '2 minutes'
+                WHERE reservation_key = ?
+                """, reservation.key());
+
+        ReflectionTestUtils.invokeMethod(durableDebt, "refresh");
+        var component = durableDebt.snapshot().components().stream()
+                .filter(debt -> debt.work().equals("reservation_reconciliation"))
+                .findFirst()
+                .orElseThrow();
+
+        assertThat(component.totalCount()).isEqualTo(1);
+        assertThat(component.retryCount()).isZero();
+        assertThat(component.terminalCount()).isEqualTo(1);
+        assertThat(component.oldestUnresolvedAgeSeconds()).isGreaterThanOrEqualTo(119);
+    }
+
+    @Test
+    void durableDebt_shouldClassifyEveryMatchOwnedWorkFromAuthoritativeTables() {
+        UUID admissionOrderId = UUID.randomUUID();
+        UUID cleanupOrderId = UUID.randomUUID();
+        UUID cleanupUserId = UUID.randomUUID();
+        UUID cancellationId = UUID.randomUUID();
+        UUID cancelledOrderId = UUID.randomUUID();
+        UUID cancelledUserId = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO match_engine.order_admission_inbox
+                    (order_id, market_id, market_sequence, payload, payload_hash, status,
+                     attempt_count, error_type, received_at)
+                VALUES (?, 'REL103-MATRIX', 999001, '{}', 'hash', 'FAILED_PERMANENT', 1,
+                        'PERMANENT_INVARIANT', CURRENT_TIMESTAMP - INTERVAL '2 minutes')
+                """, admissionOrderId);
+        jdbc.update("""
+                INSERT INTO match_engine.trade_outbox
+                    (id, event_type, aggregate_type, aggregate_id, routing_key, payload, status,
+                     attempt_count, created_at)
+                VALUES (999001, 'ProviderMatrixEvent', 'TRADE', 'REL103-MATRIX', 'test.routing',
+                        '{}', 'PENDING', 2, CURRENT_TIMESTAMP - INTERVAL '2 minutes')
+                """);
+        jdbc.update("""
+                INSERT INTO match_engine.reservation_cleanup_tasks
+                    (trade_id, order_id, user_id, status, attempt_count, created_at)
+                VALUES ('REL103-MATRIX-TRADE', ?, ?, 'PROCESSING', 3,
+                        CURRENT_TIMESTAMP - INTERVAL '2 minutes')
+                """, cleanupOrderId, cleanupUserId);
+        jdbc.update("""
+                INSERT INTO match_engine.order_cancellations
+                    (cancellation_id, order_id, user_id, status, requested_at,
+                     technical_attempt_count, error_type, created_at)
+                VALUES (?, ?, ?, 'FAILED_TERMINAL', CURRENT_TIMESTAMP - INTERVAL '2 minutes',
+                        2, 'TRANSIENT_RETRY_EXHAUSTED', CURRENT_TIMESTAMP - INTERVAL '2 minutes')
+                """, cancellationId, cancelledOrderId, cancelledUserId);
+        jdbc.update("""
+                INSERT INTO match_engine.reservation_reconciliation_issues
+                    (issue_id, reservation_key, status, error_type, attempt_count, first_seen_at,
+                     last_seen_at, last_checked_at, last_error)
+                VALUES ('REL103-MATRIX-ISSUE', 'order:reservation:REL103-MATRIX', 'RETRYABLE',
+                        'TRANSIENT_REDIS', 2, CURRENT_TIMESTAMP - INTERVAL '2 minutes',
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'redis unavailable')
+                """);
+
+        ReflectionTestUtils.invokeMethod(durableDebt, "refresh");
+        Map<String, DurableDebtSnapshot.ComponentDebt> components =
+                durableDebt.snapshot().components().stream().collect(Collectors.toMap(
+                        DurableDebtSnapshot.ComponentDebt::work,
+                        component -> component));
+
+        assertDebt(components, "order_admission_inbox", 1, 0, 1);
+        assertDebt(components, "trade_outbox", 1, 1, 0);
+        assertDebt(components, "reservation_cleanup", 1, 1, 0);
+        assertDebt(components, "order_cancellation", 1, 0, 1);
+        assertDebt(components, "reservation_reconciliation", 1, 1, 0);
+    }
+
+    private static void assertDebt(
+            Map<String, DurableDebtSnapshot.ComponentDebt> components,
+            String work,
+            long minimumTotal,
+            long minimumRetry,
+            long minimumTerminal) {
+        DurableDebtSnapshot.ComponentDebt component = components.get(work);
+        assertThat(component).isNotNull();
+        assertThat(component.totalCount()).isGreaterThanOrEqualTo(minimumTotal);
+        assertThat(component.retryCount()).isGreaterThanOrEqualTo(minimumRetry);
+        assertThat(component.terminalCount()).isGreaterThanOrEqualTo(minimumTerminal);
+        assertThat(component.oldestUnresolvedAgeSeconds()).isGreaterThanOrEqualTo(119);
     }
 
     @Test

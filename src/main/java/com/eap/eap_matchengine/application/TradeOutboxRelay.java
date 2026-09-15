@@ -336,6 +336,7 @@ public class TradeOutboxRelay {
             properties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
             properties.setContentEncoding(StandardCharsets.UTF_8.name());
             properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+            properties.setTimestamp(new java.util.Date());
             return new Message(payload(entry).getBytes(StandardCharsets.UTF_8), properties);
         } finally {
             metrics.recordMessageBuild(Duration.between(startedAt, Instant.now()));

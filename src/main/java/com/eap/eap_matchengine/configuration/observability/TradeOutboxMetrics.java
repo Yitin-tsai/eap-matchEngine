@@ -1,15 +1,12 @@
 package com.eap.eap_matchengine.configuration.observability;
 
-import com.eap.eap_matchengine.configuration.repository.TradeOutboxRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
-import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
-import java.time.LocalDateTime;
 
 @Component
 public class TradeOutboxMetrics {
@@ -34,7 +31,7 @@ public class TradeOutboxMetrics {
     private final DistributionSummary batchSize;
     private final DistributionSummary confirmedBatchSize;
 
-    public TradeOutboxMetrics(MeterRegistry registry, TradeOutboxRepository repository) {
+    public TradeOutboxMetrics(MeterRegistry registry) {
         this.publishedTotal = Counter.builder("match_engine_trade_outbox_published_total")
                 .description("Total successfully published TradeExecuted outbox events")
                 .register(registry);
@@ -106,18 +103,6 @@ public class TradeOutboxMetrics {
                 .description("Number of TradeExecuted outbox records marked SENT per relay batch")
                 .register(registry);
 
-        Gauge.builder("match_engine_trade_outbox_pending", repository, repo -> repo.countByStatus("PENDING"))
-                .description("Number of pending TradeExecuted outbox events")
-                .register(registry);
-        Gauge.builder("match_engine_trade_outbox_failed", repository, repo -> repo.countByStatus("FAILED"))
-                .description("Number of permanently failed TradeExecuted outbox events")
-                .register(registry);
-        Gauge.builder("match_engine_trade_outbox_oldest_pending_age_seconds", repository, repo -> repo
-                .findFirstByStatusOrderByCreatedAtAsc("PENDING")
-                .map(event -> Duration.between(event.getCreatedAt(), LocalDateTime.now()).toSeconds())
-                .orElse(0L))
-                .description("Age in seconds of oldest pending TradeExecuted outbox event")
-                .register(registry);
     }
 
     public void published() {

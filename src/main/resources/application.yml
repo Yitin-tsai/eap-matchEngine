@@ -130,7 +130,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,metrics,prometheus,matchOrderAdmissionInbox,orderBookRuntime,orderBookRuntimeManifest
+        include: health,metrics,prometheus,durableDebt,matchOrderAdmissionInbox,orderBookRuntime,orderBookRuntimeManifest
   metrics:
     tags:
       application: eap-matchEngine

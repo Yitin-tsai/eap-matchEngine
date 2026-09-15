@@ -512,4 +512,25 @@
         </sql>
     </changeSet>
 
+    <changeSet id="match-trade-024" author="eap">
+        <comment>Bound durable-debt snapshot queries to unresolved Match work</comment>
+        <sql>
+            CREATE INDEX idx_match_order_admission_debt_age
+                ON match_engine.order_admission_inbox(received_at)
+                WHERE status &lt;&gt; 'APPLIED' OR conflict_detected_at IS NOT NULL;
+            CREATE INDEX idx_match_trade_outbox_debt_age
+                ON match_engine.trade_outbox(created_at)
+                WHERE status &lt;&gt; 'SENT';
+            CREATE INDEX idx_match_reservation_cleanup_debt_age
+                ON match_engine.reservation_cleanup_tasks(created_at)
+                WHERE status &lt;&gt; 'COMPLETED';
+            CREATE INDEX idx_match_order_cancellation_debt_age
+                ON match_engine.order_cancellations(created_at)
+                WHERE status IN ('PENDING', 'IN_PROGRESS', 'FAILED_TERMINAL');
+            CREATE INDEX idx_match_reservation_reconciliation_debt_age
+                ON match_engine.reservation_reconciliation_issues(first_seen_at)
+                WHERE status IN ('RETRYABLE', 'TERMINAL');
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

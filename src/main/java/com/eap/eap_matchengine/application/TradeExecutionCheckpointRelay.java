@@ -214,6 +214,7 @@ public class TradeExecutionCheckpointRelay {
         properties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
         properties.setContentEncoding(StandardCharsets.UTF_8.name());
         properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+        properties.setTimestamp(new java.util.Date());
         return new Message(payload(row).getBytes(StandardCharsets.UTF_8), properties);
     }
 
