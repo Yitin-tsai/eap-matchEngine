@@ -72,7 +72,12 @@ public class OrderCancellationCoordinator {
                 ? intake(request)
                 : runtimeControls.withCancellationIntakeLock(() -> intake(request));
         if (intake.resolveNow()) {
-            resolve(intake.decision());
+            try {
+                resolve(intake.decision());
+            } catch (RuntimeException failure) {
+                log.warn("Cancellation is durably owned; deferred resolution after intake failure: cancellationId={}, orderId={}",
+                        request.getCancellationId(), request.getOrderId(), failure);
+            }
         }
     }
 
@@ -84,13 +89,19 @@ public class OrderCancellationCoordinator {
         if (decision.complete()) {
             return new CancellationIntake(decision, false);
         }
-        if (!runtimeReady()) {
-            log.warn("Cancellation persisted but deferred while CDA order book is unavailable: cancellationId={}, orderId={}",
-                    request.getCancellationId(), request.getOrderId());
+        try {
+            if (!runtimeReady()) {
+                log.warn("Cancellation persisted but deferred while CDA order book is unavailable: cancellationId={}, orderId={}",
+                        request.getCancellationId(), request.getOrderId());
+                return new CancellationIntake(decision, false);
+            }
+            orderBook.recordCancellationIntent(request.getOrderId(), request.getCancellationId());
+            return new CancellationIntake(decision, true);
+        } catch (RuntimeException failure) {
+            log.warn("Cancellation is durably owned; deferred Redis intent after intake failure: cancellationId={}, orderId={}",
+                    request.getCancellationId(), request.getOrderId(), failure);
             return new CancellationIntake(decision, false);
         }
-        orderBook.recordCancellationIntent(request.getOrderId(), request.getCancellationId());
-        return new CancellationIntake(decision, true);
     }
 
     public void resolveAdmissionBlockedByCancellationIntent(OrderAssetReservationSucceededEvent order) {

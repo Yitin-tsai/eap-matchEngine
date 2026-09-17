@@ -25,6 +25,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @ExtendWith(MockitoExtension.class)
@@ -63,6 +64,21 @@ class OrderCancellationCoordinatorTest {
         InOrder sequence = inOrder(decisions, orderBook);
         sequence.verify(decisions).begin(request(), null);
         sequence.verify(orderBook).recordCancellationIntent(ORDER_ID, CANCELLATION_ID);
+        verify(decisions, never()).complete(
+                pending, OrderCancellationResultEvent.NOT_OPEN, null, null, null);
+    }
+
+    @Test
+    void redisFailureAfterDurableIntake_shouldAckBoundaryAndLeaveDecisionForReconciler() {
+        OrderCancellationDecisionStore.Decision pending = pending(null);
+        RuntimeException failure = new RuntimeException("redis unavailable");
+        when(decisions.begin(request(), null)).thenReturn(pending);
+        org.mockito.Mockito.doThrow(failure)
+                .when(orderBook).recordCancellationIntent(ORDER_ID, CANCELLATION_ID);
+
+        assertThatCode(() -> coordinator.request(request())).doesNotThrowAnyException();
+
+        verify(decisions).begin(request(), null);
         verify(decisions, never()).complete(
                 pending, OrderCancellationResultEvent.NOT_OPEN, null, null, null);
     }

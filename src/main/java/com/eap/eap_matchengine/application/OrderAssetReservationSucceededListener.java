@@ -10,6 +10,7 @@ import java.time.Duration;
 import java.time.Instant;
 
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
+import static com.eap.eap_matchengine.configuration.reliability.MatchCdaDatabaseOutageCircuitBreaker.RESERVATION_SUCCEEDED_LISTENER_ID;
 
 @Component
 @RequiredArgsConstructor
@@ -25,6 +26,7 @@ public class OrderAssetReservationSucceededListener {
      * Auction bids flow through AuctionBidConfirmedListener instead.
      */
     @RabbitListener(
+            id = RESERVATION_SUCCEEDED_LISTENER_ID,
             queues = MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE,
             concurrency = "${eap.match-engine.listeners.asset-reservation-succeeded.concurrency:8}")
     public void onReservationSucceeded(OrderAssetReservationSucceededEvent event) {
