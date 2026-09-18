@@ -239,7 +239,8 @@ class TradeOutboxRelayTest {
                 1000,
                 3,
                 100,
-                1000);
+                1000,
+                List.of());
     }
 
     private void stubInvokeSendConfirm(boolean ack, String reason) {

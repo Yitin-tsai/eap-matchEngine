@@ -59,6 +59,7 @@ public class TradeOutboxRelay {
     private final int maxAttempts;
     private final long initialBackoffMs;
     private final long maxBackoffMs;
+    private final List<TradeOutboxPostConfirmProbe> postConfirmProbes;
 
     public TradeOutboxRelay(
             JdbcTemplate jdbcTemplate,
@@ -72,7 +73,8 @@ public class TradeOutboxRelay {
             @Value("${eap.match-engine.trade-outbox-relay.confirm-timeout-ms:5000}") long confirmTimeoutMs,
             @Value("${eap.match-engine.trade-outbox-relay.max-attempts:10}") int maxAttempts,
             @Value("${eap.match-engine.trade-outbox-relay.initial-backoff-ms:1000}") long initialBackoffMs,
-            @Value("${eap.match-engine.trade-outbox-relay.max-backoff-ms:300000}") long maxBackoffMs) {
+            @Value("${eap.match-engine.trade-outbox-relay.max-backoff-ms:300000}") long maxBackoffMs,
+            List<TradeOutboxPostConfirmProbe> postConfirmProbes) {
         this.jdbcTemplate = jdbcTemplate;
         this.namedJdbcTemplate = namedJdbcTemplate;
         this.rabbitTemplate = rabbitTemplate;
@@ -88,6 +90,7 @@ public class TradeOutboxRelay {
         this.maxAttempts = maxAttempts;
         this.initialBackoffMs = initialBackoffMs;
         this.maxBackoffMs = maxBackoffMs;
+        this.postConfirmProbes = List.copyOf(postConfirmProbes);
     }
 
     @PreDestroy
@@ -217,6 +220,7 @@ public class TradeOutboxRelay {
             if (!confirmedAttempts.isEmpty()) {
                 metrics.recordPostConfirmMarkGap(Duration.between(confirmStageCompletedAt, Instant.now()));
                 try {
+                    notifyPostConfirmProbes(confirmedAttempts);
                     markConfirmedAsSent(confirmedAttempts);
                 } catch (Exception e) {
                     batchSucceeded = false;
@@ -231,6 +235,18 @@ public class TradeOutboxRelay {
             continueDraining = batchSucceeded && pending.size() == batchSize;
             metrics.recordBatch(Duration.between(batchStartedAt, Instant.now()));
         } while (continueDraining);
+    }
+
+    private void notifyPostConfirmProbes(List<PublishAttempt> confirmedAttempts) {
+        if (postConfirmProbes.isEmpty()) {
+            return;
+        }
+        List<Long> ids = confirmedAttempts.stream()
+                .map(attempt -> attempt.entry().id())
+                .toList();
+        for (TradeOutboxPostConfirmProbe probe : postConfirmProbes) {
+            probe.afterBrokerConfirmationBeforeMarkSent(ids);
+        }
     }
 
     private List<PublishResult> publishBatch(List<OutboxRow> pending) {
