@@ -53,6 +53,7 @@ tasks.named('test') {
     useJUnitPlatform()
     systemProperty 'eap.integration.crash-recovery',
             System.getProperty('eap.integration.crash-recovery', 'false')
+    systemProperty 'api.version', System.getProperty('api.version', '1.40')
 }
 
 tasks.register('crashRecoveryIntegrationTest', Test) {
